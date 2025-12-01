@@ -333,9 +333,9 @@ class MultiLengthTester:
 def main():
     parser = argparse.ArgumentParser(description='Test Multi-Length Mentor-Guided Inference')
 
-    parser.add_argument('--mentor-model', default='Qwen/Qwen2.5-1.5B-Instruct',
+    parser.add_argument('--mentor-model', default='Qwen/Qwen2.5-32B-Instruct',
                        help='Mentor (larger) model')
-    parser.add_argument('--student-model', default='Qwen/Qwen2.5-0.5B-Instruct',
+    parser.add_argument('--student-model', default='Qwen/Qwen2.5-7B-Instruct',
                        help='Student (smaller) model')
     parser.add_argument('--lengths', type=str, default='0,10,20,50,100,200',
                        help='Comma-separated mentor token lengths to test')
