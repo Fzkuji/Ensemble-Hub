@@ -427,10 +427,10 @@ def main():
 
     parser.add_argument('--mentor-model', default='Qwen/Qwen2.5-32B-Instruct')
     parser.add_argument('--student-model', default='Qwen/Qwen2.5-7B-Instruct')
-    parser.add_argument('--dataset', default='lighteval/MATH')
+    parser.add_argument('--dataset', default='HuggingFaceH4/MATH-500')
     parser.add_argument('--num-samples', type=int, default=20)
-    parser.add_argument('--difficulty', type=str, default='Level 2,Level 3',
-                       help='Comma-separated difficulty levels (Level 1-5)')
+    parser.add_argument('--difficulty', type=str, default='2,3',
+                       help='Comma-separated difficulty levels (1-5)')
     parser.add_argument('--lengths', type=str, default='0,50,100,200')
     parser.add_argument('--output-file', default='indicator_results.json')
     parser.add_argument('--student-max-tokens', type=int, default=2048)
@@ -441,15 +441,15 @@ def main():
 
     # Load dataset
     logger.info(f"Loading dataset: {args.dataset}")
-    difficulty_levels = [d.strip() for d in args.difficulty.split(',')]
-    logger.info(f"Filtering for difficulty: {difficulty_levels}")
+    difficulty_levels = [int(d.strip()) for d in args.difficulty.split(',')]
+    logger.info(f"Filtering for difficulty levels: {difficulty_levels}")
 
     try:
         dataset = load_dataset(args.dataset, split="test")
     except:
         dataset = load_dataset(args.dataset, split="train")
 
-    # Filter by difficulty if MATH dataset
+    # Filter by difficulty if MATH dataset (level is int in MATH-500)
     if 'level' in dataset.column_names:
         dataset = dataset.filter(lambda x: x['level'] in difficulty_levels)
         logger.info(f"Filtered to {len(dataset)} samples with difficulty {difficulty_levels}")
