@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Batch-parallel version of entropy indicator testing.
+Multi-GPU parallel version: each GPU loads both models, processes different samples.
 
-使用batch推理加速，模型自动分布到多卡。
+每个GPU加载两个模型，并行处理不同的问题。
 """
 
 import argparse
@@ -12,7 +12,7 @@ import os
 import sys
 from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor
+import torch.multiprocessing as mp
 
 import torch
 import torch.nn.functional as F
@@ -52,6 +52,15 @@ def extract_boxed_content(text: str) -> str:
 
 
 @dataclass
+class SampleTask:
+    """A sample to process."""
+    idx: int
+    problem: str
+    ground_truth: str
+    level: Any
+
+
+@dataclass
 class SampleResult:
     """Result for one sample."""
     idx: int
@@ -60,157 +69,121 @@ class SampleResult:
     length_results: Dict[int, Dict[str, Any]] = field(default_factory=dict)
 
 
-class BatchTester:
-    """Batch-parallel tester using device_map=auto for multi-GPU."""
+def gpu_worker(
+    gpu_id: int,
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
+    mentor_model_name: str,
+    student_model_name: str,
+    mentor_lengths: List[int],
+    student_max_tokens: int,
+):
+    """Worker: load both models on one GPU, process samples from queue."""
 
-    def __init__(self, mentor_model_name: str, student_model_name: str):
-        logger.info(f"Loading mentor: {mentor_model_name}")
-        self.mentor_tokenizer = AutoTokenizer.from_pretrained(mentor_model_name, trust_remote_code=True)
-        self.mentor_model = AutoModelForCausalLM.from_pretrained(
-            mentor_model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        self.mentor_model.eval()
+    # Set GPU
+    torch.cuda.set_device(gpu_id)
+    device = f"cuda:{gpu_id}"
 
-        logger.info(f"Loading student: {student_model_name}")
-        self.student_tokenizer = AutoTokenizer.from_pretrained(student_model_name, trust_remote_code=True)
-        self.student_model = AutoModelForCausalLM.from_pretrained(
-            student_model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        self.student_model.eval()
+    logger.info(f"[GPU {gpu_id}] Loading mentor model...")
+    mentor_tokenizer = AutoTokenizer.from_pretrained(mentor_model_name, trust_remote_code=True)
+    mentor_model = AutoModelForCausalLM.from_pretrained(
+        mentor_model_name,
+        torch_dtype=torch.float16,
+        device_map={"": gpu_id},
+        trust_remote_code=True,
+    )
+    mentor_model.eval()
 
-        for tok in [self.mentor_tokenizer, self.student_tokenizer]:
-            if tok.pad_token is None:
-                tok.pad_token = tok.eos_token
-            tok.padding_side = "left"
+    logger.info(f"[GPU {gpu_id}] Loading student model...")
+    student_tokenizer = AutoTokenizer.from_pretrained(student_model_name, trust_remote_code=True)
+    student_model = AutoModelForCausalLM.from_pretrained(
+        student_model_name,
+        torch_dtype=torch.float16,
+        device_map={"": gpu_id},
+        trust_remote_code=True,
+    )
+    student_model.eval()
 
-    def generate_mentor_batch(self, prompts: List[str], max_tokens: int) -> List[str]:
-        """Batch generate mentor tokens."""
-        if max_tokens == 0:
-            return [""] * len(prompts)
+    for tok in [mentor_tokenizer, student_tokenizer]:
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
 
-        inputs = self.mentor_tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        ).to(self.mentor_model.device)
+    logger.info(f"[GPU {gpu_id}] Models loaded. Starting processing...")
 
-        with torch.no_grad():
-            outputs = self.mentor_model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                do_sample=False,
-                pad_token_id=self.mentor_tokenizer.pad_token_id,
-            )
+    while True:
+        task = task_queue.get()
+        if task is None:  # Poison pill
+            logger.info(f"[GPU {gpu_id}] Received stop signal, exiting.")
+            break
 
-        results = []
-        for i, output in enumerate(outputs):
-            input_len = inputs["attention_mask"][i].sum().item()
-            new_ids = output[input_len:].tolist()
-            text = self.mentor_tokenizer.decode(new_ids, skip_special_tokens=True)
-            results.append(text)
+        try:
+            # Build prompt
+            prompt = f"""Solve the following math problem. Put your final answer in \\boxed{{}}.
 
-        return results
-
-    def generate_student_batch(self, prompts: List[str], max_tokens: int) -> List[str]:
-        """Batch generate student answers."""
-        inputs = self.student_tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        ).to(self.student_model.device)
-
-        with torch.no_grad():
-            outputs = self.student_model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                do_sample=False,
-                pad_token_id=self.student_tokenizer.pad_token_id,
-            )
-
-        results = []
-        for i, output in enumerate(outputs):
-            input_len = inputs["attention_mask"][i].sum().item()
-            new_ids = output[input_len:].tolist()
-            text = self.student_tokenizer.decode(new_ids, skip_special_tokens=True)
-            results.append(text)
-
-        return results
-
-    def process_samples_batch(
-        self,
-        problems: List[str],
-        ground_truths: List[str],
-        levels: List[Any],
-        mentor_lengths: List[int],
-        student_max_tokens: int,
-        batch_size: int = 4,
-    ) -> List[SampleResult]:
-        """Process multiple samples with batching."""
-
-        results = [
-            SampleResult(idx=i, ground_truth=gt, level=lvl)
-            for i, (gt, lvl) in enumerate(zip(ground_truths, levels))
-        ]
-
-        # Build base prompts
-        base_prompts = [
-            f"""Solve the following math problem. Put your final answer in \\boxed{{}}.
-
-Problem: {prob}
+Problem: {task.problem}
 
 Solution:"""
-            for prob in problems
-        ]
 
-        for length in tqdm(mentor_lengths, desc="Mentor lengths"):
-            # Generate mentor outputs for all samples
-            logger.info(f"Generating mentor tokens (length={length})...")
+            result = SampleResult(
+                idx=task.idx,
+                ground_truth=task.ground_truth,
+                level=task.level,
+            )
 
-            mentor_texts = []
-            for i in range(0, len(base_prompts), batch_size):
-                batch = base_prompts[i:i+batch_size]
-                batch_results = self.generate_mentor_batch(batch, length)
-                mentor_texts.extend(batch_results)
+            for length in mentor_lengths:
+                # Generate mentor tokens
+                if length == 0:
+                    mentor_text = ""
+                else:
+                    inputs = mentor_tokenizer(prompt, return_tensors="pt", truncation=True)
+                    input_ids = inputs["input_ids"].to(device)
+                    with torch.no_grad():
+                        outputs = mentor_model.generate(
+                            input_ids,
+                            max_new_tokens=length,
+                            do_sample=False,
+                            pad_token_id=mentor_tokenizer.pad_token_id,
+                        )
+                    new_ids = outputs[0, input_ids.shape[1]:].tolist()
+                    mentor_text = mentor_tokenizer.decode(new_ids, skip_special_tokens=True)
 
-            # Generate student outputs for all samples
-            logger.info(f"Generating student answers...")
-            full_prompts = [p + m for p, m in zip(base_prompts, mentor_texts)]
+                # Generate student answer
+                full_prompt = prompt + mentor_text
+                inputs = student_tokenizer(full_prompt, return_tensors="pt", truncation=True)
+                input_ids = inputs["input_ids"].to(device)
+                with torch.no_grad():
+                    outputs = student_model.generate(
+                        input_ids,
+                        max_new_tokens=student_max_tokens,
+                        do_sample=False,
+                        pad_token_id=student_tokenizer.pad_token_id,
+                    )
+                student_ids = outputs[0, input_ids.shape[1]:]
+                student_answer = student_tokenizer.decode(student_ids, skip_special_tokens=True)
 
-            student_texts = []
-            for i in range(0, len(full_prompts), batch_size):
-                batch = full_prompts[i:i+batch_size]
-                batch_results = self.generate_student_batch(batch, student_max_tokens)
-                student_texts.extend(batch_results)
-
-            # Evaluate all
-            for i, (mentor_text, student_text) in enumerate(zip(mentor_texts, student_texts)):
-                full_answer = mentor_text + student_text
+                full_answer = mentor_text + student_answer
                 predicted_boxed = extract_boxed_content(full_answer)
-                is_correct = grade_answer(predicted_boxed, ground_truths[i])
+                is_correct = grade_answer(predicted_boxed, task.ground_truth)
 
-                results[i].length_results[length] = {
+                result.length_results[length] = {
                     "mentor_text": mentor_text[:200],
-                    "student_answer": student_text[:200],
+                    "student_answer": student_answer[:200],
                     "predicted_boxed": predicted_boxed,
                     "is_correct": is_correct,
                 }
 
-                status = "✓" if is_correct else "✗"
-                logger.info(f"  Sample {i} [{length}]: {status} pred={predicted_boxed}, gt={ground_truths[i]}")
+            result_queue.put(result)
+            logger.info(f"[GPU {gpu_id}] Done sample {task.idx}: {[r['is_correct'] for r in result.length_results.values()]}")
 
-        return results
+        except Exception as e:
+            logger.error(f"[GPU {gpu_id}] Error on sample {task.idx}: {e}")
+            import traceback
+            traceback.print_exc()
+            result_queue.put(None)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Batch-Parallel Entropy Indicator Test')
+    parser = argparse.ArgumentParser(description='Multi-GPU Parallel Test (each GPU loads both models)')
 
     parser.add_argument('--mentor-model', default='Qwen/Qwen2.5-32B-Instruct')
     parser.add_argument('--student-model', default='Qwen/Qwen2.5-7B-Instruct')
@@ -221,15 +194,16 @@ def main():
     parser.add_argument('--lengths', type=str, default='0,50,100,200')
     parser.add_argument('--output-file', default='parallel_results.json')
     parser.add_argument('--student-max-tokens', type=int, default=2048)
-    parser.add_argument('--batch-size', type=int, default=4,
-                       help='Batch size for generation')
+    parser.add_argument('--num-gpus', type=int, default=None,
+                       help='Number of GPUs (default: all available)')
 
     args = parser.parse_args()
 
     mentor_lengths = [int(x) for x in args.lengths.split(',')]
     difficulty_levels = [int(d.strip()) for d in args.difficulty.split(',')]
 
-    logger.info(f"GPUs available: {torch.cuda.device_count()}")
+    num_gpus = args.num_gpus or torch.cuda.device_count()
+    logger.info(f"Using {num_gpus} GPUs (each loads both models)")
 
     # Load dataset
     logger.info(f"Loading dataset: {args.dataset}")
@@ -244,11 +218,8 @@ def main():
 
     num_samples = min(args.num_samples, len(dataset))
 
-    # Extract data
-    problems = []
-    ground_truths = []
-    levels = []
-
+    # Create tasks
+    tasks = []
     for i in range(num_samples):
         sample = dataset[i]
 
@@ -266,24 +237,61 @@ def main():
         else:
             ground_truth = ""
 
-        problems.append(problem)
-        ground_truths.append(ground_truth)
-        levels.append(sample.get("level", "unknown"))
+        tasks.append(SampleTask(
+            idx=i,
+            problem=problem,
+            ground_truth=ground_truth,
+            level=sample.get("level", "unknown"),
+        ))
 
-    logger.info(f"Processing {len(problems)} samples with batch_size={args.batch_size}")
+    logger.info(f"Created {len(tasks)} tasks for {num_gpus} GPUs")
 
-    # Initialize tester
-    tester = BatchTester(args.mentor_model, args.student_model)
+    # Create queues
+    task_queue = mp.Queue()
+    result_queue = mp.Queue()
 
-    # Run batch processing
-    results = tester.process_samples_batch(
-        problems=problems,
-        ground_truths=ground_truths,
-        levels=levels,
-        mentor_lengths=mentor_lengths,
-        student_max_tokens=args.student_max_tokens,
-        batch_size=args.batch_size,
-    )
+    # Start workers
+    workers = []
+    for gpu_id in range(num_gpus):
+        p = mp.Process(
+            target=gpu_worker,
+            args=(
+                gpu_id,
+                task_queue,
+                result_queue,
+                args.mentor_model,
+                args.student_model,
+                mentor_lengths,
+                args.student_max_tokens,
+            )
+        )
+        p.start()
+        workers.append(p)
+
+    # Submit tasks
+    for task in tasks:
+        task_queue.put(task)
+
+    # Send poison pills
+    for _ in range(num_gpus):
+        task_queue.put(None)
+
+    # Collect results
+    results = []
+    pbar = tqdm(total=len(tasks), desc="Processing samples")
+    while len(results) < len(tasks):
+        result = result_queue.get()
+        if result is not None:
+            results.append(result)
+        pbar.update(1)
+    pbar.close()
+
+    # Wait for workers
+    for p in workers:
+        p.join()
+
+    # Sort by index
+    results.sort(key=lambda x: x.idx)
 
     # Print summary
     logger.info("\n" + "="*60)
@@ -304,7 +312,7 @@ def main():
             "difficulty": difficulty_levels,
             "num_samples": len(results),
             "mentor_lengths": mentor_lengths,
-            "batch_size": args.batch_size,
+            "num_gpus": num_gpus,
         },
         "results": [
             {
@@ -326,4 +334,5 @@ def main():
 
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
     main()
