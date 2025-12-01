@@ -191,7 +191,7 @@ class PredictionTester:
         mentor_text = self.mentor_tokenizer.decode(generated_tokens, skip_special_tokens=True)
         return mentor_text, len(generated_tokens), entropy_trajectory
 
-    def generate_answer(self, prompt: str, max_tokens: int = 2048) -> str:
+    def generate_student_answer(self, prompt: str, max_tokens: int = 2048) -> str:
         inputs = self.student_tokenizer(prompt, return_tensors="pt", truncation=True)
         input_ids = inputs["input_ids"].to(self.student_model.device)
 
@@ -205,6 +205,22 @@ class PredictionTester:
 
         new_ids = outputs[0, input_ids.shape[1]:]
         return self.student_tokenizer.decode(new_ids, skip_special_tokens=True)
+
+    def generate_mentor_answer(self, prompt: str, max_tokens: int = 2048) -> str:
+        """Mentor generates complete answer (for baseline comparison)."""
+        inputs = self.mentor_tokenizer(prompt, return_tensors="pt", truncation=True)
+        input_ids = inputs["input_ids"].to(self.mentor_model.device)
+
+        with torch.no_grad():
+            outputs = self.mentor_model.generate(
+                input_ids,
+                max_new_tokens=max_tokens,
+                do_sample=False,
+                pad_token_id=self.mentor_tokenizer.pad_token_id,
+            )
+
+        new_ids = outputs[0, input_ids.shape[1]:]
+        return self.mentor_tokenizer.decode(new_ids, skip_special_tokens=True)
 
     def test_sample(
         self,
@@ -223,17 +239,22 @@ Solution:"""
         # Get prediction features
         features = self.get_prediction_features(prompt)
 
-        # Baseline: student alone
-        baseline_answer = self.generate_answer(prompt)
-        baseline_boxed = extract_boxed_content(baseline_answer)
-        baseline_correct = grade_answer(baseline_boxed, ground_truth)
+        # Mentor alone (ceiling)
+        mentor_answer = self.generate_mentor_answer(prompt)
+        mentor_boxed = extract_boxed_content(mentor_answer)
+        mentor_correct = grade_answer(mentor_boxed, ground_truth)
+
+        # Student alone (baseline)
+        student_answer = self.generate_student_answer(prompt)
+        student_boxed = extract_boxed_content(student_answer)
+        student_correct = grade_answer(student_boxed, ground_truth)
 
         # Dynamic mentor approach
         mentor_text, tokens_used, entropy_traj = self.dynamic_mentor_generate(
             prompt, entropy_threshold=entropy_threshold
         )
         dynamic_prompt = prompt + mentor_text
-        dynamic_answer = self.generate_answer(dynamic_prompt)
+        dynamic_answer = self.generate_student_answer(dynamic_prompt)
         dynamic_full = mentor_text + dynamic_answer
         dynamic_boxed = extract_boxed_content(dynamic_full)
         dynamic_correct = grade_answer(dynamic_boxed, ground_truth)
@@ -241,9 +262,13 @@ Solution:"""
         return {
             "ground_truth": ground_truth,
             "features": features,
-            "baseline": {
-                "correct": baseline_correct,
-                "predicted": baseline_boxed,
+            "mentor": {
+                "correct": mentor_correct,
+                "predicted": mentor_boxed,
+            },
+            "student": {
+                "correct": student_correct,
+                "predicted": student_boxed,
             },
             "dynamic": {
                 "correct": dynamic_correct,
@@ -303,23 +328,26 @@ def main():
         result["idx"] = i
         results.append(result)
 
-        b_status = "✓" if result["baseline"]["correct"] else "✗"
+        m_status = "✓" if result["mentor"]["correct"] else "✗"
+        s_status = "✓" if result["student"]["correct"] else "✗"
         d_status = "✓" if result["dynamic"]["correct"] else "✗"
-        logger.info(f"Baseline: {b_status} | Dynamic ({result['dynamic']['mentor_tokens']} tokens): {d_status}")
+        logger.info(f"Mentor: {m_status} | Student: {s_status} | Dynamic ({result['dynamic']['mentor_tokens']} tokens): {d_status}")
 
     # Analysis
-    baseline_correct = sum(1 for r in results if r["baseline"]["correct"])
+    mentor_correct = sum(1 for r in results if r["mentor"]["correct"])
+    student_correct = sum(1 for r in results if r["student"]["correct"])
     dynamic_correct = sum(1 for r in results if r["dynamic"]["correct"])
 
-    rescued = sum(1 for r in results if not r["baseline"]["correct"] and r["dynamic"]["correct"])
-    hurt = sum(1 for r in results if r["baseline"]["correct"] and not r["dynamic"]["correct"])
+    rescued = sum(1 for r in results if not r["student"]["correct"] and r["dynamic"]["correct"])
+    hurt = sum(1 for r in results if r["student"]["correct"] and not r["dynamic"]["correct"])
 
     avg_tokens = np.mean([r["dynamic"]["mentor_tokens"] for r in results])
 
     logger.info("\n" + "="*60)
     logger.info("RESULTS")
     logger.info("="*60)
-    logger.info(f"Baseline accuracy: {baseline_correct}/{num_samples} ({100*baseline_correct/num_samples:.1f}%)")
+    logger.info(f"Mentor accuracy (ceiling): {mentor_correct}/{num_samples} ({100*mentor_correct/num_samples:.1f}%)")
+    logger.info(f"Student accuracy (baseline): {student_correct}/{num_samples} ({100*student_correct/num_samples:.1f}%)")
     logger.info(f"Dynamic accuracy: {dynamic_correct}/{num_samples} ({100*dynamic_correct/num_samples:.1f}%)")
     logger.info(f"Rescued: {rescued}, Hurt: {hurt}, Net: {rescued - hurt:+d}")
     logger.info(f"Average mentor tokens used: {avg_tokens:.1f}")
@@ -329,8 +357,8 @@ def main():
     logger.info("FEATURE ANALYSIS (for predicting when help is useful)")
     logger.info("="*60)
 
-    helped_samples = [r for r in results if not r["baseline"]["correct"] and r["dynamic"]["correct"]]
-    hurt_samples = [r for r in results if r["baseline"]["correct"] and not r["dynamic"]["correct"]]
+    helped_samples = [r for r in results if not r["student"]["correct"] and r["dynamic"]["correct"]]
+    hurt_samples = [r for r in results if r["student"]["correct"] and not r["dynamic"]["correct"]]
 
     if helped_samples:
         logger.info("Samples where dynamic HELPED:")
@@ -343,6 +371,26 @@ def main():
         for key in ["initial_entropy", "mean_entropy_10", "max_entropy_10"]:
             vals = [r["features"][key] for r in hurt_samples]
             logger.info(f"  {key}: mean={np.mean(vals):.3f}, std={np.std(vals):.3f}")
+
+    # Mentor capability analysis
+    logger.info("\n" + "="*60)
+    logger.info("MENTOR CAPABILITY ANALYSIS")
+    logger.info("="*60)
+
+    mentor_can_help = sum(1 for r in results if r["mentor"]["correct"] and not r["student"]["correct"])
+    mentor_cant_help = sum(1 for r in results if not r["mentor"]["correct"] and not r["student"]["correct"])
+    both_correct = sum(1 for r in results if r["mentor"]["correct"] and r["student"]["correct"])
+    only_student = sum(1 for r in results if not r["mentor"]["correct"] and r["student"]["correct"])
+
+    logger.info(f"Both correct (no help needed): {both_correct}")
+    logger.info(f"Only student correct (mentor worse): {only_student}")
+    logger.info(f"Mentor can help (M✓ S✗): {mentor_can_help}")
+    logger.info(f"Neither correct (mentor can't help): {mentor_cant_help}")
+
+    if mentor_can_help > 0:
+        actually_helped = sum(1 for r in results
+                            if r["mentor"]["correct"] and not r["student"]["correct"] and r["dynamic"]["correct"])
+        logger.info(f"Actually rescued from 'mentor can help' cases: {actually_helped}/{mentor_can_help}")
 
     # Save
     output_path = os.path.join(script_dir, args.output_file)
