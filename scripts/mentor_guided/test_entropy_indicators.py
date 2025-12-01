@@ -427,8 +427,10 @@ def main():
 
     parser.add_argument('--mentor-model', default='Qwen/Qwen2.5-32B-Instruct')
     parser.add_argument('--student-model', default='Qwen/Qwen2.5-7B-Instruct')
-    parser.add_argument('--dataset', default='AI-MO/aimo-validation-aime')
-    parser.add_argument('--num-samples', type=int, default=5)
+    parser.add_argument('--dataset', default='lighteval/MATH')
+    parser.add_argument('--num-samples', type=int, default=20)
+    parser.add_argument('--difficulty', type=str, default='Level 2,Level 3',
+                       help='Comma-separated difficulty levels (Level 1-5)')
     parser.add_argument('--lengths', type=str, default='0,50,100,200')
     parser.add_argument('--output-file', default='indicator_results.json')
     parser.add_argument('--student-max-tokens', type=int, default=2048)
@@ -439,12 +441,18 @@ def main():
 
     # Load dataset
     logger.info(f"Loading dataset: {args.dataset}")
+    difficulty_levels = [d.strip() for d in args.difficulty.split(',')]
+    logger.info(f"Filtering for difficulty: {difficulty_levels}")
+
     try:
-        dataset = load_dataset(args.dataset, split="train")
+        dataset = load_dataset(args.dataset, split="test")
     except:
-        # Fallback to a simpler dataset format
-        logger.info("Trying alternative dataset loading...")
-        dataset = load_dataset("math-ai/aime25", split="train")
+        dataset = load_dataset(args.dataset, split="train")
+
+    # Filter by difficulty if MATH dataset
+    if 'level' in dataset.column_names:
+        dataset = dataset.filter(lambda x: x['level'] in difficulty_levels)
+        logger.info(f"Filtered to {len(dataset)} samples with difficulty {difficulty_levels}")
 
     # Initialize tester
     tester = EntropyIndicatorTester(
@@ -467,15 +475,19 @@ def main():
         else:
             problem = str(sample)
 
-        if "answer" in sample:
-            ground_truth = str(sample["answer"])
-        elif "solution" in sample:
+        # For MATH dataset, answer is in 'solution' field with \boxed{}
+        if "solution" in sample:
             ground_truth = extract_boxed_content(sample["solution"])
+        elif "answer" in sample:
+            ground_truth = str(sample["answer"])
         else:
             ground_truth = ""
 
+        # Get difficulty level if available
+        level = sample.get("level", "unknown")
+
         logger.info(f"\n{'='*60}")
-        logger.info(f"Sample {i+1}/{num_samples}")
+        logger.info(f"Sample {i+1}/{num_samples} [{level}]")
         logger.info(f"Problem: {problem[:100]}...")
         logger.info(f"Ground truth: {ground_truth}")
 
