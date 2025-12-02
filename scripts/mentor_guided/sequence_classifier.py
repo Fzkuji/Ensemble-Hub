@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""
+Sequence Classifier for ACT-E Framework
+
+Improved classifier that directly processes variable-length PPL/Entropy sequences
+instead of using fixed 17-dim statistical features.
+
+Supports:
+- LSTM
+- GRU
+- 1D-CNN
+- MLP (baseline with statistical features)
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+import logging
+import json
+import os
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class SequenceDataset(Dataset):
+    """Dataset for PPL/Entropy sequences with variable length."""
+
+    def __init__(self, sequences: List[Dict], num_classes: int = 4):
+        """
+        Args:
+            sequences: List of dicts with 'ppl', 'entropy', 'label' keys
+                       ppl/entropy are lists of floats (variable length)
+                       label is int (0=solo, 1=100t, 2=500t, 3=1000t)
+            num_classes: Number of output classes
+        """
+        self.samples = []
+        self.num_classes = num_classes
+
+        for seq in sequences:
+            ppl = np.array(seq['ppl'], dtype=np.float32)
+            entropy = np.array(seq['entropy'], dtype=np.float32)
+            label = seq['label']
+
+            # Stack PPL and entropy as 2-channel input
+            # Shape: (seq_len, 2)
+            features = np.stack([ppl, entropy], axis=1)
+            self.samples.append({
+                'features': features,
+                'label': label,
+                'length': len(ppl)
+            })
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        return {
+            'features': torch.tensor(sample['features'], dtype=torch.float32),
+            'label': torch.tensor(sample['label'], dtype=torch.long),
+            'length': sample['length']
+        }
+
+
+def collate_fn(batch):
+    """Custom collate function for variable length sequences."""
+    features = [item['features'] for item in batch]
+    labels = torch.stack([item['label'] for item in batch])
+    lengths = torch.tensor([item['length'] for item in batch])
+
+    # Pad sequences to max length in batch
+    features_padded = pad_sequence(features, batch_first=True, padding_value=0.0)
+
+    return {
+        'features': features_padded,
+        'labels': labels,
+        'lengths': lengths
+    }
+
+
+class LSTMClassifier(nn.Module):
+    """LSTM-based sequence classifier."""
+
+    def __init__(
+        self,
+        input_dim: int = 2,  # PPL + Entropy
+        hidden_dim: int = 64,
+        num_layers: int = 2,
+        num_classes: int = 4,
+        dropout: float = 0.2,
+        bidirectional: bool = False,
+    ):
+        super().__init__()
+
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
+
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional,
+            batch_first=True,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim * self.num_directions, num_classes)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, max_seq_len, input_dim)
+            lengths: (batch,) actual sequence lengths
+
+        Returns:
+            logits: (batch, num_classes)
+        """
+        batch_size = x.size(0)
+
+        # Sort by length for pack_padded_sequence
+        lengths_sorted, sort_idx = lengths.sort(descending=True)
+        x_sorted = x[sort_idx]
+
+        # Pack padded sequence
+        packed = pack_padded_sequence(
+            x_sorted, lengths_sorted.cpu(), batch_first=True, enforce_sorted=True
+        )
+
+        # LSTM forward
+        packed_out, (h_n, c_n) = self.lstm(packed)
+
+        # Get last hidden state
+        if self.bidirectional:
+            # Concatenate forward and backward last hidden states
+            h_last = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        else:
+            h_last = h_n[-1]
+
+        # Unsort to original order
+        _, unsort_idx = sort_idx.sort()
+        h_last = h_last[unsort_idx]
+
+        # Classification
+        out = self.dropout(h_last)
+        logits = self.fc(out)
+
+        return logits
+
+
+class GRUClassifier(nn.Module):
+    """GRU-based sequence classifier."""
+
+    def __init__(
+        self,
+        input_dim: int = 2,
+        hidden_dim: int = 64,
+        num_layers: int = 2,
+        num_classes: int = 4,
+        dropout: float = 0.2,
+        bidirectional: bool = False,
+    ):
+        super().__init__()
+
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
+
+        self.gru = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional,
+            batch_first=True,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim * self.num_directions, num_classes)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        batch_size = x.size(0)
+
+        lengths_sorted, sort_idx = lengths.sort(descending=True)
+        x_sorted = x[sort_idx]
+
+        packed = pack_padded_sequence(
+            x_sorted, lengths_sorted.cpu(), batch_first=True, enforce_sorted=True
+        )
+
+        packed_out, h_n = self.gru(packed)
+
+        if self.bidirectional:
+            h_last = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        else:
+            h_last = h_n[-1]
+
+        _, unsort_idx = sort_idx.sort()
+        h_last = h_last[unsort_idx]
+
+        out = self.dropout(h_last)
+        logits = self.fc(out)
+
+        return logits
+
+
+class CNN1DClassifier(nn.Module):
+    """1D CNN classifier with global max pooling."""
+
+    def __init__(
+        self,
+        input_dim: int = 2,
+        hidden_dim: int = 64,
+        num_classes: int = 4,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(input_dim, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv1d(64, hidden_dim, kernel_size=3, padding=1)
+
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, max_seq_len, input_dim)
+            lengths: (batch,) actual sequence lengths
+
+        Returns:
+            logits: (batch, num_classes)
+        """
+        # Transpose for Conv1d: (batch, input_dim, seq_len)
+        x = x.transpose(1, 2)
+
+        # CNN layers
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = torch.relu(self.conv3(x))
+
+        # Global max pooling
+        x = torch.max(x, dim=2)[0]  # (batch, hidden_dim)
+
+        # Classification
+        x = self.dropout(x)
+        logits = self.fc(x)
+
+        return logits
+
+
+class MLPClassifier(nn.Module):
+    """MLP baseline using statistical features (17-dim)."""
+
+    def __init__(
+        self,
+        input_dim: int = 17,
+        hidden_dims: List[int] = [64, 32],
+        num_classes: int = 4,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+
+        layers = []
+        prev_dim = input_dim
+        for dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            ])
+            prev_dim = dim
+        layers.append(nn.Linear(prev_dim, num_classes))
+
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, input_dim) statistical features
+            lengths: ignored for MLP
+
+        Returns:
+            logits: (batch, num_classes)
+        """
+        return self.mlp(x)
+
+
+def extract_statistical_features(ppl: List[float], entropy: List[float]) -> np.ndarray:
+    """Extract 17-dim statistical features for MLP baseline."""
+    ppl = np.array(ppl)
+    entropy = np.array(entropy)
+
+    features = [
+        # PPL statistics (7)
+        np.mean(ppl),
+        np.std(ppl),
+        np.min(ppl),
+        np.max(ppl),
+        np.percentile(ppl, 25),
+        np.percentile(ppl, 50),
+        np.percentile(ppl, 75),
+        # Entropy statistics (7)
+        np.mean(entropy),
+        np.std(entropy),
+        np.min(entropy),
+        np.max(entropy),
+        np.percentile(entropy, 25),
+        np.percentile(entropy, 50),
+        np.percentile(entropy, 75),
+        # Trend features (2)
+        np.polyfit(range(len(ppl)), ppl, 1)[0] if len(ppl) > 1 else 0,  # PPL slope
+        np.polyfit(range(len(entropy)), entropy, 1)[0] if len(entropy) > 1 else 0,  # Entropy slope
+        # Length (1)
+        len(ppl),
+    ]
+
+    return np.array(features, dtype=np.float32)
+
+
+class ClassifierTrainer:
+    """Trainer for sequence classifiers."""
+
+    def __init__(
+        self,
+        model_type: str = "lstm",
+        hidden_dim: int = 64,
+        num_layers: int = 2,
+        num_classes: int = 4,
+        dropout: float = 0.2,
+        lr: float = 0.001,
+        device: str = None,
+    ):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_type = model_type
+        self.num_classes = num_classes
+
+        # Create model
+        if model_type == "lstm":
+            self.model = LSTMClassifier(
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                num_classes=num_classes,
+                dropout=dropout,
+            )
+        elif model_type == "gru":
+            self.model = GRUClassifier(
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                num_classes=num_classes,
+                dropout=dropout,
+            )
+        elif model_type == "cnn":
+            self.model = CNN1DClassifier(
+                hidden_dim=hidden_dim,
+                num_classes=num_classes,
+                dropout=dropout,
+            )
+        elif model_type == "mlp":
+            self.model = MLPClassifier(
+                input_dim=17,
+                hidden_dims=[hidden_dim, hidden_dim // 2],
+                num_classes=num_classes,
+                dropout=dropout,
+            )
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+
+        self.model = self.model.to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=1e-5)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', patience=5, factor=0.5
+        )
+        self.criterion = nn.CrossEntropyLoss()
+
+        logger.info(f"Initialized {model_type.upper()} classifier on {self.device}")
+
+    def train(
+        self,
+        train_data: List[Dict],
+        val_data: List[Dict],
+        epochs: int = 100,
+        batch_size: int = 32,
+        early_stopping_patience: int = 10,
+    ) -> Dict:
+        """Train the classifier."""
+        train_dataset = SequenceDataset(train_data, self.num_classes)
+        val_dataset = SequenceDataset(val_data, self.num_classes)
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
+        )
+
+        best_val_acc = 0
+        best_model_state = None
+        patience_counter = 0
+        history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+
+        for epoch in range(epochs):
+            # Training
+            self.model.train()
+            train_loss = 0
+            train_correct = 0
+            train_total = 0
+
+            for batch in train_loader:
+                features = batch['features'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                lengths = batch['lengths'].to(self.device)
+
+                self.optimizer.zero_grad()
+                logits = self.model(features, lengths)
+                loss = self.criterion(logits, labels)
+                loss.backward()
+                self.optimizer.step()
+
+                train_loss += loss.item() * len(labels)
+                train_correct += (logits.argmax(dim=1) == labels).sum().item()
+                train_total += len(labels)
+
+            train_loss /= train_total
+            train_acc = train_correct / train_total
+
+            # Validation
+            val_loss, val_acc = self.evaluate(val_loader)
+
+            # Scheduler step
+            self.scheduler.step(val_loss)
+
+            history['train_loss'].append(train_loss)
+            history['train_acc'].append(train_acc)
+            history['val_loss'].append(val_loss)
+            history['val_acc'].append(val_acc)
+
+            if epoch % 10 == 0 or val_acc > best_val_acc:
+                logger.info(
+                    f"Epoch {epoch+1}/{epochs}: "
+                    f"Train Loss={train_loss:.4f}, Train Acc={train_acc:.4f}, "
+                    f"Val Loss={val_loss:.4f}, Val Acc={val_acc:.4f}"
+                )
+
+            # Early stopping
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = self.model.state_dict().copy()
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= early_stopping_patience:
+                    logger.info(f"Early stopping at epoch {epoch+1}")
+                    break
+
+        # Restore best model
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+
+        logger.info(f"Best validation accuracy: {best_val_acc:.4f}")
+        return history
+
+    def evaluate(self, data_loader: DataLoader) -> Tuple[float, float]:
+        """Evaluate the model."""
+        self.model.eval()
+        total_loss = 0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for batch in data_loader:
+                features = batch['features'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                lengths = batch['lengths'].to(self.device)
+
+                logits = self.model(features, lengths)
+                loss = self.criterion(logits, labels)
+
+                total_loss += loss.item() * len(labels)
+                correct += (logits.argmax(dim=1) == labels).sum().item()
+                total += len(labels)
+
+        return total_loss / total, correct / total
+
+    def predict(self, ppl: List[float], entropy: List[float]) -> int:
+        """Predict the optimal strategy for a single sample."""
+        self.model.eval()
+
+        features = np.stack([np.array(ppl), np.array(entropy)], axis=1)
+        features = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(self.device)
+        lengths = torch.tensor([len(ppl)]).to(self.device)
+
+        with torch.no_grad():
+            logits = self.model(features, lengths)
+            pred = logits.argmax(dim=1).item()
+
+        return pred
+
+    def save(self, path: str):
+        """Save the model."""
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'model_type': self.model_type,
+            'num_classes': self.num_classes,
+        }, path)
+        logger.info(f"Model saved to {path}")
+
+    def load(self, path: str):
+        """Load the model."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        logger.info(f"Model loaded from {path}")
+
+
+def demo():
+    """Demo with synthetic data."""
+    logger.info("=== Sequence Classifier Demo ===")
+
+    # Generate synthetic data
+    np.random.seed(42)
+    num_samples = 200
+
+    data = []
+    for i in range(num_samples):
+        seq_len = np.random.randint(50, 500)
+        ppl = np.random.lognormal(1.0, 0.5, seq_len).tolist()
+        entropy = np.random.uniform(0.5, 3.0, seq_len).tolist()
+        label = np.random.randint(0, 4)
+        data.append({'ppl': ppl, 'entropy': entropy, 'label': label})
+
+    # Split data
+    train_data = data[:160]
+    val_data = data[160:]
+
+    # Train different classifiers
+    for model_type in ["lstm", "gru", "cnn"]:
+        logger.info(f"\n--- Training {model_type.upper()} ---")
+        trainer = ClassifierTrainer(model_type=model_type, hidden_dim=64, num_classes=4)
+        history = trainer.train(train_data, val_data, epochs=50, batch_size=32)
+        logger.info(f"{model_type.upper()} final val acc: {history['val_acc'][-1]:.4f}")
+
+
+if __name__ == "__main__":
+    demo()
