@@ -36,6 +36,7 @@ if current_dir not in sys.path:
 
 from openrouter_client import OpenRouterClient
 from complete_token_analysis import TokenAnalyzer
+from grader import grade_answer  # Use official grader for math answer checking
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -134,7 +135,7 @@ class InternModel:
 
         return ppls, entropies
 
-    def generate(self, prompt: str, max_tokens: int = 2048) -> Tuple[str, int]:
+    def generate(self, prompt: str, max_tokens: int = 4096) -> Tuple[str, int]:
         """Generate response."""
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
 
@@ -173,15 +174,15 @@ def extract_boxed_answer(text: str) -> str:
 
 
 def check_math_correctness(prediction: str, ground_truth: str) -> bool:
-    """Check if math answer is correct."""
+    """Check if math answer is correct using the official grader."""
     pred_answer = extract_boxed_answer(prediction)
     true_answer = extract_boxed_answer(ground_truth)
 
     if not pred_answer or not true_answer:
         return False
 
-    # Simple string comparison (can be improved with math_equivalence)
-    return pred_answer.strip() == true_answer.strip()
+    # Use the official grader with sympy-based math equivalence checking
+    return grade_answer(pred_answer, true_answer)
 
 
 class DataCollector:
