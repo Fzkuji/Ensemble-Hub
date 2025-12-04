@@ -394,7 +394,7 @@ class AttentionClassifier(nn.Module):
 
         # Mean pooling over valid positions
         # Create a mask for valid positions: (batch, max_len, 1)
-        valid_mask = ~mask.unsqueeze(-1).float()
+        valid_mask = (~mask).unsqueeze(-1).float()
         x = (x * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
 
         # Classification
