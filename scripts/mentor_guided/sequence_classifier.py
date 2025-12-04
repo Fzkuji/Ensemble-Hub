@@ -2,14 +2,16 @@
 """
 Sequence Classifier for ACT-E Framework
 
-Improved classifier that directly processes variable-length PPL/Entropy sequences.
+All classifiers directly process variable-length PPL/Entropy sequences (no manual feature engineering).
 
 Supports:
 - LSTM: Recurrent model with pack_padded_sequence for variable length
 - GRU: Similar to LSTM but with gated recurrent units
 - 1D-CNN: Convolutional model with global max pooling
-- MLP: Extracts 17-dim statistical features then uses MLP
+- MLP: Uses global pooling (mean/max/min) to handle variable length
 - Attention: Small Transformer with positional encoding and mean pooling
+
+Input format for all models: (batch, seq_len, 2) where 2 = [PPL, Entropy]
 """
 
 import torch
@@ -259,23 +261,26 @@ class CNN1DClassifier(nn.Module):
 
 
 class MLPClassifier(nn.Module):
-    """MLP baseline using statistical features (17-dim).
+    """MLP using global pooling to handle variable-length sequences.
 
-    Extracts statistical features from variable-length sequences
-    and uses an MLP for classification.
+    Uses mean/max pooling over the sequence dimension to get fixed-size features,
+    then applies MLP for classification.
     """
 
     def __init__(
         self,
-        input_dim: int = 17,
+        input_dim: int = 2,  # PPL + Entropy
         hidden_dims: List[int] = [64, 32],
         num_classes: int = 4,
         dropout: float = 0.2,
     ):
         super().__init__()
 
+        # After pooling: mean(2) + max(2) + min(2) = 6 features
+        pooled_dim = input_dim * 3
+
         layers = []
-        prev_dim = input_dim
+        prev_dim = pooled_dim
         for dim in hidden_dims:
             layers.extend([
                 nn.Linear(prev_dim, dim),
@@ -287,52 +292,6 @@ class MLPClassifier(nn.Module):
 
         self.mlp = nn.Sequential(*layers)
 
-    def _extract_features(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        """Extract statistical features from sequences.
-
-        Args:
-            x: (batch, max_seq_len, 2) - PPL and Entropy sequences
-            lengths: (batch,) actual sequence lengths
-
-        Returns:
-            features: (batch, 17) statistical features
-        """
-        batch_size = x.size(0)
-        features_list = []
-
-        for i in range(batch_size):
-            seq_len = lengths[i].item()
-            ppl = x[i, :seq_len, 0].cpu().numpy()
-            entropy = x[i, :seq_len, 1].cpu().numpy()
-
-            # Extract 17-dim statistical features
-            feat = [
-                # PPL statistics (7)
-                np.mean(ppl),
-                np.std(ppl) if len(ppl) > 1 else 0,
-                np.min(ppl),
-                np.max(ppl),
-                np.percentile(ppl, 25),
-                np.percentile(ppl, 50),
-                np.percentile(ppl, 75),
-                # Entropy statistics (7)
-                np.mean(entropy),
-                np.std(entropy) if len(entropy) > 1 else 0,
-                np.min(entropy),
-                np.max(entropy),
-                np.percentile(entropy, 25),
-                np.percentile(entropy, 50),
-                np.percentile(entropy, 75),
-                # Trend features (2)
-                np.polyfit(range(len(ppl)), ppl, 1)[0] if len(ppl) > 1 else 0,
-                np.polyfit(range(len(entropy)), entropy, 1)[0] if len(entropy) > 1 else 0,
-                # Length (1)
-                len(ppl),
-            ]
-            features_list.append(feat)
-
-        return torch.tensor(features_list, dtype=torch.float32, device=x.device)
-
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -342,8 +301,29 @@ class MLPClassifier(nn.Module):
         Returns:
             logits: (batch, num_classes)
         """
-        # Extract statistical features from sequences
-        features = self._extract_features(x, lengths)
+        batch_size, max_len, input_dim = x.shape
+
+        # Create mask for valid positions
+        mask = torch.arange(max_len, device=x.device).unsqueeze(0) < lengths.unsqueeze(1)
+        mask = mask.unsqueeze(-1).float()  # (batch, max_len, 1)
+
+        # Masked mean pooling
+        x_masked = x * mask
+        mean_pool = x_masked.sum(dim=1) / lengths.unsqueeze(1).float().clamp(min=1)
+
+        # Masked max pooling (set invalid positions to -inf)
+        x_for_max = x.clone()
+        x_for_max[~mask.bool().expand_as(x)] = float('-inf')
+        max_pool = x_for_max.max(dim=1)[0]
+
+        # Masked min pooling (set invalid positions to +inf)
+        x_for_min = x.clone()
+        x_for_min[~mask.bool().expand_as(x)] = float('inf')
+        min_pool = x_for_min.min(dim=1)[0]
+
+        # Concatenate: (batch, 6)
+        features = torch.cat([mean_pool, max_pool, min_pool], dim=1)
+
         return self.mlp(features)
 
 
@@ -424,38 +404,6 @@ class AttentionClassifier(nn.Module):
         return logits
 
 
-def extract_statistical_features(ppl: List[float], entropy: List[float]) -> np.ndarray:
-    """Extract 17-dim statistical features for MLP baseline."""
-    ppl = np.array(ppl)
-    entropy = np.array(entropy)
-
-    features = [
-        # PPL statistics (7)
-        np.mean(ppl),
-        np.std(ppl),
-        np.min(ppl),
-        np.max(ppl),
-        np.percentile(ppl, 25),
-        np.percentile(ppl, 50),
-        np.percentile(ppl, 75),
-        # Entropy statistics (7)
-        np.mean(entropy),
-        np.std(entropy),
-        np.min(entropy),
-        np.max(entropy),
-        np.percentile(entropy, 25),
-        np.percentile(entropy, 50),
-        np.percentile(entropy, 75),
-        # Trend features (2)
-        np.polyfit(range(len(ppl)), ppl, 1)[0] if len(ppl) > 1 else 0,  # PPL slope
-        np.polyfit(range(len(entropy)), entropy, 1)[0] if len(entropy) > 1 else 0,  # Entropy slope
-        # Length (1)
-        len(ppl),
-    ]
-
-    return np.array(features, dtype=np.float32)
-
-
 class ClassifierTrainer:
     """Trainer for sequence classifiers."""
 
@@ -496,7 +444,7 @@ class ClassifierTrainer:
             )
         elif model_type == "mlp":
             self.model = MLPClassifier(
-                input_dim=17,
+                input_dim=2,  # PPL + Entropy
                 hidden_dims=[hidden_dim, hidden_dim // 2],
                 num_classes=num_classes,
                 dropout=dropout,

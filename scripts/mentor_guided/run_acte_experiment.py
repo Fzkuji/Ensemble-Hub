@@ -19,7 +19,7 @@ import numpy as np
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sequence_classifier import ClassifierTrainer, extract_statistical_features
+from sequence_classifier import ClassifierTrainer
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
