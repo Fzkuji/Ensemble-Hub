@@ -78,7 +78,7 @@ echo "[Step 3] 训练分类器..."
 python scripts/mentor_guided/run_acte_experiment.py \
     --dataset $DATASET \
     --mentor "$MENTOR_NAME" \
-    --models lstm gru mlp
+    --models lstm gru mlp attention
 
 # ============================
 # Step 4: 计算基线并输出最终结果

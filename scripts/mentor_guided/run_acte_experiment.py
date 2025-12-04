@@ -315,8 +315,8 @@ def main():
     parser.add_argument("--dataset", type=str, default="math500", choices=["math500", "humaneval"])
     parser.add_argument("--mentor", type=str, default="DeepSeek-R1-Distill-Qwen-32B",
                         help="Mentor model name (for path)")
-    parser.add_argument("--models", nargs="+", default=["lstm", "gru", "mlp"],
-                        help="Classifier models to train")
+    parser.add_argument("--models", nargs="+", default=["lstm", "gru", "mlp", "attention"],
+                        help="Classifier models to train (lstm, gru, mlp, attention, cnn)")
     args = parser.parse_args()
 
     run_experiment(args)

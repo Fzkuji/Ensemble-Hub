@@ -2,14 +2,14 @@
 """
 Sequence Classifier for ACT-E Framework
 
-Improved classifier that directly processes variable-length PPL/Entropy sequences
-instead of using fixed 17-dim statistical features.
+Improved classifier that directly processes variable-length PPL/Entropy sequences.
 
 Supports:
-- LSTM
-- GRU
-- 1D-CNN
-- MLP (baseline with statistical features)
+- LSTM: Recurrent model with pack_padded_sequence for variable length
+- GRU: Similar to LSTM but with gated recurrent units
+- 1D-CNN: Convolutional model with global max pooling
+- MLP: Extracts 17-dim statistical features then uses MLP
+- Attention: Small Transformer with positional encoding and mean pooling
 """
 
 import torch
@@ -259,7 +259,11 @@ class CNN1DClassifier(nn.Module):
 
 
 class MLPClassifier(nn.Module):
-    """MLP baseline using statistical features (17-dim)."""
+    """MLP baseline using statistical features (17-dim).
+
+    Extracts statistical features from variable-length sequences
+    and uses an MLP for classification.
+    """
 
     def __init__(
         self,
@@ -283,16 +287,141 @@ class MLPClassifier(nn.Module):
 
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor = None) -> torch.Tensor:
+    def _extract_features(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        """Extract statistical features from sequences.
+
+        Args:
+            x: (batch, max_seq_len, 2) - PPL and Entropy sequences
+            lengths: (batch,) actual sequence lengths
+
+        Returns:
+            features: (batch, 17) statistical features
+        """
+        batch_size = x.size(0)
+        features_list = []
+
+        for i in range(batch_size):
+            seq_len = lengths[i].item()
+            ppl = x[i, :seq_len, 0].cpu().numpy()
+            entropy = x[i, :seq_len, 1].cpu().numpy()
+
+            # Extract 17-dim statistical features
+            feat = [
+                # PPL statistics (7)
+                np.mean(ppl),
+                np.std(ppl) if len(ppl) > 1 else 0,
+                np.min(ppl),
+                np.max(ppl),
+                np.percentile(ppl, 25),
+                np.percentile(ppl, 50),
+                np.percentile(ppl, 75),
+                # Entropy statistics (7)
+                np.mean(entropy),
+                np.std(entropy) if len(entropy) > 1 else 0,
+                np.min(entropy),
+                np.max(entropy),
+                np.percentile(entropy, 25),
+                np.percentile(entropy, 50),
+                np.percentile(entropy, 75),
+                # Trend features (2)
+                np.polyfit(range(len(ppl)), ppl, 1)[0] if len(ppl) > 1 else 0,
+                np.polyfit(range(len(entropy)), entropy, 1)[0] if len(entropy) > 1 else 0,
+                # Length (1)
+                len(ppl),
+            ]
+            features_list.append(feat)
+
+        return torch.tensor(features_list, dtype=torch.float32, device=x.device)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (batch, input_dim) statistical features
-            lengths: ignored for MLP
+            x: (batch, max_seq_len, 2) PPL and Entropy sequences
+            lengths: (batch,) actual sequence lengths
 
         Returns:
             logits: (batch, num_classes)
         """
-        return self.mlp(x)
+        # Extract statistical features from sequences
+        features = self._extract_features(x, lengths)
+        return self.mlp(features)
+
+
+class AttentionClassifier(nn.Module):
+    """Small self-attention based classifier for variable-length sequences.
+
+    Uses positional encoding + multi-head self-attention + mean pooling.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 2,  # PPL + Entropy
+        hidden_dim: int = 64,
+        num_heads: int = 4,
+        num_layers: int = 2,
+        num_classes: int = 4,
+        dropout: float = 0.2,
+        max_seq_len: int = 2000,
+    ):
+        super().__init__()
+
+        self.hidden_dim = hidden_dim
+
+        # Input projection
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+
+        # Learnable positional encoding
+        self.pos_encoding = nn.Parameter(torch.randn(1, max_seq_len, hidden_dim) * 0.02)
+
+        # Transformer encoder layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Classification head
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, max_seq_len, input_dim)
+            lengths: (batch,) actual sequence lengths
+
+        Returns:
+            logits: (batch, num_classes)
+        """
+        batch_size, max_len, _ = x.shape
+
+        # Project input to hidden dimension
+        x = self.input_proj(x)  # (batch, max_len, hidden_dim)
+
+        # Add positional encoding
+        x = x + self.pos_encoding[:, :max_len, :]
+
+        # Create attention mask for padding
+        # True = masked (ignored), False = not masked
+        mask = torch.arange(max_len, device=x.device).unsqueeze(0) >= lengths.unsqueeze(1)
+
+        # Transformer encoding
+        x = self.transformer(x, src_key_padding_mask=mask)
+
+        # Mean pooling over valid positions
+        # Create a mask for valid positions: (batch, max_len, 1)
+        valid_mask = ~mask.unsqueeze(-1).float()
+        x = (x * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
+
+        # Classification
+        x = self.dropout(x)
+        logits = self.fc(x)
+
+        return logits
 
 
 def extract_statistical_features(ppl: List[float], entropy: List[float]) -> np.ndarray:
@@ -369,6 +498,15 @@ class ClassifierTrainer:
             self.model = MLPClassifier(
                 input_dim=17,
                 hidden_dims=[hidden_dim, hidden_dim // 2],
+                num_classes=num_classes,
+                dropout=dropout,
+            )
+        elif model_type == "attention":
+            self.model = AttentionClassifier(
+                input_dim=2,
+                hidden_dim=hidden_dim,
+                num_heads=4,
+                num_layers=num_layers,
                 num_classes=num_classes,
                 dropout=dropout,
             )
@@ -542,7 +680,7 @@ def demo():
     val_data = data[160:]
 
     # Train different classifiers
-    for model_type in ["lstm", "gru", "cnn"]:
+    for model_type in ["lstm", "gru", "cnn", "mlp", "attention"]:
         logger.info(f"\n--- Training {model_type.upper()} ---")
         trainer = ClassifierTrainer(model_type=model_type, hidden_dim=64, num_classes=4)
         history = trainer.train(train_data, val_data, epochs=50, batch_size=32)
