@@ -477,10 +477,30 @@ class ClassifierTrainer:
         epochs: int = 100,
         batch_size: int = 32,
         early_stopping_patience: int = 10,
+        use_class_weights: bool = True,
     ) -> Dict:
         """Train the classifier."""
         train_dataset = SequenceDataset(train_data, self.num_classes)
         val_dataset = SequenceDataset(val_data, self.num_classes)
+
+        # Calculate class weights to handle imbalanced data
+        if use_class_weights:
+            label_counts = {}
+            for item in train_data:
+                label = item['label']
+                label_counts[label] = label_counts.get(label, 0) + 1
+
+            total_samples = len(train_data)
+            class_weights = []
+            for i in range(self.num_classes):
+                count = label_counts.get(i, 1)  # Avoid division by zero
+                # Inverse frequency weighting
+                weight = total_samples / (self.num_classes * count)
+                class_weights.append(weight)
+
+            class_weights = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
+            self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+            logger.info(f"Class weights: {[f'{w:.2f}' for w in class_weights.tolist()]}")
 
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
