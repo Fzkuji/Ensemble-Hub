@@ -26,8 +26,23 @@ logger = logging.getLogger(__name__)
 
 
 def load_collected_data(data_dir: str, dataset: str, split: str) -> Dict[int, List[Dict]]:
-    """Load collected data for all token lengths."""
+    """Load collected data for all token lengths.
+
+    Token lengths:
+        -1: Mentor only (mentor generates complete response)
+         0: Intern only (no mentor)
+        100, 500, 1000: Progressive (mentor prefix + intern continuation)
+    """
     data = {}
+
+    # Load mentor only (-1)
+    mentor_only_path = os.path.join(data_dir, f"{dataset}_{split}_mentor_only.json")
+    if os.path.exists(mentor_only_path):
+        with open(mentor_only_path, 'r', encoding='utf-8') as f:
+            data[-1] = json.load(f)
+        logger.info(f"Loaded {len(data[-1])} samples for mentor only")
+
+    # Load other token lengths
     for tokens in [0, 100, 500, 1000]:
         file_path = os.path.join(data_dir, f"{dataset}_{split}_tokens{tokens}.json")
         if os.path.exists(file_path):

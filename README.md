@@ -215,6 +215,87 @@ curl -X POST http://localhost:8000/v1/completions \
   -d '{"model": "ensemble", "prompt": "Hello", "max_tokens": 50}'
 ```
 
+## 🧪 ACT-E Experiments
+
+ACT-E (Adaptive Control of LLM Thinking Ensemble) is a framework for dynamically deciding how much mentor guidance an intern model needs. The experiment scripts evaluate different model combinations and datasets.
+
+### Experiment Scripts
+
+Located in `scripts/mentor_guided/`:
+
+| Script | Mentor Model | Intern Model | Dataset |
+|--------|--------------|--------------|---------|
+| `exp_homo_math.sh` | DeepSeek-R1-Distill-Qwen-32B | DeepSeek-R1-Distill-Qwen-7B | MATH-500 |
+| `exp_homo_humaneval.sh` | DeepSeek-R1-Distill-Qwen-32B | DeepSeek-R1-Distill-Qwen-7B | HumanEval |
+| `exp_hetero_math.sh` | GPT-4o (API) | DeepSeek-R1-Distill-Qwen-7B | MATH-500 |
+| `exp_hetero_humaneval.sh` | GPT-4o (API) | DeepSeek-R1-Distill-Qwen-7B | HumanEval |
+
+### Baseline Strategies
+
+Each experiment evaluates the following strategies:
+
+| Strategy | Description |
+|----------|-------------|
+| Mentor Only | Mentor generates complete response (no intern) |
+| Intern Only | Intern generates complete response (no mentor) |
+| Progressive-100 | Mentor generates 100 tokens, intern continues |
+| Progressive-500 | Mentor generates 500 tokens, intern continues |
+| Progressive-1000 | Mentor generates 1000 tokens, intern continues |
+| ACT-E (LSTM/GRU/MLP/Attention) | Adaptive selection based on PPL/Entropy |
+
+### Running Experiments
+
+```bash
+# Homogeneous models + MATH-500
+bash scripts/mentor_guided/exp_homo_math.sh
+
+# Homogeneous models + HumanEval
+bash scripts/mentor_guided/exp_homo_humaneval.sh
+
+# Heterogeneous models + MATH-500 (requires OPENROUTER_API_KEY)
+export OPENROUTER_API_KEY="your-api-key"
+bash scripts/mentor_guided/exp_hetero_math.sh
+
+# Heterogeneous models + HumanEval
+bash scripts/mentor_guided/exp_hetero_humaneval.sh
+```
+
+### Parallel Data Collection
+
+For faster data collection with multiple GPUs, use parallel mode:
+
+```bash
+# Homogeneous models (local mentor + local intern)
+# 4 workers: GPU 0-3 for Mentor (32B), GPU 4-7 for Intern (7B)
+python scripts/mentor_guided/collect_progressive_data.py \
+    --dataset math500 \
+    --split train \
+    --mentor-type local \
+    --parallel \
+    --num-workers 4 \
+    --mentor-gpus "0,1,2,3" \
+    --intern-gpus "4,5,6,7"
+
+# Heterogeneous models (API mentor + local intern)
+# All 8 GPUs for Intern since Mentor uses API
+python scripts/mentor_guided/collect_progressive_data.py \
+    --dataset math500 \
+    --split train \
+    --mentor-type api \
+    --api-model "gpt-4o" \
+    --parallel \
+    --num-workers 8 \
+    --intern-gpus "0,1,2,3,4,5,6,7"
+```
+
+**Memory Requirements:**
+- 32B Mentor model: ~64GB VRAM per instance (fp16)
+- 7B Intern model: ~14GB VRAM per instance (fp16)
+
+### Output
+
+Results are saved to `data/acte_experiments/results/` with accuracy, average token lengths, and TFLOPs comparison.
+
 ## 📌 To-Do
 
 - [x] Multi-model inference

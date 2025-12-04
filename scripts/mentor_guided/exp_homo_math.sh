@@ -109,6 +109,27 @@ print("-"*70)
 print(f"{'策略':<20} {'准确率':<10} {'Mentor长度':<12} {'Intern长度':<12} {'TFLOPs':<10}")
 print("-"*70)
 
+# Load Mentor Only baseline
+mentor_only_path = os.path.join(test_dir, f"{dataset}_test_mentor_only.json")
+if os.path.exists(mentor_only_path):
+    with open(mentor_only_path, 'r') as f:
+        data = json.load(f)
+    if data:
+        accuracy = np.mean([d['is_correct'] for d in data])
+        avg_mentor = np.mean([d.get('mentor_length', 0) for d in data])
+        avg_intern = 0  # No intern in mentor-only mode
+        tflops = calculate_tflops(avg_mentor, avg_intern)
+        print(f"{'Mentor Only':<20} {accuracy:<10.4f} {avg_mentor:<12.1f} {avg_intern:<12.1f} {tflops:<10.2f}")
+        baseline_results.append({
+            'method': 'Mentor Only',
+            'tokens': -1,
+            'accuracy': accuracy,
+            'mentor_len': avg_mentor,
+            'intern_len': avg_intern,
+            'tflops': tflops,
+        })
+
+# Load other baselines
 for tokens in [0, 100, 500, 1000]:
     file_path = os.path.join(test_dir, f"{dataset}_test_tokens{tokens}.json")
     if not os.path.exists(file_path):
@@ -166,10 +187,12 @@ if best_result:
     print(f"  计算成本 (TFLOPs): {best_result['tflops']:.2f}")
 
     # 对比最好的固定策略
-    best_baseline = max(baseline_results, key=lambda x: x['accuracy'])
-    print(f"\n  对比最佳固定策略 ({best_baseline['method']}):")
-    print(f"    准确率提升: {(best_result['accuracy'] - best_baseline['accuracy'])*100:+.2f}%")
-    print(f"    TFLOPs 节省: {(best_baseline['tflops'] - best_result['tflops']):.2f} ({(1 - best_result['tflops']/best_baseline['tflops'])*100:.1f}%)")
+    if baseline_results:
+        best_baseline = max(baseline_results, key=lambda x: x['accuracy'])
+        print(f"\n  对比最佳固定策略 ({best_baseline['method']}):")
+        print(f"    准确率提升: {(best_result['accuracy'] - best_baseline['accuracy'])*100:+.2f}%")
+        if best_baseline['tflops'] > 0:
+            print(f"    TFLOPs 节省: {(best_baseline['tflops'] - best_result['tflops']):.2f} ({(1 - best_result['tflops']/best_baseline['tflops'])*100:.1f}%)")
 
 # 保存完整结果
 final_results = {
