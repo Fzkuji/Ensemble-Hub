@@ -16,7 +16,10 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
+import signal
+import contextlib
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
@@ -185,6 +188,105 @@ def check_math_correctness(prediction: str, ground_truth: str) -> bool:
     return grade_answer(pred_answer, true_answer)
 
 
+# ============ HumanEval Code Execution ============
+
+class TimeoutException(Exception):
+    pass
+
+
+@contextlib.contextmanager
+def time_limit(seconds: float):
+    """Context manager for timeout."""
+    def signal_handler(signum, frame):
+        raise TimeoutException("Timed out!")
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def extract_code_from_response(response: str) -> str:
+    """Extract code from model response.
+
+    Tries multiple patterns:
+    1. Code in ```python ... ``` blocks
+    2. Code in ``` ... ``` blocks
+    3. Raw code (if no blocks found)
+    """
+    # Try to find code in ```python blocks
+    pattern = r'```python\s*(.*?)```'
+    matches = re.findall(pattern, response, re.DOTALL)
+    if matches:
+        return matches[-1].strip()  # Return last match (usually the final answer)
+
+    # Try to find code in ``` blocks
+    pattern = r'```\s*(.*?)```'
+    matches = re.findall(pattern, response, re.DOTALL)
+    if matches:
+        return matches[-1].strip()
+
+    # If no code blocks, try to extract function body
+    # Look for lines that look like code (indented or starting with keywords)
+    lines = response.split('\n')
+    code_lines = []
+    in_code = False
+    for line in lines:
+        # Skip thinking/reasoning lines
+        if line.strip().startswith(('#', '//', '**', '-', '*')) and not line.strip().startswith('# '):
+            continue
+        # Detect code start
+        if line.startswith('    ') or line.startswith('\t') or \
+           line.strip().startswith(('def ', 'if ', 'for ', 'while ', 'return ', 'class ')):
+            in_code = True
+        if in_code:
+            code_lines.append(line)
+
+    if code_lines:
+        return '\n'.join(code_lines).strip()
+
+    return response.strip()
+
+
+def check_code_correctness(
+    prompt: str,
+    completion: str,
+    test: str,
+    entry_point: str,
+    timeout: float = 5.0
+) -> bool:
+    """Check if generated code passes the test cases.
+
+    Args:
+        prompt: The function signature and docstring
+        completion: The model's generated code (function body)
+        test: The test code with assertions
+        entry_point: The function name to test
+        timeout: Maximum execution time in seconds
+
+    Returns:
+        True if all tests pass, False otherwise
+    """
+    # Extract just the function body from completion
+    code_body = extract_code_from_response(completion)
+
+    # Build the full code: prompt + completion + test
+    full_code = prompt + code_body + "\n\n" + test + f"\ncheck({entry_point})"
+
+    try:
+        with time_limit(timeout):
+            exec_globals = {}
+            exec(full_code, exec_globals)
+        return True
+    except TimeoutException:
+        return False
+    except AssertionError:
+        return False
+    except Exception as e:
+        return False
+
+
 class DataCollector:
     """Collect progressive data for ACT-E experiments."""
 
@@ -195,8 +297,10 @@ class DataCollector:
         intern_model: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
         api_key: Optional[str] = None,
         api_model: str = "gpt-4o",
+        dataset_type: str = "math",  # "math" or "code"
     ):
         self.mentor_type = mentor_type
+        self.dataset_type = dataset_type
         self.token_lengths = [0, 100, 500, 1000]
 
         # Initialize intern model (always local)
@@ -216,6 +320,8 @@ class DataCollector:
         question: str,
         ground_truth: str,
         max_mentor_tokens: int,
+        test_code: Optional[str] = None,
+        entry_point: Optional[str] = None,
     ) -> SampleResult:
         """Collect data for a single sample with specified mentor tokens."""
 
@@ -243,9 +349,19 @@ class DataCollector:
 
         intern_response, intern_length = self.intern.generate(intern_prompt)
 
-        # Check correctness
+        # Check correctness based on dataset type
         full_response = mentor_response + intern_response
-        is_correct = check_math_correctness(full_response, ground_truth)
+        if self.dataset_type == "code" and test_code and entry_point:
+            # For HumanEval: execute code and check against test cases
+            is_correct = check_code_correctness(
+                prompt=question,  # question contains the function signature
+                completion=full_response,
+                test=test_code,
+                entry_point=entry_point,
+            )
+        else:
+            # For math: use the grader
+            is_correct = check_math_correctness(full_response, ground_truth)
 
         return SampleResult(
             question=question,
@@ -279,9 +395,15 @@ class DataCollector:
                 try:
                     question = item.get('input', item.get('prompt', ''))
                     ground_truth = item.get('output', item.get('canonical_solution', ''))
+                    # HumanEval specific fields
+                    test_code = item.get('test', None)
+                    entry_point = item.get('entry_point', None)
 
-                    result = self.collect_sample(question, ground_truth, token_limit)
-                    results.append({
+                    result = self.collect_sample(
+                        question, ground_truth, token_limit,
+                        test_code=test_code, entry_point=entry_point
+                    )
+                    result_dict = {
                         'question': result.question,
                         'ground_truth': result.ground_truth,
                         'mentor_tokens': result.mentor_tokens,
@@ -292,7 +414,13 @@ class DataCollector:
                         'is_correct': result.is_correct,
                         'mentor_length': result.mentor_length,
                         'intern_length': result.intern_length,
-                    })
+                    }
+                    # Add HumanEval specific fields if present
+                    if test_code:
+                        result_dict['test'] = test_code
+                    if entry_point:
+                        result_dict['entry_point'] = entry_point
+                    results.append(result_dict)
 
                     if result.is_correct:
                         correct_count += 1
@@ -342,6 +470,10 @@ def main():
         mentor_name = args.api_model if args.mentor_type == "api" else args.mentor_model.split('/')[-1]
         args.output_dir = os.path.join(data_dir, "collected", f"{args.dataset}_{args.split}_{mentor_name}")
 
+    # Determine dataset type
+    dataset_type = "code" if args.dataset == "humaneval" else "math"
+    logger.info(f"Dataset type: {dataset_type}")
+
     # Initialize collector
     collector = DataCollector(
         mentor_type=args.mentor_type,
@@ -349,6 +481,7 @@ def main():
         intern_model=args.intern_model,
         api_key=args.api_key,
         api_model=args.api_model,
+        dataset_type=dataset_type,
     )
 
     # Collect data
