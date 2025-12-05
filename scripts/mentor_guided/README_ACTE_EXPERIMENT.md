@@ -1,142 +1,221 @@
 # ACT-E 实验指南
 
-本目录包含运行 ACT-E (Adaptive Control of LLM Thinking Ensemble) 论文补充实验所需的所有脚本。
-
-## 实验目标
-
-回应审稿人关于：
-1. 只用同一模型家族（DeepSeek-R1-Distill-Qwen）的问题
-2. 只用 MATH 数据集的问题
+本目录包含运行 ACT-E (Adaptive Control of LLM Thinking Ensemble) 实验所需的所有脚本。
 
 ## 文件说明
 
 | 文件 | 说明 |
 |------|------|
-| `prepare_datasets.py` | 准备 MATH-500 和 HumanEval 数据集 |
-| `openrouter_client.py` | OpenRouter API 客户端，用于调用 GPT-5 等模型 |
-| `sequence_classifier.py` | LSTM/GRU/CNN/MLP 分类器实现 |
 | `collect_progressive_data.py` | 收集不同 token 长度的 PPL/Entropy 数据 |
-| `run_acte_experiment.py` | 运行完整实验流程 |
+| `sequence_classifier.py` | LSTM/GRU/CNN/MLP/Attention 分类器实现 |
+| `run_acte_experiment.py` | 运行交叉验证实验 |
 
-## 实验步骤
+---
 
-### Step 1: 准备数据集
+## 数据集说明
+
+| 数据集 | 样本数 | 来源 |
+|--------|--------|------|
+| hendrycks_math | ~12.5k | HuggingFace `EleutherAI/hendrycks_math` (7 subsets, train+test) |
+| humaneval | 164 | HuggingFace `openai_humaneval` |
+
+---
+
+## 完整运行命令
+
+### MATH 数据集 (hendrycks_math)
+
+#### Step 1: 收集数据
 
 ```bash
-python scripts/mentor_guided/prepare_datasets.py
-```
-
-这将创建：
-- `data/acte_experiments/math500/train.json` (400 samples)
-- `data/acte_experiments/math500/test.json` (100 samples)
-- `data/acte_experiments/humaneval/train.json` (130 samples)
-- `data/acte_experiments/humaneval/test.json` (34 samples)
-
-### Step 2: 收集 Progressive 数据
-
-#### 同构模型 (DeepSeek-32B + DeepSeek-7B)
-
-```bash
-# 训练集
 python scripts/mentor_guided/collect_progressive_data.py \
-    --dataset math500 \
-    --split train \
+    --dataset hendrycks_math \
+    --split all \
     --mentor-type local \
     --mentor-model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
-    --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-
-# 测试集
-python scripts/mentor_guided/collect_progressive_data.py \
-    --dataset math500 \
-    --split test \
-    --mentor-type local \
-    --mentor-model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
-    --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+    --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+    --parallel \
+    --num-workers 2 \
+    --mentor-gpus 0,1 \
+    --intern-gpus 2,3
 ```
 
-#### 异构模型 (GPT-4o + DeepSeek-7B)
+#### Step 2: 运行实验
 
 ```bash
-export OPENROUTER_API_KEY="sk-or-v1-your-key-here"
-
-# 训练集
-python scripts/mentor_guided/collect_progressive_data.py \
-    --dataset math500 \
-    --split train \
-    --mentor-type api \
-    --api-model gpt-4o \
-    --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-
-# 测试集
-python scripts/mentor_guided/collect_progressive_data.py \
-    --dataset math500 \
-    --split test \
-    --mentor-type api \
-    --api-model gpt-4o \
-    --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-```
-
-### Step 3: 训练分类器并评估
-
-```bash
-# 同构模型实验
 python scripts/mentor_guided/run_acte_experiment.py \
-    --dataset math500 \
+    --dataset hendrycks_math \
     --mentor DeepSeek-R1-Distill-Qwen-32B \
-    --models lstm gru mlp
-
-# 异构模型实验
-python scripts/mentor_guided/run_acte_experiment.py \
-    --dataset math500 \
-    --mentor gpt-4o \
-    --models lstm gru
+    --models mlp lstm gru attention cnn \
+    --n_folds 5
 ```
 
-## 预期输出
+---
 
-### Table A: 完整实验结果
+### HumanEval 数据集
 
-| Dataset | Mentor | Intern | Method | Mentor Len | Intern Len | Accuracy | TFLOPs |
-|---------|--------|--------|--------|------------|------------|----------|--------|
-| MATH-500 | - | DS-7B | Intern Only | 0 | ~2000 | ~45% | 0.03 |
-| MATH-500 | DS-32B | DS-7B | Progressive-100 | 100 | ~1800 | ~50% | 0.03 |
-| MATH-500 | DS-32B | DS-7B | Progressive-500 | 500 | ~1500 | ~55% | 0.05 |
-| MATH-500 | DS-32B | DS-7B | Progressive-1000 | 1000 | ~1200 | ~60% | 0.09 |
-| MATH-500 | DS-32B | DS-7B | ACT-E (LSTM) | ~400 | ~1600 | ~58% | 0.05 |
-| MATH-500 | GPT-4o | DS-7B | ACT-E (LSTM) | ~400 | ~1600 | ~62% | - |
+#### Step 1: 收集数据
 
-### Table B: 判断模型对比
-
-| Classifier | Accuracy | Avg Length | Cost |
-|------------|----------|------------|------|
-| Oracle | 60% | 300 | 0.04 |
-| MLP (17-dim) | 55% | 450 | 0.05 |
-| LSTM | 58% | 400 | 0.05 |
-| GRU | 57% | 420 | 0.05 |
-
-## API 配置
-
-OpenRouter API 支持的模型：
-- `gpt-5`: openai/gpt-5
-- `gpt-4o`: openai/gpt-4o
-- `claude-3.5-sonnet`: anthropic/claude-3.5-sonnet
-- `deepseek-v3`: deepseek/deepseek-chat
-
-设置 API key:
 ```bash
-export OPENROUTER_API_KEY="sk-or-v1-your-key-here"
+python scripts/mentor_guided/collect_progressive_data.py \
+    --dataset humaneval \
+    --split all \
+    --mentor-type local \
+    --mentor-model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
+    --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+    --parallel \
+    --num-workers 2 \
+    --mentor-gpus 0,1 \
+    --intern-gpus 2,3
 ```
 
-## 注意事项
+#### Step 2: 运行实验
 
-1. **GPU 内存**: 本地模型需要足够的 GPU 内存
-   - 32B 模型: ~64GB
-   - 7B 模型: ~16GB
-   - 建议使用 A100 或类似显卡
+```bash
+python scripts/mentor_guided/run_acte_experiment.py \
+    --dataset humaneval \
+    --mentor DeepSeek-R1-Distill-Qwen-32B \
+    --models mlp lstm gru attention cnn \
+    --n_folds 5
+```
 
-2. **API 成本**: GPT-4o API 调用有成本，建议先在小数据集测试
+---
 
-3. **时间估计**:
-   - 数据收集 (本地): ~2-4 小时/数据集
-   - 数据收集 (API): ~30 分钟/数据集 (取决于 rate limit)
-   - 分类器训练: ~10 分钟
+## 一键运行脚本
+
+### run_hendrycks_math.sh
+
+```bash
+#!/bin/bash
+set -e
+
+echo "=========================================="
+echo "Step 1: Collecting data for hendrycks_math"
+echo "=========================================="
+python scripts/mentor_guided/collect_progressive_data.py \
+    --dataset hendrycks_math \
+    --split all \
+    --mentor-type local \
+    --mentor-model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
+    --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+    --parallel \
+    --num-workers 2 \
+    --mentor-gpus 0,1 \
+    --intern-gpus 2,3
+
+echo "=========================================="
+echo "Step 2: Running experiments"
+echo "=========================================="
+python scripts/mentor_guided/run_acte_experiment.py \
+    --dataset hendrycks_math \
+    --mentor DeepSeek-R1-Distill-Qwen-32B \
+    --models mlp lstm gru attention cnn \
+    --n_folds 5
+
+echo "=========================================="
+echo "Done! Results in data/acte_experiments/results/"
+echo "=========================================="
+```
+
+### run_humaneval.sh
+
+```bash
+#!/bin/bash
+set -e
+
+echo "=========================================="
+echo "Step 1: Collecting data for humaneval"
+echo "=========================================="
+python scripts/mentor_guided/collect_progressive_data.py \
+    --dataset humaneval \
+    --split all \
+    --mentor-type local \
+    --mentor-model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
+    --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+    --parallel \
+    --num-workers 2 \
+    --mentor-gpus 0,1 \
+    --intern-gpus 2,3
+
+echo "=========================================="
+echo "Step 2: Running experiments"
+echo "=========================================="
+python scripts/mentor_guided/run_acte_experiment.py \
+    --dataset humaneval \
+    --mentor DeepSeek-R1-Distill-Qwen-32B \
+    --models mlp lstm gru attention cnn \
+    --n_folds 5
+
+echo "=========================================="
+echo "Done! Results in data/acte_experiments/results/"
+echo "=========================================="
+```
+
+---
+
+## 输出文件位置
+
+```
+data/acte_experiments/
+├── collected/
+│   ├── hendrycks_math_all_DeepSeek-R1-Distill-Qwen-32B/
+│   │   ├── hendrycks_math_all_tokens0.json
+│   │   ├── hendrycks_math_all_tokens100.json
+│   │   ├── hendrycks_math_all_tokens500.json
+│   │   ├── hendrycks_math_all_tokens1000.json
+│   │   └── hendrycks_math_all_mentor_only.json
+│   └── humaneval_all_DeepSeek-R1-Distill-Qwen-32B/
+│       └── ...
+└── results/
+    ├── hendrycks_math_DeepSeek-R1-Distill-Qwen-32B_mlp_cv_results.json
+    ├── hendrycks_math_DeepSeek-R1-Distill-Qwen-32B_lstm_cv_results.json
+    ├── humaneval_DeepSeek-R1-Distill-Qwen-32B_mlp_cv_results.json
+    └── ...
+```
+
+---
+
+## 实验结果示例
+
+```
+=== Baselines on All Data ===
+Intern-only: Acc=0.6940, Mentor=0.0
+Fixed-100:   Acc=0.7440, Mentor=100.0
+Fixed-500:   Acc=0.7660, Mentor=496.1
+Fixed-1000:  Acc=0.7940, Mentor=970.6
+Mentor-only: Acc=0.7820, Mentor=2366.8
+Oracle:      Acc=0.9000, Mentor=93.4
+
+=== MLP Cross-Validation Results ===
+Threshold  Mean Acc     Std Acc    Avg Mentor   Distribution
+--------------------------------------------------------------------------------
+0.30       0.7440       0.0265     100.0        100:500
+0.50       0.7440       0.0258     133.0        100:470, 500:20, 1000:10
+0.60       0.7940       0.0258     970.6        1000:500
+```
+
+---
+
+## GPU 配置建议
+
+| 配置 | Mentor GPU | Intern GPU | 说明 |
+|------|------------|------------|------|
+| 单卡 A100 80G | cuda:0 | cuda:0 | 顺序执行 |
+| 双卡 A100 | cuda:0 | cuda:1 | 并行执行 |
+| 4卡并行 | 0,1 | 2,3 | 2 workers |
+
+---
+
+## 常见问题
+
+**Q: 收集数据时 OOM？**
+- 减少 `--num-workers`
+- 使用单卡模式（去掉 `--parallel`）
+
+**Q: 分类器全部预测同一类？**
+- 检查 label 分布是否平衡
+- 调整分类阈值（0.3-0.7）
+
+**Q: 准确率低于 baseline？**
+- PPL/Entropy 特征区分度可能不够
+- 尝试不同的分类器（LSTM 通常比 MLP 好）

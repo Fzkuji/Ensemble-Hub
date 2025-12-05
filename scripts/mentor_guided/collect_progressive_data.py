@@ -47,6 +47,21 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def build_prompt(item: Dict[str, Any]) -> str:
+    """Build full prompt from data item.
+
+    For MATH dataset: combines 'instruction' + 'input'
+    For HumanEval: uses 'prompt' directly
+    """
+    # Check if it's a MATH-style item with instruction
+    if 'instruction' in item and 'input' in item:
+        instruction = item['instruction']
+        input_text = item['input']
+        return f"{instruction}\n\n{input_text}"
+    # Fallback for other formats
+    return item.get('input', item.get('prompt', ''))
+
+
 @dataclass
 class SampleResult:
     """Result for a single sample."""
@@ -429,7 +444,7 @@ def worker_process(
 
             item, token_limit = task
 
-            question = item.get('input', item.get('prompt', ''))
+            question = build_prompt(item)
             ground_truth = item.get('output', item.get('canonical_solution', ''))
             test_code = item.get('test', None)
             entry_point = item.get('entry_point', None)
@@ -633,7 +648,7 @@ class DataCollector:
 
             for item in tqdm(data, desc=mode_name):
                 try:
-                    question = item.get('input', item.get('prompt', ''))
+                    question = build_prompt(item)
                     ground_truth = item.get('output', item.get('canonical_solution', ''))
                     # HumanEval specific fields
                     test_code = item.get('test', None)
@@ -779,7 +794,7 @@ def collect_dataset_parallel(
         while len(results) < len(data):
             try:
                 item, _, result = result_queue.get(timeout=300)  # 5 min timeout
-                question = item.get('input', item.get('prompt', ''))
+                question = build_prompt(item)
                 ground_truth = item.get('output', item.get('canonical_solution', ''))
                 test_code = item.get('test', None)
                 entry_point = item.get('entry_point', None)
@@ -839,10 +854,65 @@ def collect_dataset_parallel(
         logger.info(f"Avg mentor length: {avg_mentor_len:.1f}, Avg intern length: {avg_intern_len:.1f}")
 
 
+def load_hendrycks_math(split: str = "all") -> List[Dict[str, Any]]:
+    """Load MATH data directly from HuggingFace EleutherAI/hendrycks_math.
+
+    Args:
+        split: "train", "test", or "all" (combines both)
+
+    Returns:
+        List of all problems from all 7 subsets
+    """
+    from datasets import load_dataset
+
+    MATH_SUBSETS = [
+        "algebra",
+        "counting_and_probability",
+        "geometry",
+        "intermediate_algebra",
+        "number_theory",
+        "prealgebra",
+        "precalculus",
+    ]
+
+    MATH_INSTRUCTION = """Solve the following math problem step by step. Structure your reasoning using the following framework:
+
+1. **Goal**: Define the ultimate objective or question to be solved.
+2. **Planning**: Outline the high-level reasoning strategy, including decomposition of subproblems.
+3. **Retrieval**: Recall relevant knowledge, facts, or formulas necessary for problem solving.
+4. **Action**: Execute concrete reasoning steps, calculations, or logical operations.
+
+Write your reasoning clearly using LaTeX. Box the final answer using \\boxed{}."""
+
+    all_data = []
+    splits_to_load = ["train", "test"] if split == "all" else [split]
+
+    for s in splits_to_load:
+        for subset in MATH_SUBSETS:
+            logger.info(f"Loading {subset} {s}...")
+            dataset = load_dataset("EleutherAI/hendrycks_math", subset, split=s)
+
+            for item in dataset:
+                all_data.append({
+                    'instruction': MATH_INSTRUCTION,
+                    'input': item['problem'],
+                    'output': item['solution'],
+                    'type': item.get('type', subset),
+                    'level': item.get('level', ''),
+                    'subset': subset,
+                })
+
+            logger.info(f"  Loaded {len(dataset)} problems from {subset} {s}")
+
+    logger.info(f"Total loaded: {len(all_data)} problems")
+    return all_data
+
+
 def main():
     parser = argparse.ArgumentParser(description="Collect progressive data for ACT-E")
-    parser.add_argument("--dataset", type=str, default="math500", choices=["math500", "humaneval"])
-    parser.add_argument("--split", type=str, default="train", choices=["train", "test"])
+    parser.add_argument("--dataset", type=str, default="hendrycks_math",
+                        choices=["hendrycks_math", "math500", "humaneval"])
+    parser.add_argument("--split", type=str, default="all", choices=["train", "test", "all"])
     parser.add_argument("--mentor-type", type=str, default="local", choices=["local", "api"])
     parser.add_argument("--mentor-model", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Qwen-32B")
     parser.add_argument("--intern-model", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
@@ -871,10 +941,18 @@ def main():
     data_dir = os.path.join(base_dir, "data", "acte_experiments")
 
     # Load data
-    data_file = os.path.join(data_dir, args.dataset, f"{args.split}.json")
-    with open(data_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    logger.info(f"Loaded {len(data)} samples from {data_file}")
+    if args.dataset == "hendrycks_math":
+        # Load directly from HuggingFace
+        data = load_hendrycks_math(args.split)
+    else:
+        # Load from local file (legacy datasets)
+        if args.split == "all":
+            data_file = os.path.join(data_dir, args.dataset, "all.json")
+        else:
+            data_file = os.path.join(data_dir, args.dataset, f"{args.split}.json")
+        with open(data_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        logger.info(f"Loaded {len(data)} samples from {data_file}")
 
     # Set output directory
     if args.output_dir is None:

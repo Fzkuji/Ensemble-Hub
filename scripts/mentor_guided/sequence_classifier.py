@@ -597,8 +597,13 @@ class ClassifierTrainer:
 
         return total_loss / total, correct / total
 
-    def predict(self, ppl: List[float], entropy: List[float]) -> int:
-        """Predict the optimal strategy for a single sample."""
+    def predict(self, ppl: List[float], entropy: List[float], threshold: float = 0.5) -> int:
+        """Predict the optimal strategy for a single sample.
+
+        For binary classification:
+            - Returns 1 (sufficient) if P(class=1) >= threshold
+            - Returns 0 (not sufficient) otherwise
+        """
         self.model.eval()
 
         features = np.stack([np.array(ppl), np.array(entropy)], axis=1)
@@ -607,9 +612,32 @@ class ClassifierTrainer:
 
         with torch.no_grad():
             logits = self.model(features, lengths)
-            pred = logits.argmax(dim=1).item()
+            if self.num_classes == 2:
+                # Binary classification with threshold
+                probs = torch.softmax(logits, dim=1)
+                pred = 1 if probs[0, 1].item() >= threshold else 0
+            else:
+                pred = logits.argmax(dim=1).item()
 
         return pred
+
+    def predict_proba(self, ppl: List[float], entropy: List[float]) -> np.ndarray:
+        """Get class probabilities for a single sample.
+
+        Returns:
+            Array of shape (num_classes,) with class probabilities
+        """
+        self.model.eval()
+
+        features = np.stack([np.array(ppl), np.array(entropy)], axis=1)
+        features = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(self.device)
+        lengths = torch.tensor([len(ppl)]).to(self.device)
+
+        with torch.no_grad():
+            logits = self.model(features, lengths)
+            probs = torch.softmax(logits, dim=1)
+
+        return probs[0].cpu().numpy()
 
     def save(self, path: str):
         """Save the model."""
