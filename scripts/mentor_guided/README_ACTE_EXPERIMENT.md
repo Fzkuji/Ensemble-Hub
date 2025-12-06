@@ -28,6 +28,7 @@
 #### Step 1: 收集数据
 
 ```bash
+# 8卡并行：每张卡加载 mentor(32B) + intern(7B)，8个worker同时处理
 python scripts/mentor_guided/collect_progressive_data.py \
     --dataset hendrycks_math \
     --split all \
@@ -35,9 +36,7 @@ python scripts/mentor_guided/collect_progressive_data.py \
     --mentor-model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
     --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
     --parallel \
-    --num-workers 2 \
-    --mentor-gpus 0,1 \
-    --intern-gpus 2,3
+    --gpus 0,1,2,3,4,5,6,7
 ```
 
 #### Step 2: 运行实验
@@ -57,6 +56,7 @@ python scripts/mentor_guided/run_acte_experiment.py \
 #### Step 1: 收集数据
 
 ```bash
+# 8卡并行：每张卡加载 mentor(32B) + intern(7B)
 python scripts/mentor_guided/collect_progressive_data.py \
     --dataset humaneval \
     --split all \
@@ -64,9 +64,7 @@ python scripts/mentor_guided/collect_progressive_data.py \
     --mentor-model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
     --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
     --parallel \
-    --num-workers 2 \
-    --mentor-gpus 0,1 \
-    --intern-gpus 2,3
+    --gpus 0,1,2,3,4,5,6,7
 ```
 
 #### Step 2: 运行实验
@@ -99,9 +97,7 @@ python scripts/mentor_guided/collect_progressive_data.py \
     --mentor-model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
     --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
     --parallel \
-    --num-workers 2 \
-    --mentor-gpus 0,1 \
-    --intern-gpus 2,3
+    --gpus 0,1,2,3,4,5,6,7
 
 echo "=========================================="
 echo "Step 2: Running experiments"
@@ -133,9 +129,7 @@ python scripts/mentor_guided/collect_progressive_data.py \
     --mentor-model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
     --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
     --parallel \
-    --num-workers 2 \
-    --mentor-gpus 0,1 \
-    --intern-gpus 2,3
+    --gpus 0,1,2,3,4,5,6,7
 
 echo "=========================================="
 echo "Step 2: Running experiments"
@@ -198,11 +192,11 @@ Threshold  Mean Acc     Std Acc    Avg Mentor   Distribution
 
 ## GPU 配置建议
 
-| 配置 | Mentor GPU | Intern GPU | 说明 |
-|------|------------|------------|------|
-| 单卡 A100 80G | cuda:0 | cuda:0 | 顺序执行 |
-| 双卡 A100 | cuda:0 | cuda:1 | 并行执行 |
-| 4卡并行 | 0,1 | 2,3 | 2 workers |
+| 配置 | 参数 | Workers | 说明 |
+|------|------|---------|------|
+| 单卡 A100 80G | `--gpus 0` | 1 | 单卡加载两个模型 (32B+7B≈78GB) |
+| 8卡 A100 | `--gpus 0,1,2,3,4,5,6,7` | 8 | 每卡一对模型，8路并行 |
+| 4卡 A100 | `--gpus 0,1,2,3` | 4 | 4路并行 |
 
 ---
 

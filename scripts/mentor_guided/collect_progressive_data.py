@@ -923,12 +923,16 @@ def main():
     # Parallel mode arguments
     parser.add_argument("--parallel", action="store_true",
                         help="Enable parallel data collection with multiple GPU workers")
-    parser.add_argument("--num-workers", type=int, default=4,
-                        help="Number of parallel workers (default: 4)")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Number of parallel workers (default: number of GPUs)")
+    parser.add_argument("--gpus", type=str, default=None,
+                        help="Comma-separated list of GPUs (e.g., '0,1,2,3,4,5,6,7'). "
+                             "Each GPU loads both mentor and intern models.")
+    # Legacy arguments for separate GPU allocation (deprecated)
     parser.add_argument("--mentor-gpus", type=str, default=None,
-                        help="Comma-separated list of GPUs for mentor models (e.g., '0,1,2,3')")
+                        help="[DEPRECATED] Use --gpus instead. Comma-separated list of GPUs for mentor models")
     parser.add_argument("--intern-gpus", type=str, default=None,
-                        help="Comma-separated list of GPUs for intern models (e.g., '4,5,6,7')")
+                        help="[DEPRECATED] Use --gpus instead. Comma-separated list of GPUs for intern models")
     parser.add_argument("--mentor-device", type=str, default=None,
                         help="Single GPU device for mentor in sequential mode (e.g., 'cuda:0')")
     parser.add_argument("--intern-device", type=str, default=None,
@@ -964,42 +968,67 @@ def main():
     logger.info(f"Dataset type: {dataset_type}")
 
     if args.parallel:
-        # Parse GPU lists
-        if args.mentor_gpus:
+        # Parse GPU list - each GPU loads both mentor and intern
+        if args.gpus:
+            gpus = [f"cuda:{g.strip()}" for g in args.gpus.split(",")]
+        elif args.mentor_gpus and args.intern_gpus:
+            # Legacy mode: use separate GPU lists (deprecated)
             mentor_gpus = [f"cuda:{g.strip()}" for g in args.mentor_gpus.split(",")]
-        else:
-            # Default: use first half of GPUs for mentor
-            num_gpus = torch.cuda.device_count()
-            mentor_gpus = [f"cuda:{i}" for i in range(num_gpus // 2)]
-
-        if args.intern_gpus:
             intern_gpus = [f"cuda:{g.strip()}" for g in args.intern_gpus.split(",")]
+            logger.warning("Using deprecated --mentor-gpus/--intern-gpus. Consider using --gpus instead.")
+
+            num_workers = args.num_workers or min(len(mentor_gpus), len(intern_gpus))
+            logger.info(f"Parallel mode (legacy) with {num_workers} workers")
+            logger.info(f"Mentor GPUs: {mentor_gpus[:num_workers]}")
+            logger.info(f"Intern GPUs: {intern_gpus[:num_workers]}")
+
+            mp.set_start_method('spawn', force=True)
+            collect_dataset_parallel(
+                data=data,
+                output_dir=args.output_dir,
+                dataset_name=f"{args.dataset}_{args.split}",
+                mentor_type=args.mentor_type,
+                mentor_model=args.mentor_model,
+                intern_model=args.intern_model,
+                api_key=args.api_key,
+                api_model=args.api_model,
+                dataset_type=dataset_type,
+                num_workers=num_workers,
+                mentor_gpus=mentor_gpus,
+                intern_gpus=intern_gpus,
+            )
         else:
-            # Default: use second half of GPUs for intern
+            # Default: use all available GPUs
             num_gpus = torch.cuda.device_count()
-            intern_gpus = [f"cuda:{i}" for i in range(num_gpus // 2, num_gpus)]
+            gpus = [f"cuda:{i}" for i in range(num_gpus)]
 
-        logger.info(f"Parallel mode enabled with {args.num_workers} workers")
-        logger.info(f"Mentor GPUs: {mentor_gpus}")
-        logger.info(f"Intern GPUs: {intern_gpus}")
+        if args.gpus or (not args.mentor_gpus and not args.intern_gpus):
+            # New mode: each GPU loads both models
+            num_workers = args.num_workers or len(gpus)
+            if num_workers > len(gpus):
+                logger.warning(f"Requested {num_workers} workers but only {len(gpus)} GPUs available. Using {len(gpus)} workers.")
+                num_workers = len(gpus)
 
-        # Use multiprocessing spawn method for CUDA
-        mp.set_start_method('spawn', force=True)
+            logger.info(f"Parallel mode with {num_workers} workers (each GPU loads both mentor + intern)")
+            logger.info(f"GPUs: {gpus[:num_workers]}")
 
-        collect_dataset_parallel(
-            data=data,
-            output_dir=args.output_dir,
-            dataset_name=f"{args.dataset}_{args.split}",
-            mentor_type=args.mentor_type,
-            mentor_model=args.mentor_model,
-            intern_model=args.intern_model,
-            api_key=args.api_key,
-            api_model=args.api_model,
-            dataset_type=dataset_type,
-            num_workers=args.num_workers,
-            mentor_gpus=mentor_gpus,
-            intern_gpus=intern_gpus,
-        )
+            # Use multiprocessing spawn method for CUDA
+            mp.set_start_method('spawn', force=True)
+
+            collect_dataset_parallel(
+                data=data,
+                output_dir=args.output_dir,
+                dataset_name=f"{args.dataset}_{args.split}",
+                mentor_type=args.mentor_type,
+                mentor_model=args.mentor_model,
+                intern_model=args.intern_model,
+                api_key=args.api_key,
+                api_model=args.api_model,
+                dataset_type=dataset_type,
+                num_workers=num_workers,
+                mentor_gpus=gpus,  # Same GPU for both
+                intern_gpus=gpus,  # Same GPU for both
+            )
     else:
         # Sequential mode
         collector = DataCollector(
