@@ -20,7 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -264,6 +264,145 @@ def simulate_cascade(
     }
 
 
+def run_single_split(
+    all_hidden: torch.Tensor,
+    all_labels: torch.Tensor,
+    all_stages: torch.Tensor,
+    data: Dict[int, Dict],
+    val_ratio: float = 0.2,
+    epochs: int = 50,
+    batch_size: int = 128,
+    lr: float = 1e-3,
+    device: str = "cuda",
+) -> Dict:
+    """Run training with simple train/val split (80:20)."""
+
+    input_dim = all_hidden.size(1)
+    logger.info(f"Input dim: {input_dim}")
+
+    # Use sample indices from stage 0 for stratification
+    n_samples_per_stage = len(data[TOKEN_LEVELS[0]]['labels'])
+    stage0_labels = all_labels[:n_samples_per_stage].numpy()
+
+    # Stratified 80:20 split
+    train_sample_idx, val_sample_idx = train_test_split(
+        np.arange(n_samples_per_stage),
+        test_size=val_ratio,
+        stratify=stage0_labels,
+        random_state=42
+    )
+
+    logger.info(f"\n{'='*50}")
+    logger.info(f"Train/Val Split: {len(train_sample_idx)}/{len(val_sample_idx)} samples per stage")
+    logger.info(f"{'='*50}")
+
+    # Expand indices to all stages
+    train_idx = []
+    val_idx = []
+    for stage_idx in range(len(TOKEN_LEVELS)):
+        offset = stage_idx * n_samples_per_stage
+        train_idx.extend(train_sample_idx + offset)
+        val_idx.extend(val_sample_idx + offset)
+
+    train_hidden = all_hidden[train_idx]
+    train_labels = all_labels[train_idx]
+    train_stages = all_stages[train_idx]
+    val_hidden = all_hidden[val_idx]
+    val_labels = all_labels[val_idx]
+    val_stages = all_stages[val_idx]
+
+    train_dataset = CascadedDataset(train_hidden, train_labels, train_stages)
+    val_dataset = CascadedDataset(val_hidden, val_labels, val_stages)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+    # Class weights for imbalanced data
+    class_counts = torch.bincount(train_labels)
+    class_weights = 1.0 / class_counts.float()
+    class_weights = class_weights / class_weights.sum() * 2
+    class_weights = class_weights.to(device)
+
+    model = CascadedClassifier(input_dim).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    best_val_acc = 0
+    best_model_state = None
+    patience = 15
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_acc, _, _, _ = evaluate(model, val_loader, criterion, device)
+        scheduler.step()
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if (epoch + 1) % 10 == 0:
+            logger.info(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.4f}, "
+                       f"Val Loss={val_loss:.4f}, Val Acc={val_acc:.4f}")
+
+        if patience_counter >= patience:
+            logger.info(f"Early stopping at epoch {epoch + 1}")
+            break
+
+    # Load best model
+    model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
+    _, _, val_preds, val_true, val_stage_arr = evaluate(model, val_loader, criterion, device)
+
+    # Per-stage accuracy
+    logger.info(f"\nPer-stage Binary Accuracy:")
+    stage_accs = {}
+    for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+        mask = val_stage_arr == stage_idx
+        if mask.sum() > 0:
+            stage_acc = (val_preds[mask] == val_true[mask]).mean()
+            stage_accs[tokens] = float(stage_acc)
+            logger.info(f"  Stage {stage_idx} (tokens={tokens}): Acc={stage_acc:.4f}")
+
+    # Simulate cascade on validation set
+    val_data = {}
+    for tokens in TOKEN_LEVELS:
+        val_data[tokens] = {
+            'hidden_states': data[tokens]['hidden_states'][val_sample_idx],
+            'labels': data[tokens]['labels'][val_sample_idx],
+        }
+
+    logger.info(f"\nCascade Results:")
+    cascade_results = {}
+    for threshold in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+        result = simulate_cascade(model, val_data, device, threshold)
+        cascade_results[threshold] = result
+        logger.info(f"  Threshold {threshold}: Acc={result['accuracy']:.4f}, "
+                   f"Avg Tokens={result['avg_tokens']:.1f}, "
+                   f"Dist={result['token_distribution']}")
+
+    # Summary
+    logger.info(f"\n{'='*50}")
+    logger.info(f"Summary")
+    logger.info(f"{'='*50}")
+    logger.info(f"Binary Accuracy: {best_val_acc:.4f}")
+
+    logger.info(f"\n{'Threshold':<10} {'Accuracy':<15} {'Avg Tokens':<15}")
+    logger.info("-" * 50)
+    for threshold in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+        result = cascade_results[threshold]
+        logger.info(f"{threshold:<10} {result['accuracy']:.4f}          {result['avg_tokens']:<15.1f}")
+
+    return {
+        'best_val_acc': float(best_val_acc),
+        'stage_accs': stage_accs,
+        'cascade_results': cascade_results,
+    }
+
+
 def run_cross_validation(
     all_hidden: torch.Tensor,
     all_labels: torch.Tensor,
@@ -416,6 +555,10 @@ def main():
     parser.add_argument("--data-dir", type=str, required=True,
                         help="Directory with hidden states .pt files")
     parser.add_argument("--n-folds", type=int, default=5)
+    parser.add_argument("--no-cv", action="store_true",
+                        help="Use simple 80:20 train/val split instead of cross-validation")
+    parser.add_argument("--val-ratio", type=float, default=0.2,
+                        help="Validation ratio when using --no-cv (default: 0.2)")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -432,18 +575,31 @@ def main():
     # Prepare cascaded training data
     all_hidden, all_labels, all_stages = prepare_cascaded_data(data)
 
-    # Run cross-validation
-    results = run_cross_validation(
-        all_hidden,
-        all_labels,
-        all_stages,
-        data,
-        n_folds=args.n_folds,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        device=args.device,
-    )
+    # Run training
+    if args.no_cv:
+        results = run_single_split(
+            all_hidden,
+            all_labels,
+            all_stages,
+            data,
+            val_ratio=args.val_ratio,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            device=args.device,
+        )
+    else:
+        results = run_cross_validation(
+            all_hidden,
+            all_labels,
+            all_stages,
+            data,
+            n_folds=args.n_folds,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            device=args.device,
+        )
 
     # Save results
     if args.output_file:
