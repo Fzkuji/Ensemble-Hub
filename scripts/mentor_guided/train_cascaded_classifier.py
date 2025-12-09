@@ -373,7 +373,7 @@ def run_cross_validation(
             }
 
         cascade_results = {}
-        for threshold in [0.3, 0.5, 0.7]:
+        for threshold in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
             result = simulate_cascade(model, val_data, device, threshold)
             cascade_results[threshold] = result
             logger.info(f"  Threshold {threshold}: Acc={result['accuracy']:.4f}, "
@@ -397,12 +397,12 @@ def run_cross_validation(
     logger.info(f"Mean Binary Accuracy: {mean_acc:.4f} ± {std_acc:.4f}")
 
     # Average cascade results
-    for threshold in [0.3, 0.5, 0.7]:
+    logger.info(f"\n{'Threshold':<10} {'Accuracy':<20} {'Avg Tokens':<15}")
+    logger.info("-" * 50)
+    for threshold in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
         accs = [r['cascade_results'][threshold]['accuracy'] for r in fold_results]
         tokens = [r['cascade_results'][threshold]['avg_tokens'] for r in fold_results]
-        logger.info(f"Cascade (threshold={threshold}): "
-                   f"Acc={np.mean(accs):.4f}±{np.std(accs):.4f}, "
-                   f"Avg Tokens={np.mean(tokens):.1f}")
+        logger.info(f"{threshold:<10} {np.mean(accs):.4f}±{np.std(accs):.4f}     {np.mean(tokens):<15.1f}")
 
     return {
         'fold_results': fold_results,
