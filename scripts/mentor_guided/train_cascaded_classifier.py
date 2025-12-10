@@ -216,12 +216,26 @@ def simulate_cascade(
     data: Dict[int, Dict],
     device: str,
     threshold: float = 0.5,
+    per_stage_thresholds: List[float] = None,
 ) -> Dict:
     """
     Simulate the cascaded inference process.
+
+    Args:
+        model: Trained classifier
+        data: Hidden states and labels for each token level
+        device: Device to run on
+        threshold: Global threshold (used if per_stage_thresholds is None)
+        per_stage_thresholds: List of thresholds for each stage [t0, t1, t2, t3]
     """
     model.eval()
     n_samples = len(data[TOKEN_LEVELS[0]]['labels'])
+
+    # Use per-stage thresholds if provided, otherwise use global threshold
+    if per_stage_thresholds is not None:
+        thresholds = per_stage_thresholds
+    else:
+        thresholds = [threshold] * len(TOKEN_LEVELS)
 
     # Ground truth at each stage
     gt = {tokens: data[tokens]['labels'].numpy() for tokens in TOKEN_LEVELS}
@@ -242,7 +256,8 @@ def simulate_cascade(
                 output = model(hidden, stage_tensor)
                 prob_sufficient = torch.softmax(output, dim=1)[0, 1].item()
 
-                if prob_sufficient >= threshold:
+                stage_threshold = thresholds[stage_idx]
+                if prob_sufficient >= stage_threshold:
                     # Predict sufficient at this stage
                     final_tokens[i] = tokens
                     final_correct[i] = gt[tokens][i] == 1
@@ -261,6 +276,76 @@ def simulate_cascade(
         'accuracy': float(accuracy),
         'avg_tokens': float(avg_tokens),
         'token_distribution': token_dist,
+        'thresholds': thresholds,
+    }
+
+
+def search_optimal_thresholds(
+    model: nn.Module,
+    data: Dict[int, Dict],
+    device: str,
+    threshold_candidates: List[float] = None,
+    optimize_for: str = "accuracy",  # "accuracy" or "efficiency" or "balanced"
+) -> Dict:
+    """
+    Search for optimal per-stage thresholds using grid search.
+
+    Args:
+        model: Trained classifier
+        data: Hidden states and labels
+        device: Device
+        threshold_candidates: List of threshold values to try (default: [0.3, 0.5, 0.7, 0.9])
+        optimize_for: Optimization target
+            - "accuracy": maximize accuracy
+            - "efficiency": minimize tokens while maintaining accuracy
+            - "balanced": balance accuracy and token efficiency
+
+    Returns:
+        Dict with best thresholds and results
+    """
+    if threshold_candidates is None:
+        threshold_candidates = [0.3, 0.5, 0.7, 0.9]
+
+    n_stages = len(TOKEN_LEVELS)
+    best_result = None
+    best_score = -float('inf')
+    all_results = []
+
+    # Grid search over all combinations
+    from itertools import product
+    total_combos = len(threshold_candidates) ** n_stages
+    logger.info(f"Searching {total_combos} threshold combinations...")
+
+    for combo in product(threshold_candidates, repeat=n_stages):
+        thresholds = list(combo)
+        result = simulate_cascade(model, data, device, per_stage_thresholds=thresholds)
+
+        # Calculate score based on optimization target
+        if optimize_for == "accuracy":
+            score = result['accuracy']
+        elif optimize_for == "efficiency":
+            # Maximize accuracy - penalty for more tokens
+            score = result['accuracy'] - result['avg_tokens'] / 1000.0 * 0.1
+        elif optimize_for == "balanced":
+            # Weighted combination
+            score = result['accuracy'] * 0.7 + (1 - result['avg_tokens'] / 1000.0) * 0.3
+        else:
+            score = result['accuracy']
+
+        result['score'] = score
+        all_results.append(result)
+
+        if score > best_score:
+            best_score = score
+            best_result = result
+
+    # Sort by score
+    all_results.sort(key=lambda x: x['score'], reverse=True)
+
+    return {
+        'best': best_result,
+        'top_5': all_results[:5],
+        'optimize_for': optimize_for,
     }
 
 
@@ -375,7 +460,7 @@ def run_single_split(
             'labels': data[tokens]['labels'][val_sample_idx],
         }
 
-    logger.info(f"\nCascade Results:")
+    logger.info(f"\nCascade Results (Global Threshold):")
     cascade_results = {}
     for threshold in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
         result = simulate_cascade(model, val_data, device, threshold)
@@ -383,6 +468,17 @@ def run_single_split(
         logger.info(f"  Threshold {threshold}: Acc={result['accuracy']:.4f}, "
                    f"Avg Tokens={result['avg_tokens']:.1f}, "
                    f"Dist={result['token_distribution']}")
+
+    # Search for optimal per-stage thresholds
+    logger.info(f"\nSearching Optimal Per-Stage Thresholds:")
+    per_stage_results = {}
+    for opt_target in ["accuracy", "efficiency", "balanced"]:
+        opt_result = search_optimal_thresholds(model, val_data, device, optimize_for=opt_target)
+        per_stage_results[opt_target] = opt_result
+        best = opt_result['best']
+        logger.info(f"  [{opt_target}] Best thresholds: {best['thresholds']}")
+        logger.info(f"           Acc={best['accuracy']:.4f}, Avg Tokens={best['avg_tokens']:.1f}, "
+                   f"Dist={best['token_distribution']}")
 
     # Summary
     logger.info(f"\n{'='*50}")
@@ -400,6 +496,7 @@ def run_single_split(
         'best_val_acc': float(best_val_acc),
         'stage_accs': stage_accs,
         'cascade_results': cascade_results,
+        'per_stage_thresholds': per_stage_results,
     }
 
 
