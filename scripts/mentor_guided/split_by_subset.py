@@ -18,6 +18,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from collections import defaultdict
 from typing import Dict, List
 import torch
@@ -52,12 +53,13 @@ def load_hendrycks_math_metadata() -> Dict[str, Dict]:
         for split in ["train", "test"]:
             if split in ds:
                 for idx, item in enumerate(ds[split]):
-                    # Use problem text as key (should be unique)
-                    problem = item["problem"].strip()
-                    metadata[problem] = {
+                    # Use solution text as key (matches ground_truth in collected data)
+                    solution = item["solution"].strip()
+                    metadata[solution] = {
                         "subset": subset,
                         "split": split,
                         "original_idx": idx,
+                        "problem": item["problem"].strip(),
                     }
 
     logger.info(f"Loaded metadata for {len(metadata)} problems")
@@ -92,16 +94,16 @@ def load_collected_data(data_dir: str) -> Dict[int, Dict]:
     for f in os.listdir(data_dir):
         if f.endswith(".json"):
             filepath = os.path.join(data_dir, f)
-            # Extract token level from filename
-            for tokens in TOKEN_LEVELS + ["mentor_only"]:
-                token_str = str(tokens) if isinstance(tokens, int) else tokens
-                if f"tokens{token_str}" in f or f"_{token_str}.json" in f:
+            # Extract token level from filename using regex for exact match
+            # Match patterns like tokens0, tokens100, tokens500, tokens1000
+            match = re.search(r'tokens(\d+)', f)
+            if match:
+                token_num = int(match.group(1))
+                if token_num in TOKEN_LEVELS:
                     with open(filepath, 'r') as file:
-                        json_data_by_tokens[token_str] = json.load(file)
-                    logger.info(f"Loaded JSON: {f} ({len(json_data_by_tokens[token_str])} samples)")
-                    break
-            # Also check for mentor_only
-            if "mentor_only" in f:
+                        json_data_by_tokens[str(token_num)] = json.load(file)
+                    logger.info(f"Loaded JSON: {f} ({len(json_data_by_tokens[str(token_num)])} samples)")
+            elif "mentor_only" in f:
                 with open(filepath, 'r') as file:
                     json_data_by_tokens["mentor_only"] = json.load(file)
                 logger.info(f"Loaded JSON: {f}")
@@ -117,44 +119,47 @@ def load_collected_data(data_dir: str) -> Dict[int, Dict]:
     if reference_data is None and json_data_by_tokens:
         reference_data = list(json_data_by_tokens.values())[0]
 
+    # Extract ground_truth for matching (not question, which is formatted prompt)
+    ground_truths = []
     if reference_data:
         for item in reference_data:
-            problems.append(item.get("question", item.get("problem", "")).strip())
-        logger.info(f"Loaded {len(problems)} problems")
+            # Use ground_truth field which matches original dataset's solution
+            ground_truths.append(item.get("ground_truth", "").strip())
+        logger.info(f"Loaded {len(ground_truths)} samples")
 
-    return data, problems, json_data_by_tokens
+    return data, ground_truths, json_data_by_tokens
 
 
 def split_data_by_subset(
     data: Dict[int, Dict],
-    problems: List[str],
+    ground_truths: List[str],
     metadata: Dict[str, Dict],
     output_dir: str,
     json_data_by_tokens: Dict[str, List] = None,
 ):
     """Split data by subset and train/test."""
 
-    # Create index mapping
+    # Create index mapping using ground_truth (solution) for matching
     subset_split_indices = defaultdict(lambda: defaultdict(list))
     unmatched = []
 
-    for idx, problem in enumerate(problems):
-        if problem in metadata:
-            info = metadata[problem]
+    for idx, solution in enumerate(ground_truths):
+        if solution in metadata:
+            info = metadata[solution]
             subset_split_indices[info["subset"]][info["split"]].append(idx)
         else:
-            # Try partial match (first 100 chars)
+            # Try partial match (first 200 chars) for solutions
             matched = False
             for key in metadata:
-                if len(problem) > 50 and len(key) > 50 and problem[:100] == key[:100]:
+                if len(solution) > 100 and len(key) > 100 and solution[:200] == key[:200]:
                     info = metadata[key]
                     subset_split_indices[info["subset"]][info["split"]].append(idx)
                     matched = True
                     break
             if not matched:
-                # Try even shorter match
+                # Try shorter match (first 100 chars)
                 for key in metadata:
-                    if len(problem) > 30 and len(key) > 30 and problem[:50] == key[:50]:
+                    if len(solution) > 50 and len(key) > 50 and solution[:100] == key[:100]:
                         info = metadata[key]
                         subset_split_indices[info["subset"]][info["split"]].append(idx)
                         matched = True
@@ -314,14 +319,14 @@ def main():
     metadata = load_hendrycks_math_metadata()
 
     # Load collected data
-    data, problems, json_data_by_tokens = load_collected_data(args.data_dir)
+    data, ground_truths, json_data_by_tokens = load_collected_data(args.data_dir)
 
-    if not problems:
-        logger.error("Could not load problem texts. Please check data directory.")
+    if not ground_truths:
+        logger.error("Could not load ground truth data. Please check data directory.")
         return
 
     # Split and save
-    split_data_by_subset(data, problems, metadata, args.output_dir, json_data_by_tokens)
+    split_data_by_subset(data, ground_truths, metadata, args.output_dir, json_data_by_tokens)
 
     logger.info("Done!")
 
