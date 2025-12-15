@@ -8,8 +8,8 @@
 set -e
 
 # Default paths (modify as needed)
-DATA_DIR="${1:-/root/data/hendrycks_math_all_DeepSeek-R1-Distill-Qwen-32B}"
-OUTPUT_DIR="${2:-/root/data/hendrycks_math_split}"
+DATA_DIR="${1:-/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_all_DeepSeek-R1-Distill-Qwen-32B}"
+OUTPUT_DIR="${2:-/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
