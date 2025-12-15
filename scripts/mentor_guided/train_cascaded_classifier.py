@@ -22,6 +22,11 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from tqdm import tqdm
+try:
+    import xgboost as xgb
+    HAS_XGBOOST = True
+except ImportError:
+    HAS_XGBOOST = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -349,6 +354,217 @@ def search_optimal_thresholds(
     }
 
 
+class XGBoostCascadeClassifier:
+    """Wrapper for per-stage XGBoost classifiers."""
+
+    def __init__(self, models: Dict[int, 'xgb.XGBClassifier']):
+        self.models = models  # {stage_idx: xgb_model}
+
+    def predict_proba(self, hidden_states: np.ndarray, stage_idx: int) -> np.ndarray:
+        """Predict probability of sufficient for given stage."""
+        return self.models[stage_idx].predict_proba(hidden_states)
+
+
+def simulate_cascade_xgb(
+    model: XGBoostCascadeClassifier,
+    data: Dict[int, Dict],
+    threshold: float = 0.5,
+    per_stage_thresholds: List[float] = None,
+) -> Dict:
+    """Simulate cascade for XGBoost models."""
+    n_samples = len(data[TOKEN_LEVELS[0]]['labels'])
+
+    if per_stage_thresholds is not None:
+        thresholds = per_stage_thresholds
+    else:
+        thresholds = [threshold] * len(TOKEN_LEVELS)
+
+    gt = {tokens: data[tokens]['labels'].numpy() for tokens in TOKEN_LEVELS}
+
+    final_tokens = np.zeros(n_samples, dtype=int)
+    final_correct = np.zeros(n_samples, dtype=bool)
+
+    for i in range(n_samples):
+        for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+            hidden = data[tokens]['hidden_states'][i:i+1].numpy()
+            if hidden.ndim == 3:
+                hidden = hidden.reshape(1, -1)
+
+            proba = model.predict_proba(hidden, stage_idx)
+            prob_sufficient = proba[0, 1]
+
+            if prob_sufficient >= thresholds[stage_idx]:
+                final_tokens[i] = tokens
+                final_correct[i] = gt[tokens][i] == 1
+                break
+            elif stage_idx == len(TOKEN_LEVELS) - 1:
+                final_tokens[i] = 0
+                final_correct[i] = gt[0][i] == 1
+
+    accuracy = final_correct.mean()
+    avg_tokens = final_tokens.mean()
+    token_dist = {tokens: int((final_tokens == tokens).sum()) for tokens in TOKEN_LEVELS}
+
+    return {
+        'accuracy': float(accuracy),
+        'avg_tokens': float(avg_tokens),
+        'token_distribution': token_dist,
+        'thresholds': thresholds,
+    }
+
+
+def run_xgboost_single_split(
+    all_hidden: torch.Tensor,
+    all_labels: torch.Tensor,
+    all_stages: torch.Tensor,
+    data: Dict[int, Dict],
+    val_ratio: float = 0.2,
+) -> Dict:
+    """Train per-stage XGBoost classifiers with 80:20 split."""
+
+    if not HAS_XGBOOST:
+        raise ImportError("xgboost not installed. Run: pip install xgboost")
+
+    input_dim = all_hidden.size(1)
+    logger.info(f"Input dim: {input_dim}")
+
+    n_samples_per_stage = len(data[TOKEN_LEVELS[0]]['labels'])
+    stage0_labels = all_labels[:n_samples_per_stage].numpy()
+
+    train_sample_idx, val_sample_idx = train_test_split(
+        np.arange(n_samples_per_stage),
+        test_size=val_ratio,
+        stratify=stage0_labels,
+        random_state=42
+    )
+
+    logger.info(f"\n{'='*50}")
+    logger.info(f"XGBoost Train/Val Split: {len(train_sample_idx)}/{len(val_sample_idx)} samples per stage")
+    logger.info(f"{'='*50}")
+
+    # Train per-stage XGBoost models
+    stage_models = {}
+    stage_accs = {}
+
+    for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+        logger.info(f"\nTraining XGBoost for Stage {stage_idx} (tokens={tokens})...")
+
+        # Get data for this stage
+        offset = stage_idx * n_samples_per_stage
+        stage_train_idx = train_sample_idx + offset
+        stage_val_idx = val_sample_idx + offset
+
+        X_train = all_hidden[stage_train_idx].numpy()
+        y_train = all_labels[stage_train_idx].numpy()
+        X_val = all_hidden[stage_val_idx].numpy()
+        y_val = all_labels[stage_val_idx].numpy()
+
+        # Compute scale_pos_weight for imbalanced data
+        neg_count = (y_train == 0).sum()
+        pos_count = (y_train == 1).sum()
+        scale_pos_weight = neg_count / pos_count if pos_count > 0 else 1.0
+
+        model = xgb.XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            scale_pos_weight=scale_pos_weight,
+            eval_metric='logloss',
+            early_stopping_rounds=10,
+            random_state=42,
+            n_jobs=-1,
+        )
+
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            verbose=False
+        )
+
+        # Evaluate
+        val_pred = model.predict(X_val)
+        stage_acc = (val_pred == y_val).mean()
+        stage_accs[tokens] = float(stage_acc)
+        stage_models[stage_idx] = model
+
+        logger.info(f"  Stage {stage_idx} (tokens={tokens}): Val Acc={stage_acc:.4f}")
+
+    # Create cascade classifier
+    cascade_model = XGBoostCascadeClassifier(stage_models)
+
+    # Prepare validation data
+    val_data = {}
+    for tokens in TOKEN_LEVELS:
+        val_data[tokens] = {
+            'hidden_states': data[tokens]['hidden_states'][val_sample_idx],
+            'labels': data[tokens]['labels'][val_sample_idx],
+        }
+
+    # Evaluate cascade with global thresholds
+    logger.info(f"\nCascade Results (Global Threshold):")
+    cascade_results = {}
+    for threshold in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+        result = simulate_cascade_xgb(cascade_model, val_data, threshold)
+        cascade_results[threshold] = result
+        logger.info(f"  Threshold {threshold}: Acc={result['accuracy']:.4f}, "
+                   f"Avg Tokens={result['avg_tokens']:.1f}, "
+                   f"Dist={result['token_distribution']}")
+
+    # Search for optimal per-stage thresholds
+    logger.info(f"\nSearching Optimal Per-Stage Thresholds (XGBoost):")
+    per_stage_results = {}
+
+    threshold_candidates = [0.3, 0.5, 0.7, 0.9]
+    from itertools import product
+
+    for opt_target in ["accuracy", "efficiency", "balanced"]:
+        best_result = None
+        best_score = -float('inf')
+
+        for combo in product(threshold_candidates, repeat=len(TOKEN_LEVELS)):
+            thresholds = list(combo)
+            result = simulate_cascade_xgb(cascade_model, val_data, per_stage_thresholds=thresholds)
+
+            if opt_target == "accuracy":
+                score = result['accuracy']
+            elif opt_target == "efficiency":
+                score = result['accuracy'] - result['avg_tokens'] / 1000.0 * 0.1
+            elif opt_target == "balanced":
+                score = result['accuracy'] * 0.7 + (1 - result['avg_tokens'] / 1000.0) * 0.3
+            else:
+                score = result['accuracy']
+
+            if score > best_score:
+                best_score = score
+                best_result = result
+
+        per_stage_results[opt_target] = {'best': best_result}
+        best = best_result
+        logger.info(f"  [{opt_target}] Best thresholds: {best['thresholds']}")
+        logger.info(f"           Acc={best['accuracy']:.4f}, Avg Tokens={best['avg_tokens']:.1f}, "
+                   f"Dist={best['token_distribution']}")
+
+    # Summary
+    mean_stage_acc = np.mean(list(stage_accs.values()))
+    logger.info(f"\n{'='*50}")
+    logger.info(f"XGBoost Summary")
+    logger.info(f"{'='*50}")
+    logger.info(f"Mean Per-Stage Binary Accuracy: {mean_stage_acc:.4f}")
+
+    logger.info(f"\n{'Threshold':<10} {'Accuracy':<15} {'Avg Tokens':<15}")
+    logger.info("-" * 50)
+    for threshold in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+        result = cascade_results[threshold]
+        logger.info(f"{threshold:<10} {result['accuracy']:.4f}          {result['avg_tokens']:<15.1f}")
+
+    return {
+        'mean_stage_acc': float(mean_stage_acc),
+        'stage_accs': stage_accs,
+        'cascade_results': cascade_results,
+        'per_stage_thresholds': per_stage_results,
+    }
+
+
 def run_single_split(
     all_hidden: torch.Tensor,
     all_labels: torch.Tensor,
@@ -651,6 +867,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train cascaded hidden state classifier")
     parser.add_argument("--data-dir", type=str, required=True,
                         help="Directory with hidden states .pt files")
+    parser.add_argument("--model", type=str, default="mlp", choices=["mlp", "xgboost"],
+                        help="Model type: mlp (default) or xgboost")
     parser.add_argument("--n-folds", type=int, default=5)
     parser.add_argument("--no-cv", action="store_true",
                         help="Use simple 80:20 train/val split instead of cross-validation")
@@ -673,7 +891,16 @@ def main():
     all_hidden, all_labels, all_stages = prepare_cascaded_data(data)
 
     # Run training
-    if args.no_cv:
+    if args.model == "xgboost":
+        logger.info("Using XGBoost (per-stage classifiers)")
+        results = run_xgboost_single_split(
+            all_hidden,
+            all_labels,
+            all_stages,
+            data,
+            val_ratio=args.val_ratio,
+        )
+    elif args.no_cv:
         results = run_single_split(
             all_hidden,
             all_labels,
