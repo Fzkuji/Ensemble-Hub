@@ -87,30 +87,42 @@ def load_collected_data(data_dir: str) -> Dict[int, Dict]:
                 }
                 logger.info(f"Loaded tokens={tokens}: {len(loaded['labels'])} samples")
 
-    # Load original json to get problem text
-    json_files = []
+    # Load all json files
+    json_data_by_tokens = {}
     for f in os.listdir(data_dir):
-        if "_tokens0.json" in f or "tokens0.json" in f:
-            json_files.append(os.path.join(data_dir, f))
+        if f.endswith(".json"):
+            filepath = os.path.join(data_dir, f)
+            # Extract token level from filename
+            for tokens in TOKEN_LEVELS + ["mentor_only"]:
+                token_str = str(tokens) if isinstance(tokens, int) else tokens
+                if f"tokens{token_str}" in f or f"_{token_str}.json" in f:
+                    with open(filepath, 'r') as file:
+                        json_data_by_tokens[token_str] = json.load(file)
+                    logger.info(f"Loaded JSON: {f} ({len(json_data_by_tokens[token_str])} samples)")
+                    break
+            # Also check for mentor_only
+            if "mentor_only" in f:
+                with open(filepath, 'r') as file:
+                    json_data_by_tokens["mentor_only"] = json.load(file)
+                logger.info(f"Loaded JSON: {f}")
+
+    # Get problems from tokens0 or first available
+    problems = []
+    reference_data = None
+    for key in ["0", "tokens0", "mentor_only"]:
+        if key in json_data_by_tokens:
+            reference_data = json_data_by_tokens[key]
             break
 
-    if not json_files:
-        # Try any json file
-        for f in os.listdir(data_dir):
-            if f.endswith(".json"):
-                json_files.append(os.path.join(data_dir, f))
-                break
+    if reference_data is None and json_data_by_tokens:
+        reference_data = list(json_data_by_tokens.values())[0]
 
-    problems = []
-    if json_files:
-        logger.info(f"Loading problems from {json_files[0]}")
-        with open(json_files[0], 'r') as f:
-            json_data = json.load(f)
-        for item in json_data:
+    if reference_data:
+        for item in reference_data:
             problems.append(item.get("question", item.get("problem", "")).strip())
-        logger.info(f"Loaded {len(problems)} problems from JSON")
+        logger.info(f"Loaded {len(problems)} problems")
 
-    return data, problems
+    return data, problems, json_data_by_tokens
 
 
 def split_data_by_subset(
@@ -118,6 +130,7 @@ def split_data_by_subset(
     problems: List[str],
     metadata: Dict[str, Dict],
     output_dir: str,
+    json_data_by_tokens: Dict[str, List] = None,
 ):
     """Split data by subset and train/test."""
 
@@ -228,6 +241,48 @@ def split_data_by_subset(
     else:
         logger.info("No hidden states found, saving only index mapping")
 
+    # Save JSON data if available
+    if json_data_by_tokens:
+        logger.info("\nSaving split JSON files...")
+
+        # Save by subset
+        for subset in SUBSETS:
+            for split in ["train", "test"]:
+                indices = subset_split_indices[subset][split]
+                if not indices:
+                    continue
+
+                subset_split_dir = os.path.join(output_dir, subset, split)
+                os.makedirs(subset_split_dir, exist_ok=True)
+
+                for token_key, json_data in json_data_by_tokens.items():
+                    split_json = [json_data[i] for i in indices]
+                    save_path = os.path.join(subset_split_dir, f"tokens{token_key}.json")
+                    with open(save_path, 'w') as f:
+                        json.dump(split_json, f, indent=2, ensure_ascii=False)
+
+                logger.info(f"Saved JSON for {subset}/{split}: {len(indices)} samples")
+
+        # Save combined train/test
+        for split in ["train", "test"]:
+            all_indices = []
+            for subset in SUBSETS:
+                all_indices.extend(subset_split_indices[subset][split])
+
+            if not all_indices:
+                continue
+
+            split_dir = os.path.join(output_dir, f"all_{split}")
+            os.makedirs(split_dir, exist_ok=True)
+
+            for token_key, json_data in json_data_by_tokens.items():
+                split_json = [json_data[i] for i in all_indices]
+                save_path = os.path.join(split_dir, f"tokens{token_key}.json")
+                with open(save_path, 'w') as f:
+                    json.dump(split_json, f, indent=2, ensure_ascii=False)
+
+            logger.info(f"Saved JSON for all_{split}: {len(all_indices)} samples")
+
     # Save index mapping for reference
     index_map = {
         "subsets": {
@@ -259,14 +314,14 @@ def main():
     metadata = load_hendrycks_math_metadata()
 
     # Load collected data
-    data, problems = load_collected_data(args.data_dir)
+    data, problems, json_data_by_tokens = load_collected_data(args.data_dir)
 
     if not problems:
         logger.error("Could not load problem texts. Please check data directory.")
         return
 
     # Split and save
-    split_data_by_subset(data, problems, metadata, args.output_dir)
+    split_data_by_subset(data, problems, metadata, args.output_dir, json_data_by_tokens)
 
     logger.info("Done!")
 
