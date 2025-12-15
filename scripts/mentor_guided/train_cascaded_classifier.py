@@ -88,6 +88,87 @@ class CascadedClassifier(nn.Module):
         return self.net(x)
 
 
+class AttentionClassifier(nn.Module):
+    """
+    Attention-based classifier that treats hidden states as a sequence of chunks.
+    Uses self-attention to learn which parts of the hidden states are most important.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_stages: int = 4,
+        num_heads: int = 4,
+        chunk_size: int = 64,
+        hidden_dim: int = 128,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.num_chunks = input_dim // chunk_size
+        assert input_dim % chunk_size == 0, f"input_dim {input_dim} must be divisible by chunk_size {chunk_size}"
+
+        # Stage embedding
+        self.stage_embedding = nn.Embedding(num_stages, chunk_size)
+
+        # Project chunks to hidden_dim
+        self.input_proj = nn.Linear(chunk_size, hidden_dim)
+
+        # Self-attention layer
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_norm = nn.LayerNorm(hidden_dim)
+
+        # Learnable query for pooling
+        self.pool_query = nn.Parameter(torch.randn(1, 1, hidden_dim))
+
+        # Cross-attention for pooling
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.cross_norm = nn.LayerNorm(hidden_dim)
+
+        # Output head
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 2),
+        )
+
+    def forward(self, hidden_states, stages):
+        batch_size = hidden_states.size(0)
+
+        # Reshape to chunks: [batch, num_chunks, chunk_size]
+        x = hidden_states.view(batch_size, self.num_chunks, self.chunk_size)
+
+        # Add stage embedding as an extra token
+        stage_embed = self.stage_embedding(stages).unsqueeze(1)  # [batch, 1, chunk_size]
+        x = torch.cat([stage_embed, x], dim=1)  # [batch, num_chunks+1, chunk_size]
+
+        # Project to hidden dim
+        x = self.input_proj(x)  # [batch, num_chunks+1, hidden_dim]
+
+        # Self-attention
+        attn_out, _ = self.self_attn(x, x, x)
+        x = self.attn_norm(x + attn_out)
+
+        # Cross-attention pooling with learnable query
+        query = self.pool_query.expand(batch_size, -1, -1)  # [batch, 1, hidden_dim]
+        pooled, attn_weights = self.cross_attn(query, x, x)
+        pooled = self.cross_norm(pooled).squeeze(1)  # [batch, hidden_dim]
+
+        # Classify
+        return self.classifier(pooled)
+
+
 def load_all_hidden_data(data_dir: str) -> Dict[int, Dict]:
     """Load hidden states from all token level .pt files."""
     data = {}
@@ -575,6 +656,7 @@ def run_single_split(
     batch_size: int = 128,
     lr: float = 1e-3,
     device: str = "cuda",
+    model_type: str = "mlp",  # "mlp" or "attention"
 ) -> Dict:
     """Run training with simple train/val split (80:20)."""
 
@@ -624,7 +706,12 @@ def run_single_split(
     class_weights = class_weights / class_weights.sum() * 2
     class_weights = class_weights.to(device)
 
-    model = CascadedClassifier(input_dim).to(device)
+    if model_type == "attention":
+        model = AttentionClassifier(input_dim).to(device)
+        logger.info("Using AttentionClassifier")
+    else:
+        model = CascadedClassifier(input_dim).to(device)
+        logger.info("Using CascadedClassifier (MLP)")
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -867,8 +954,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train cascaded hidden state classifier")
     parser.add_argument("--data-dir", type=str, required=True,
                         help="Directory with hidden states .pt files")
-    parser.add_argument("--model", type=str, default="mlp", choices=["mlp", "xgboost"],
-                        help="Model type: mlp (default) or xgboost")
+    parser.add_argument("--model", type=str, default="mlp", choices=["mlp", "attention", "xgboost"],
+                        help="Model type: mlp (default), attention, or xgboost")
     parser.add_argument("--n-folds", type=int, default=5)
     parser.add_argument("--no-cv", action="store_true",
                         help="Use simple 80:20 train/val split instead of cross-validation")
@@ -900,7 +987,7 @@ def main():
             data,
             val_ratio=args.val_ratio,
         )
-    elif args.no_cv:
+    elif args.model in ["mlp", "attention"] and args.no_cv:
         results = run_single_split(
             all_hidden,
             all_labels,
@@ -911,8 +998,9 @@ def main():
             batch_size=args.batch_size,
             lr=args.lr,
             device=args.device,
+            model_type=args.model,
         )
-    else:
+    elif args.model in ["mlp", "attention"]:
         results = run_cross_validation(
             all_hidden,
             all_labels,
