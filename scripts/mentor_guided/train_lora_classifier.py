@@ -10,24 +10,34 @@ Architecture:
 """
 
 import argparse
-import gc
+import glob
 import json
 import logging
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, TaskType
-from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 TOKEN_LEVELS = [0, 100, 500, 1000]
+
+# Available subsets
+SUBSETS = [
+    "algebra",
+    "counting_and_probability",
+    "geometry",
+    "intermediate_algebra",
+    "number_theory",
+    "prealgebra",
+    "precalculus",
+]
 
 
 class MentorClassifierHead(nn.Module):
@@ -130,27 +140,26 @@ def collate_fn(batch, tokenizer):
 
 
 def load_json_data(data_dir: str, split: str = "train") -> Dict[int, List[Dict]]:
-    """Load JSON data for all token levels."""
+    """Load JSON data for all token levels.
+
+    Expects structure: data_dir/{split}/tokens{0,100,500,1000}.json
+    """
     data = {}
-    split_dir = os.path.join(data_dir, split) if os.path.exists(os.path.join(data_dir, split)) else data_dir
+    split_dir = os.path.join(data_dir, split)
+
+    if not os.path.exists(split_dir):
+        # Fallback to data_dir directly
+        split_dir = data_dir
+        logger.warning(f"Split dir not found, using: {split_dir}")
 
     for tokens in TOKEN_LEVELS:
-        # Try different filename patterns
-        for pattern in [f"tokens{tokens}.json", f"tokens{tokens}_*.json"]:
-            import glob
-            files = glob.glob(os.path.join(split_dir, pattern.replace("*", "*")))
-            if not files:
-                files = glob.glob(os.path.join(data_dir, pattern.replace("*", "*")))
-
-            for filepath in files:
-                if 'mentor_only' in filepath:
-                    continue
-                with open(filepath, 'r') as f:
-                    data[tokens] = json.load(f)
-                logger.info(f"Loaded {len(data[tokens])} samples from {filepath}")
-                break
-            if tokens in data:
-                break
+        filepath = os.path.join(split_dir, f"tokens{tokens}.json")
+        if os.path.exists(filepath):
+            with open(filepath, 'r') as f:
+                data[tokens] = json.load(f)
+            logger.info(f"Loaded {len(data[tokens])} samples from {filepath}")
+        else:
+            logger.warning(f"File not found: {filepath}")
 
     return data
 
@@ -252,12 +261,16 @@ def eval_epoch(model, dataloader, criterion, device):
 
 def main():
     parser = argparse.ArgumentParser(description="LoRA fine-tuning for mentor classification")
-    parser.add_argument("--data-dir", type=str, required=True,
-                        help="Directory with JSON data files")
+    parser.add_argument("--data-dir", type=str,
+                        default="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split",
+                        help="Base directory with subset folders")
+    parser.add_argument("--subset", type=str, default="algebra",
+                        choices=SUBSETS + ["all"],
+                        help="Which subset to train on (default: algebra)")
     parser.add_argument("--model-path", type=str,
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
     parser.add_argument("--output-dir", type=str, default=None,
-                        help="Directory to save model (default: data_dir/lora_model)")
+                        help="Directory to save model (default: data_dir/{subset}/lora_model)")
     parser.add_argument("--lora-r", type=int, default=8,
                         help="LoRA rank")
     parser.add_argument("--lora-alpha", type=int, default=16,
@@ -269,7 +282,6 @@ def main():
     parser.add_argument("--grad-accum", type=int, default=8,
                         help="Gradient accumulation steps")
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--use-4bit", action="store_true",
                         help="Use 4-bit quantization")
@@ -277,34 +289,52 @@ def main():
     args = parser.parse_args()
     device = args.device
 
+    # Determine subset directory
+    if args.subset == "all":
+        subset_dir = args.data_dir
+        # Use all_train / all_test folders
+        train_split = "all_train"
+        test_split = "all_test"
+    else:
+        subset_dir = os.path.join(args.data_dir, args.subset)
+        train_split = "train"
+        test_split = "test"
+
     if args.output_dir is None:
-        args.output_dir = os.path.join(args.data_dir, "lora_model")
+        args.output_dir = os.path.join(subset_dir, "lora_model")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load data
-    logger.info("Loading data...")
-    all_data = load_json_data(args.data_dir)
-    if not all_data:
-        logger.error("No data found!")
+    logger.info(f"Subset: {args.subset}")
+    logger.info(f"Data dir: {subset_dir}")
+
+    # Load train and test data separately (already split)
+    logger.info("Loading training data...")
+    train_data = load_json_data(subset_dir, split=train_split)
+    if not train_data:
+        logger.error("No training data found!")
         return
 
-    # Train/val split based on sample indices
-    n_samples = len(all_data[TOKEN_LEVELS[0]])
-    train_idx, val_idx = train_test_split(
-        np.arange(n_samples),
-        test_size=args.val_ratio,
-        random_state=42,
-    )
+    logger.info("Loading test data...")
+    test_data = load_json_data(subset_dir, split=test_split)
+    if not test_data:
+        logger.warning("No test data found, will use train data for validation")
+        # Fall back to train/val split
+        from sklearn.model_selection import train_test_split
+        n_samples = len(train_data[TOKEN_LEVELS[0]])
+        train_idx, val_idx = train_test_split(
+            np.arange(n_samples), test_size=0.2, random_state=42
+        )
+        val_data = {}
+        for tokens in TOKEN_LEVELS:
+            if tokens in train_data:
+                val_data[tokens] = [train_data[tokens][i] for i in val_idx]
+                train_data[tokens] = [train_data[tokens][i] for i in train_idx]
+    else:
+        val_data = test_data
 
-    # Split data
-    train_data = {}
-    val_data = {}
-    for tokens in TOKEN_LEVELS:
-        if tokens in all_data:
-            train_data[tokens] = [all_data[tokens][i] for i in train_idx]
-            val_data[tokens] = [all_data[tokens][i] for i in val_idx]
-
-    logger.info(f"Train: {len(train_idx)} samples, Val: {len(val_idx)} samples")
+    n_train = len(train_data[TOKEN_LEVELS[0]])
+    n_val = len(val_data[TOKEN_LEVELS[0]])
+    logger.info(f"Train: {n_train} samples, Val: {n_val} samples")
 
     # Load tokenizer
     logger.info(f"Loading tokenizer from {args.model_path}...")
@@ -422,11 +452,15 @@ def main():
 
     # Save results
     results = {
+        'subset': args.subset,
+        'n_train': n_train,
+        'n_val': n_val,
         'best_val_acc': float(best_val_acc),
         'args': vars(args),
     }
     with open(os.path.join(args.output_dir, "results.json"), 'w') as f:
         json.dump(results, f, indent=2)
+    logger.info(f"Results saved to {args.output_dir}/results.json")
 
 
 if __name__ == "__main__":
