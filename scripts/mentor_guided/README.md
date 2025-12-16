@@ -1,95 +1,361 @@
-# Mentor-Guided Adaptive Inference Framework
+# ACT-E: Adaptive Control of LLM Thinking Ensemble
 
-## 导师引导的自适应推理框架
+## 完整实验流程
 
-### 核心思想
+本文档提供从数据收集到结果对比的完整实验流程。所有命令默认使用 8 GPU 并行。
 
-大模型不再机械地写八股文（如生成完整大纲），而是像导师一样，只负责攻克最难的"起步阶段"。通过监测小模型的"熵"指标，验证大模型输出对小模型的实际帮助程度，实现真正的高效交接。
+---
 
-### 工作原理
+## 目录
 
-1. **大模型推理**：Streaming方式输出token
-2. **小模型监测**：这些token连续输入小模型，计算小模型对下一个token的预测分布熵
-3. **自适应切换**：当熵降低到阈值以下（表示小模型已有足够信心），切换到小模型独立推理
+1. [环境准备](#1-环境准备)
+2. [数据收集](#2-数据收集)
+3. [数据统计](#3-数据统计)
+4. [LoRA 分类器训练](#4-lora-分类器训练)
+5. [Cascade 评估](#5-cascade-评估)
+6. [结果汇总](#6-结果汇总)
+7. [一键运行](#7-一键运行)
 
-### 熵作为"有益性"指标
+---
 
-- **高熵**：小模型不确定，需要更多帮助
-- **低熵**：小模型有信心，可以独立继续
-- **熵减**：相比baseline的熵降低，表示大模型的帮助有效
-
-## 文件说明
-
-### mentor_guided_inference.py
-核心实现文件，包含：
-- `MentorGuidedInference`: 主要推理类
-- `EntropyMetrics`: 熵相关指标
-- `InferenceState`: 推理状态追踪
-
-### test_multi_length.py
-**主要测试脚本**：测试大模型提供不同长度token后，小模型接续推理的效果。
+## 1. 环境准备
 
 ```bash
-# 基本用法
-python test_multi_length.py
-
-# 自定义参数
-python test_multi_length.py \
-    --mentor-model Qwen/Qwen2.5-7B-Instruct \
-    --student-model Qwen/Qwen2.5-1.5B-Instruct \
-    --lengths 0,10,20,50,100,200 \
-    --student-max-tokens 300
-
-# 自定义prompt
-python test_multi_length.py --prompt "你的问题..."
+pip install torch transformers peft datasets scikit-learn tqdm numpy vllm
 ```
 
-### analyze_entropy.py
-熵轨迹分析和可视化脚本。
+---
 
-### test_mentor_guided.py
-在多个测试问题上评估效果。
+## 2. 数据收集
 
-## 参数说明
+### 2.1 方式一：标准推理（无结构化思考）
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--mentor-model` | Qwen/Qwen2.5-1.5B-Instruct | 大模型（导师） |
-| `--student-model` | Qwen/Qwen2.5-0.5B-Instruct | 小模型（学生） |
-| `--lengths` | 0,10,20,50,100,200 | 测试的大模型token长度列表 |
-| `--student-max-tokens` | 200 | 小模型最大生成长度 |
-| `--entropy-threshold` | 2.0 | 熵阈值（低于此值切换到小模型） |
-| `--reduction-threshold` | 0.3 | 熵减阈值（30%减少视为有效） |
-| `--temperature` | 0.7 | 采样温度 |
+```bash
+cd /home/fzkuji/PycharmProjects/Ensemble-Hub/scripts/mentor_guided
 
-## 输出示例
+# 收集 train split（8 GPU 并行）
+python collect_progressive_data.py \
+    --dataset hendrycks_math \
+    --split train \
+    --parallel \
+    --gpus 0,1,2,3,4,5,6,7
 
-```
-Testing mentor lengths: [0, 10, 20, 50, 100, 200]
-Length   0: initial_entropy=4.2341
-Length  10: initial_entropy=3.8567
-Length  20: initial_entropy=3.1234
-Length  50: initial_entropy=2.4521
-Length 100: initial_entropy=1.8234
-Length 200: initial_entropy=1.5632
-
-RESULTS SUMMARY
-Baseline entropy (no mentor help): 4.2341
-Best length: 100 tokens
-Min entropy achieved: 1.5632
-
-Entropy by mentor length:
-    0 tokens: entropy=4.2341, reduction=+0.0%
-   10 tokens: entropy=3.8567, reduction=+8.9%
-   20 tokens: entropy=3.1234, reduction=+26.2%
-   50 tokens: entropy=2.4521, reduction=+42.1%
-  100 tokens: entropy=1.8234, reduction=+56.9%
-  200 tokens: entropy=1.5632, reduction=+63.1%
+# 收集 test split（8 GPU 并行）
+python collect_progressive_data.py \
+    --dataset hendrycks_math \
+    --split test \
+    --parallel \
+    --gpus 0,1,2,3,4,5,6,7
 ```
 
-## 后续集成
+**输出目录**: `/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split/`
 
-如果测试效果良好，可以将此方法集成到 Ensemble-Hub 主框架中：
-1. 在 `ensemblehub/utils/` 添加熵计算工具
-2. 在 `ensemblehub/ensemble_methods/output_aggregation/sentence_level/` 添加 `mentor_guided_selector.py`
-3. 在 `ensemble.py` 的 `OUTPUT_AGGREGATORS` 注册新方法
+### 2.2 方式二：结构化思考推理（vLLM + Think Token）
+
+```bash
+# 收集 train split
+python collect_data_vllm_think.py --split train --gpu 0
+
+# 收集 test split
+python collect_data_vllm_think.py --split test --gpu 0
+```
+
+**输出目录**: `/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B/`
+
+---
+
+## 3. 数据统计
+
+```bash
+# 标准数据统计
+python compute_stats.py --split test
+python compute_stats.py --split train
+
+# Think 数据统计
+python compute_stats.py \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B \
+    --split test
+```
+
+---
+
+## 4. LoRA 分类器训练
+
+### 4.1 标准数据训练（所有子集）
+
+```bash
+# algebra
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset algebra
+
+# counting_and_probability
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset counting_and_probability
+
+# geometry
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset geometry
+
+# intermediate_algebra
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset intermediate_algebra
+
+# number_theory
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset number_theory
+
+# prealgebra
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset prealgebra
+
+# precalculus
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset precalculus
+
+# 所有子集合并训练
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset all
+```
+
+### 4.2 Think 数据训练（所有子集）
+
+```bash
+# algebra
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset algebra \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# counting_and_probability
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset counting_and_probability \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# geometry
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset geometry \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# intermediate_algebra
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset intermediate_algebra \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# number_theory
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset number_theory \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# prealgebra
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset prealgebra \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# precalculus
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset precalculus \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# 所有子集合并训练
+torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset all \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+```
+
+---
+
+## 5. Cascade 评估
+
+### 5.1 标准数据评估（所有子集）
+
+```bash
+# algebra
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset algebra
+
+# counting_and_probability
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset counting_and_probability
+
+# geometry
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset geometry
+
+# intermediate_algebra
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset intermediate_algebra
+
+# number_theory
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset number_theory
+
+# prealgebra
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset prealgebra
+
+# precalculus
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset precalculus
+```
+
+### 5.2 Think 数据评估（所有子集）
+
+```bash
+# algebra
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset algebra \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# counting_and_probability
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset counting_and_probability \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# geometry
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset geometry \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# intermediate_algebra
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset intermediate_algebra \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# number_theory
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset number_theory \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# prealgebra
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset prealgebra \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+
+# precalculus
+torchrun --nproc_per_node=8 eval_lora_cascade.py --subset precalculus \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+```
+
+---
+
+## 6. 结果汇总
+
+```bash
+# 标准数据结果
+python summarize_results.py
+
+# Think 数据结果
+python summarize_results.py \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+```
+
+**输出示例**:
+
+```
+====================================================================================================================================================================================
+Subset                    N      T0                      T100                    T500                    T1000                   Oracle   Cascade  Gap
+                                 acc     m_len   i_len   acc     m_len   i_len   acc     m_len   i_len   acc     m_len   i_len
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+algebra                   1187   0.7321  -       234.5   0.7489  78.8    198.3   0.7623  356.2   156.2   0.7712  712.4   112.4   0.8234   0.7956   +0.0244
+counting_and_probability  474    0.6456  -       289.1   0.6624  82.3    245.6   0.6835  401.3   201.3   0.6962  758.7   158.7   0.7511   0.7234   +0.0272
+geometry                  479    0.4530  -       312.8   0.4697  85.6    267.4   0.4843  423.1   223.1   0.4968  778.9   178.9   0.5678   0.5312   +0.0344
+intermediate_algebra      903    0.3211  -       356.2   0.3389  89.2    301.5   0.3567  456.8   256.8   0.3689  812.1   212.1   0.4234   0.3912   +0.0223
+number_theory             540    0.6012  -       267.3   0.6234  76.5    223.8   0.6423  379.5   179.5   0.6589  735.2   135.2   0.7123   0.6823   +0.0234
+prealgebra                871    0.7823  -       198.6   0.7956  68.4    156.2   0.8089  312.9   112.9   0.8189  678.5   78.5    0.8567   0.8312   +0.0123
+precalculus               546    0.3412  -       378.4   0.3589  92.1    323.7   0.3756  478.1   278.1   0.3889  834.5   234.5   0.4456   0.4123   +0.0234
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+TOTAL (weighted)          5000   0.5538  -       278.3   0.5723  81.2    234.6   0.5889  389.2   189.2   0.6012  745.8   145.8   0.6543   0.6234   +0.0245
+====================================================================================================================================================================================
+```
+
+- `acc`: 准确率
+- `m_len`: mentor（大模型）平均生成长度（tokens）
+- `i_len`: intern（小模型）平均生成长度（tokens）
+
+---
+
+## 7. 一键运行
+
+### 7.1 标准数据完整流程
+
+```bash
+./run_standard.sh
+```
+
+### 7.2 Think 数据完整流程
+
+```bash
+./run_think.sh
+```
+
+---
+
+## 附录
+
+### A. 数据目录结构
+
+```
+/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/
+├── hendrycks_math_split/                    # 标准数据
+│   ├── algebra/
+│   │   ├── train/
+│   │   │   ├── tokens0.json
+│   │   │   ├── tokens100.json
+│   │   │   ├── tokens500.json
+│   │   │   └── tokens1000.json
+│   │   ├── test/
+│   │   │   └── ...
+│   │   └── lora_model/                      # 训练后的模型
+│   │       ├── best_model.pt
+│   │       ├── cascade_eval.json            # 评估结果
+│   │       └── results.json
+│   ├── counting_and_probability/
+│   ├── geometry/
+│   ├── intermediate_algebra/
+│   ├── number_theory/
+│   ├── prealgebra/
+│   └── precalculus/
+│
+└── hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B/   # Think 数据
+    └── ... (同上结构)
+```
+
+### B. JSON 字段说明
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `question` | str | 问题文本 |
+| `ground_truth` | str | 标准答案 |
+| `mentor_tokens` | int | mentor token 数量 (0/100/500/1000) |
+| `mentor_response` | str | mentor 的推理过程 |
+| `response` | str | 完整推理响应 |
+| `is_correct` | bool | 答案是否正确 |
+
+### C. 评估结果说明
+
+| 指标 | 说明 |
+|------|------|
+| T0 | 无 mentor token 时的准确率 |
+| T100 | 100 mentor tokens 时的准确率 |
+| T500 | 500 mentor tokens 时的准确率 |
+| T1000 | 1000 mentor tokens 时的准确率 |
+| Oracle | 理论最优（任一 token level 正确即正确） |
+| Cascade | LoRA 分类器 cascade 准确率 |
+| Gap | Cascade - Best Baseline（提升） |
+
+### D. 文件说明
+
+| 文件 | 说明 |
+|------|------|
+| `collect_progressive_data.py` | 标准数据收集（8 GPU 并行） |
+| `collect_data_vllm_think.py` | Think 数据收集（vLLM） |
+| `compute_stats.py` | 计算 Oracle/Baseline 统计 |
+| `train_lora_classifier.py` | LoRA 分类器训练（8 GPU DDP） |
+| `eval_lora_cascade.py` | Cascade 评估（8 GPU DDP） |
+| `summarize_results.py` | 汇总所有子集结果 |
+| `eval_model.py` | 单独评测模型性能 |
+
+---
+
+## 8. 单独模型评测
+
+用于对比不同模型的性能（准确率、生成长度、推理速度）。
+
+```bash
+# 使用 vLLM 评测（推荐）
+python eval_model.py --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B --gpu 0
+
+# 评测其他模型
+python eval_model.py --model Qwen/Qwen2.5-7B-Instruct --gpu 0
+python eval_model.py --model meta-llama/Llama-3.1-8B-Instruct --gpu 0
+
+# 评测特定子集
+python eval_model.py --model xxx --subset algebra
+
+# 使用 HuggingFace 后端
+python eval_model.py --model xxx --backend hf
+
+# 快速测试（限制样本数）
+python eval_model.py --model xxx --max-samples 100
+
+# 禁用 CoT
+python eval_model.py --model xxx --no-cot
+```
+
+**输出目录**: `/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/eval_results/{model_name}/`
+
+**输出指标**:
+- 准确率 (Accuracy)
+- 生成长度统计 (mean/median/min/max tokens)
+- 推理速度 (tokens/s)
+- 按难度级别的准确率 (Level 1-5)
