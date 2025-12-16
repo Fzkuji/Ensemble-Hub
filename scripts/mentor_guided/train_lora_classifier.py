@@ -355,6 +355,8 @@ def main():
                         help="Use DistributedDataParallel (use with torchrun)")
     parser.add_argument("--no-filter", action="store_true",
                         help="Don't filter out all-correct/all-wrong samples")
+    parser.add_argument("--dropout", type=float, default=0.1,
+                        help="Dropout rate for classifier head")
 
     args = parser.parse_args()
 
@@ -481,7 +483,7 @@ def main():
 
     # Create classification head
     hidden_size = base_model.config.hidden_size
-    classifier_head = MentorClassifierHead(hidden_size).to(device)
+    classifier_head = MentorClassifierHead(hidden_size, dropout=args.dropout).to(device)
 
     # Combine into single model
     model = LoRAClassifier(base_model, classifier_head)
