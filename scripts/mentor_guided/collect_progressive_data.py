@@ -951,12 +951,28 @@ def main():
     else:
         # Load from local file (legacy datasets)
         if args.split == "all":
-            data_file = os.path.join(data_dir, args.dataset, "all.json")
+            # Try all.json first, otherwise merge train.json and test.json
+            all_file = os.path.join(data_dir, args.dataset, "all.json")
+            if os.path.exists(all_file):
+                with open(all_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                logger.info(f"Loaded {len(data)} samples from {all_file}")
+            else:
+                # Merge train and test
+                data = []
+                for split_name in ["train", "test"]:
+                    split_file = os.path.join(data_dir, args.dataset, f"{split_name}.json")
+                    if os.path.exists(split_file):
+                        with open(split_file, 'r', encoding='utf-8') as f:
+                            split_data = json.load(f)
+                        data.extend(split_data)
+                        logger.info(f"Loaded {len(split_data)} samples from {split_file}")
+                logger.info(f"Total: {len(data)} samples (merged train + test)")
         else:
             data_file = os.path.join(data_dir, args.dataset, f"{args.split}.json")
-        with open(data_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        logger.info(f"Loaded {len(data)} samples from {data_file}")
+            with open(data_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            logger.info(f"Loaded {len(data)} samples from {data_file}")
 
     # Set output directory
     if args.output_dir is None:
