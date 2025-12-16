@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import gc
 import json
 import logging
 import math
@@ -181,15 +182,68 @@ def compute_oracle_accuracy(all_data: Dict[int, List[Dict]]) -> float:
     return oracle_correct / n_samples
 
 
-def train_on_subset(
+def precompute_train_hidden_states(
     intern_model,
     tokenizer,
     train_data: Dict[int, List[Dict]],
+    max_mentor_tokens: int,
+    device: str,
+) -> Dict[int, Dict]:
+    """Pre-extract hidden states for training data (one sample at a time to save memory)."""
+    logger.info("    Pre-extracting training hidden states...")
+    n_samples = len(train_data[TOKEN_LEVELS[0]])
+    cached = {}
+
+    for tokens in TOKEN_LEVELS:
+        all_hidden = []
+        all_mask = []
+
+        for i in tqdm(range(n_samples), desc=f"      train tokens{tokens}", leave=False):
+            item = train_data[tokens][i]
+            question = item['question']
+            mentor_response = item.get('mentor_response', '')
+
+            hidden, mask = extract_hidden_states(
+                intern_model, tokenizer, [question], [mentor_response],
+                max_mentor_tokens, device
+            )
+            all_hidden.append(hidden[0].cpu())
+            all_mask.append(mask[0].cpu())
+
+            # Clear cache periodically
+            if i % 50 == 0:
+                torch.cuda.empty_cache()
+
+        # Pad to same length
+        max_len = max(h.shape[0] for h in all_hidden)
+        hidden_dim = all_hidden[0].shape[1]
+
+        padded_hidden = torch.zeros(n_samples, max_len, hidden_dim)
+        padded_mask = torch.zeros(n_samples, max_len)
+
+        for i, (h, m) in enumerate(zip(all_hidden, all_mask)):
+            seq_len = h.shape[0]
+            padded_hidden[i, :seq_len] = h
+            padded_mask[i, :seq_len] = m
+
+        cached[tokens] = {
+            'hidden_states': padded_hidden,
+            'attention_mask': padded_mask,
+            'labels': torch.tensor([1 if item.get('is_correct', False) else 0
+                                   for item in train_data[tokens]]),
+        }
+        torch.cuda.empty_cache()
+
+    return cached
+
+
+def train_on_cached_data(
+    cached_train: Dict[int, Dict],
     hidden_dim: int,
     args,
     device: str,
 ) -> nn.Module:
-    """Train transformer classifier on a single subset."""
+    """Train transformer classifier on pre-extracted hidden states."""
     classifier = TransformerClassifier(
         input_dim=hidden_dim,
         num_stages=len(TOKEN_LEVELS),
@@ -197,11 +251,11 @@ def train_on_subset(
         nhead=args.nhead,
     ).to(device)
 
-    n_samples = len(train_data[TOKEN_LEVELS[0]])
-    train_labels = [1 if item.get('is_correct', False) else 0 for item in train_data[TOKEN_LEVELS[0]]]
+    n_samples = len(cached_train[TOKEN_LEVELS[0]]['labels'])
+    train_labels = cached_train[TOKEN_LEVELS[0]]['labels']
 
-    pos_count = sum(train_labels)
-    neg_count = len(train_labels) - pos_count
+    pos_count = (train_labels == 1).sum().item()
+    neg_count = (train_labels == 0).sum().item()
     if pos_count > 0 and neg_count > 0:
         class_weights = torch.tensor([1.0 / neg_count, 1.0 / pos_count], device=device)
         class_weights = class_weights / class_weights.sum() * 2
@@ -228,27 +282,36 @@ def train_on_subset(
             batch_idx = indices[batch_start:batch_start + args.batch_size]
             batch_stages = np.random.randint(0, len(TOKEN_LEVELS), size=len(batch_idx))
 
-            questions = []
-            mentor_responses = []
+            # Collect batch data from cached hidden states
+            batch_hidden_list = []
+            batch_mask_list = []
             batch_labels = []
 
             for sample_idx, stage_idx in zip(batch_idx, batch_stages):
                 token_level = TOKEN_LEVELS[stage_idx]
-                item = train_data[token_level][sample_idx]
-                questions.append(item['question'])
-                mentor_responses.append(item.get('mentor_response', ''))
-                batch_labels.append(1 if item.get('is_correct', False) else 0)
+                batch_hidden_list.append(cached_train[token_level]['hidden_states'][sample_idx])
+                batch_mask_list.append(cached_train[token_level]['attention_mask'][sample_idx])
+                batch_labels.append(cached_train[token_level]['labels'][sample_idx].item())
 
-            hidden, mask = extract_hidden_states(
-                intern_model, tokenizer, questions, mentor_responses,
-                args.max_mentor_tokens, device
-            )
+            # Pad batch to same length
+            max_len = max(h.shape[0] for h in batch_hidden_list)
+            hidden_dim_batch = batch_hidden_list[0].shape[1]
 
+            batch_hidden = torch.zeros(len(batch_idx), max_len, hidden_dim_batch)
+            batch_mask = torch.zeros(len(batch_idx), max_len)
+
+            for i, (h, m) in enumerate(zip(batch_hidden_list, batch_mask_list)):
+                seq_len = h.shape[0]
+                batch_hidden[i, :seq_len] = h
+                batch_mask[i, :seq_len] = m
+
+            batch_hidden = batch_hidden.to(device)
+            batch_mask = batch_mask.to(device)
             labels_tensor = torch.tensor(batch_labels, dtype=torch.long, device=device)
             stages_tensor = torch.tensor(batch_stages, dtype=torch.long, device=device)
 
             optimizer.zero_grad()
-            logits = classifier(hidden.float(), mask, stages_tensor)
+            logits = classifier(batch_hidden.float(), batch_mask, stages_tensor)
             loss = criterion(logits, labels_tensor)
             loss.backward()
             optimizer.step()
@@ -383,7 +446,8 @@ def main():
                         help="Directory with split data (containing subset folders)")
     parser.add_argument("--intern-model", type=str,
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
-    parser.add_argument("--max-mentor-tokens", type=int, default=1024)
+    parser.add_argument("--max-mentor-tokens", type=int, default=512,
+                        help="Max mentor tokens to extract (default: 512, reduce for less memory)")
     parser.add_argument("--compress-dim", type=int, default=64,
                         help="Compress hidden states to this dimension (default: 64)")
     parser.add_argument("--nhead", type=int, default=4)
@@ -451,20 +515,33 @@ def main():
 
         # Train transformer classifier
         if n_train > 0:
-            logger.info(f"  Training transformer classifier...")
-            classifier = train_on_subset(
-                intern_model, tokenizer, train_data, hidden_dim, args, device
+            # Step 1: Pre-extract ALL hidden states (train + test)
+            logger.info(f"  Pre-extracting hidden states...")
+            cached_train = precompute_train_hidden_states(
+                intern_model, tokenizer, train_data, args.max_mentor_tokens, device
             )
-
-            # Pre-compute test hidden states for faster evaluation
             cached_test = precompute_test_hidden_states(
                 intern_model, tokenizer, test_data, args.max_mentor_tokens, device
             )
 
-            # Evaluate cascade
+            # Step 2: Clear GPU memory (intern model not needed for training)
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+
+            # Step 3: Train classifier on cached data
+            logger.info(f"  Training transformer classifier...")
+            classifier = train_on_cached_data(cached_train, hidden_dim, args, device)
+
+            # Step 4: Evaluate cascade
             transformer_result = evaluate_cascade(classifier, cached_test, device)
             logger.info(f"  Transformer Best: {transformer_result['best_accuracy']:.4f} "
                        f"(thresholds: {transformer_result['best_thresholds']})")
+
+            # Clean up cached data
+            del cached_train
+            torch.cuda.empty_cache()
+            gc.collect()
 
             results[subset] = {
                 'n_test': n_test,
