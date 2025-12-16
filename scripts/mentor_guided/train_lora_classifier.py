@@ -23,6 +23,8 @@ import argparse
 import json
 import logging
 import os
+import random
+from itertools import product
 from typing import Dict, List
 import numpy as np
 import torch
@@ -31,12 +33,24 @@ import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
 from peft import LoraConfig, get_peft_model, TaskType
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def set_all_seeds(seed: int):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    set_seed(seed)
+    # For deterministic behavior (may slow down training)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def setup_distributed():
@@ -302,9 +316,10 @@ def eval_epoch(model, dataloader, criterion, device):
     all_preds = []
     all_labels = []
     all_stages = []
+    all_probs = []  # Store probabilities for cascade eval
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
+        for batch in tqdm(dataloader, desc="Evaluating", disable=not is_main_process()):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
@@ -315,14 +330,105 @@ def eval_epoch(model, dataloader, criterion, device):
 
             total_loss += loss.item()
             preds = logits.argmax(dim=1)
+            probs = torch.softmax(logits, dim=1)[:, 1]  # Probability of class 1 (correct)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
             all_stages.extend(stages.cpu().tolist())
+            all_probs.extend(probs.cpu().tolist())
 
-    return total_loss / len(dataloader), correct / total, all_preds, all_labels, all_stages
+    return total_loss / len(dataloader), correct / total, all_preds, all_labels, all_stages, all_probs
+
+
+def eval_cascade(all_probs, all_labels, all_stages, n_stages=4):
+    """
+    Evaluate cascade accuracy with threshold search.
+    This matches the evaluation logic in eval_lora_cascade.py.
+
+    Args:
+        all_probs: List of probabilities (class 1) for all samples
+        all_labels: List of ground truth labels
+        all_stages: List of stage indices (0-3)
+        n_stages: Number of stages (default 4)
+
+    Returns:
+        best_accuracy, best_thresholds
+    """
+    # Reorganize data by question (each question has n_stages samples)
+    n_total = len(all_probs)
+    n_questions = n_total // n_stages
+
+    if n_questions == 0:
+        return 0.0, [0.5] * n_stages
+
+    # Group by question index
+    # samples are ordered: q0_stage0, q0_stage1, ..., q0_stage3, q1_stage0, ...
+    # OR: q0_stage0, q1_stage0, ..., qN_stage0, q0_stage1, ...
+    # Need to determine the ordering
+
+    # Check if samples are grouped by question or by stage
+    # If grouped by question: stages go 0,1,2,3,0,1,2,3,...
+    # If grouped by stage: stages go 0,0,0,...,1,1,1,...
+
+    # Detect ordering from first few samples
+    if len(all_stages) >= n_stages:
+        first_stages = all_stages[:n_stages]
+        if first_stages == list(range(n_stages)):
+            # Grouped by question
+            probs_by_q = []
+            labels_by_q = []
+            for q in range(n_questions):
+                start = q * n_stages
+                probs_by_q.append([all_probs[start + s] for s in range(n_stages)])
+                labels_by_q.append([all_labels[start + s] for s in range(n_stages)])
+        else:
+            # Grouped by stage
+            probs_by_q = [[] for _ in range(n_questions)]
+            labels_by_q = [[] for _ in range(n_questions)]
+            for s in range(n_stages):
+                start = s * n_questions
+                for q in range(n_questions):
+                    probs_by_q[q].append(all_probs[start + q])
+                    labels_by_q[q].append(all_labels[start + q])
+    else:
+        return 0.0, [0.5] * n_stages
+
+    # Search for best thresholds
+    threshold_candidates = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    best_acc = 0
+    best_thresholds = None
+
+    for combo in product(threshold_candidates, repeat=n_stages):
+        thresholds = list(combo)
+        correct = 0
+
+        for q in range(n_questions):
+            decided = False
+            stage_probs = []
+
+            for s in range(n_stages):
+                prob = probs_by_q[q][s]
+                label = labels_by_q[q][s]
+                stage_probs.append((s, prob, label))
+
+                if prob >= thresholds[s]:
+                    correct += label
+                    decided = True
+                    break
+
+            if not decided:
+                # No stage passed threshold, select the one with highest confidence
+                best_stage, _, best_label = max(stage_probs, key=lambda x: x[1])
+                correct += best_label
+
+        acc = correct / n_questions
+        if acc > best_acc:
+            best_acc = acc
+            best_thresholds = thresholds
+
+    return best_acc, best_thresholds
 
 
 def main():
@@ -357,8 +463,13 @@ def main():
                         help="Don't filter out all-correct/all-wrong samples")
     parser.add_argument("--dropout", type=float, default=0.1,
                         help="Dropout rate for classifier head")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility")
 
     args = parser.parse_args()
+
+    # Set random seeds first
+    set_all_seeds(args.seed)
 
     # Setup distributed training
     rank, world_size, local_rank = setup_distributed()
@@ -548,8 +659,9 @@ def main():
     optimizer = torch.optim.AdamW(trainable_params, weight_decay=0.01)
 
     # Training loop
-    best_val_acc = 0
+    best_cascade_acc = 0
     best_state = None
+    best_thresholds = None
 
     for epoch in range(args.epochs):
         if use_ddp:
@@ -561,21 +673,30 @@ def main():
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device, args.grad_accum
         )
-        val_loss, val_acc, _, _, _ = eval_epoch(model, val_loader, criterion, device)
+        val_loss, val_acc, all_preds, all_labels, all_stages, all_probs = eval_epoch(
+            model, val_loader, criterion, device
+        )
+
+        # Compute cascade accuracy (the metric that matters for deployment)
+        cascade_acc, thresholds = eval_cascade(all_probs, all_labels, all_stages)
 
         if is_main_process():
-            logger.info(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
-            logger.info(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+            logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+            logger.info(f"Val Loss: {val_loss:.4f}, Val Acc (per-sample): {val_acc:.4f}")
+            logger.info(f"Val Cascade Acc: {cascade_acc:.4f}, Thresholds: {thresholds}")
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Save based on cascade accuracy (matches eval_lora_cascade.py logic)
+        if cascade_acc > best_cascade_acc:
+            best_cascade_acc = cascade_acc
+            best_thresholds = thresholds
             if is_main_process():
                 classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
                 best_state = {
                     'lora': base_model.state_dict(),
                     'classifier': classifier_state,
+                    'thresholds': thresholds,
                 }
-                logger.info(f"New best! Saving...")
+                logger.info(f"New best cascade acc! Saving...")
 
     # Save best model (only main process)
     if is_main_process() and best_state:
@@ -586,15 +707,18 @@ def main():
 
     if is_main_process():
         logger.info("\nFinal Evaluation:")
-        logger.info(f"Best Val Accuracy: {best_val_acc:.4f}")
+        logger.info(f"Best Cascade Accuracy: {best_cascade_acc:.4f}")
+        logger.info(f"Best Thresholds: {best_thresholds}")
 
         # Save results
         results = {
             'subset': args.subset,
             'n_train': n_train,
             'n_val': n_val,
-            'best_val_acc': float(best_val_acc),
+            'best_cascade_acc': float(best_cascade_acc),
+            'best_thresholds': best_thresholds,
             'world_size': world_size,
+            'seed': args.seed,
             'args': vars(args),
         }
         with open(os.path.join(args.output_dir, "results.json"), 'w') as f:
