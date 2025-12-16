@@ -300,6 +300,12 @@ def main():
         train_split = "train"
         test_split = "test"
 
+    # Validate data directory exists
+    if not os.path.exists(subset_dir):
+        logger.error(f"Data directory not found: {subset_dir}")
+        logger.error(f"Please check --data-dir and --subset arguments")
+        return
+
     if args.output_dir is None:
         args.output_dir = os.path.join(subset_dir, "lora_model")
     os.makedirs(args.output_dir, exist_ok=True)
