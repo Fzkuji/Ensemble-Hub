@@ -3,7 +3,11 @@
 Evaluate trained LoRA classifier with cascade inference.
 
 Usage:
+    # Single GPU
     python eval_lora_cascade.py --model-dir /path/to/lora_model --subset algebra
+
+    # Multi-GPU with torchrun
+    torchrun --nproc_per_node=4 eval_lora_cascade.py --subset algebra
 """
 
 import argparse
@@ -15,6 +19,7 @@ from typing import Dict, List
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
 from tqdm import tqdm
@@ -33,6 +38,32 @@ SUBSETS = [
     "prealgebra",
     "precalculus",
 ]
+
+
+def setup_distributed():
+    """Initialize distributed evaluation if available."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+        torch.cuda.set_device(local_rank)
+        return rank, world_size, local_rank
+    return 0, 1, 0
+
+
+def cleanup_distributed():
+    """Clean up distributed evaluation."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """Check if this is the main process."""
+    if dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
 
 
 class MentorClassifierHead(nn.Module):
@@ -61,14 +92,16 @@ def load_json_data(data_dir: str, split: str = "test") -> Dict[int, List[Dict]]:
 
     if not os.path.exists(split_dir):
         split_dir = data_dir
-        logger.warning(f"Split dir not found, using: {split_dir}")
+        if is_main_process():
+            logger.warning(f"Split dir not found, using: {split_dir}")
 
     for tokens in TOKEN_LEVELS:
         filepath = os.path.join(split_dir, f"tokens{tokens}.json")
         if os.path.exists(filepath):
             with open(filepath, 'r') as f:
                 data[tokens] = json.load(f)
-            logger.info(f"Loaded {len(data[tokens])} samples from {filepath}")
+            if is_main_process():
+                logger.info(f"Loaded {len(data[tokens])} samples from {filepath}")
 
     return data
 
@@ -123,29 +156,40 @@ def get_hidden_state(model, tokenizer, question: str, mentor_response: str, max_
     return hidden_state
 
 
-def evaluate_cascade(
+def evaluate_cascade_distributed(
     model,
     classifier_head,
     tokenizer,
     test_data: Dict[int, List[Dict]],
     max_length: int,
     device: str,
+    rank: int,
+    world_size: int,
 ) -> Dict:
-    """Evaluate cascade accuracy with threshold search."""
+    """Evaluate cascade accuracy with threshold search (distributed version)."""
     model.eval()
     classifier_head.eval()
 
     n_samples = len(test_data[TOKEN_LEVELS[0]])
 
-    # Get ground truth
+    # Distribute samples across processes
+    samples_per_rank = (n_samples + world_size - 1) // world_size
+    start_idx = rank * samples_per_rank
+    end_idx = min(start_idx + samples_per_rank, n_samples)
+    local_indices = list(range(start_idx, end_idx))
+
+    # Get ground truth (all processes need this for threshold search)
     gt = {tokens: [item.get('is_correct', False) for item in test_data[tokens]]
           for tokens in TOKEN_LEVELS}
 
-    # Pre-compute all classifier predictions
-    logger.info("Pre-computing classifier predictions...")
-    all_probs = {tokens: [] for tokens in TOKEN_LEVELS}
+    # Pre-compute classifier predictions for local samples
+    if is_main_process():
+        logger.info(f"Pre-computing classifier predictions (distributed across {world_size} GPUs)...")
 
-    for i in tqdm(range(n_samples), desc="Computing predictions"):
+    local_probs = {tokens: {} for tokens in TOKEN_LEVELS}
+
+    desc = f"GPU {rank}" if world_size > 1 else "Computing predictions"
+    for i in tqdm(local_indices, desc=desc, disable=not is_main_process()):
         for stage_idx, tokens in enumerate(TOKEN_LEVELS):
             item = test_data[tokens][i]
             question = item['question']
@@ -157,13 +201,38 @@ def evaluate_cascade(
             with torch.no_grad():
                 logits = classifier_head(hidden.unsqueeze(0), stage_tensor)
                 prob = torch.softmax(logits, dim=1)[0, 1].item()
-                all_probs[tokens].append(prob)
+                local_probs[tokens][i] = prob
 
-        if i % 50 == 0:
+        if (i - start_idx) % 50 == 0:
             torch.cuda.empty_cache()
 
-    # Threshold search
-    logger.info("Searching thresholds...")
+    # Gather predictions from all processes
+    if world_size > 1:
+        if is_main_process():
+            logger.info("Gathering predictions from all GPUs...")
+
+        # Convert to tensor for gathering
+        all_probs = {tokens: [0.0] * n_samples for tokens in TOKEN_LEVELS}
+
+        for tokens in TOKEN_LEVELS:
+            local_tensor = torch.zeros(n_samples, device=device)
+            for idx, prob in local_probs[tokens].items():
+                local_tensor[idx] = prob
+
+            # All-reduce to gather all probabilities
+            dist.all_reduce(local_tensor, op=dist.ReduceOp.SUM)
+
+            all_probs[tokens] = local_tensor.cpu().tolist()
+    else:
+        all_probs = {tokens: [0.0] * n_samples for tokens in TOKEN_LEVELS}
+        for tokens in TOKEN_LEVELS:
+            for idx, prob in local_probs[tokens].items():
+                all_probs[tokens][idx] = prob
+
+    # Threshold search (only on main process, but all processes need result)
+    if is_main_process():
+        logger.info("Searching thresholds...")
+
     threshold_candidates = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     best_acc = 0
     best_thresholds = None
@@ -204,7 +273,7 @@ def evaluate_cascade(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate LoRA classifier cascade")
     parser.add_argument("--data-dir", type=str,
-                        default="/home/fzkuji/PycharmProjects/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split",
+                        default="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split",
                         help="Base directory with subset folders")
     parser.add_argument("--subset", type=str, default="algebra",
                         choices=SUBSETS,
@@ -220,6 +289,15 @@ def main():
 
     args = parser.parse_args()
 
+    # Setup distributed
+    rank, world_size, local_rank = setup_distributed()
+    use_distributed = world_size > 1
+
+    if use_distributed:
+        device = f"cuda:{local_rank}"
+    else:
+        device = args.device
+
     subset_dir = os.path.join(args.data_dir, args.subset)
     if args.model_dir is None:
         args.model_dir = os.path.join(subset_dir, "lora_model")
@@ -227,45 +305,57 @@ def main():
     # Check model exists
     model_path = os.path.join(args.model_dir, "best_model.pt")
     if not os.path.exists(model_path):
-        logger.error(f"Model not found: {model_path}")
+        if is_main_process():
+            logger.error(f"Model not found: {model_path}")
+        cleanup_distributed()
         return
 
-    logger.info(f"Subset: {args.subset}")
-    logger.info(f"Model dir: {args.model_dir}")
+    if is_main_process():
+        logger.info(f"Subset: {args.subset}")
+        logger.info(f"Model dir: {args.model_dir}")
+        logger.info(f"Distributed: {use_distributed}, World size: {world_size}")
 
     # Load test data
-    logger.info("Loading test data...")
+    if is_main_process():
+        logger.info("Loading test data...")
     test_data = load_json_data(subset_dir, split="test")
     if not test_data:
-        logger.error("No test data found!")
+        if is_main_process():
+            logger.error("No test data found!")
+        cleanup_distributed()
         return
 
     n_test = len(test_data[TOKEN_LEVELS[0]])
-    logger.info(f"Test samples: {n_test}")
+    if is_main_process():
+        logger.info(f"Test samples: {n_test}")
 
     # Baseline accuracy
-    logger.info("\nBaseline accuracy:")
+    if is_main_process():
+        logger.info("\nBaseline accuracy:")
     baseline_acc = {}
     for tokens in TOKEN_LEVELS:
         if tokens in test_data:
             correct = sum(1 for item in test_data[tokens] if item.get('is_correct', False))
             acc = correct / n_test
             baseline_acc[tokens] = acc
-            logger.info(f"  Tokens {tokens}: {acc:.4f} ({acc*100:.1f}%)")
+            if is_main_process():
+                logger.info(f"  Tokens {tokens}: {acc:.4f} ({acc*100:.1f}%)")
 
     # Oracle accuracy
     oracle_acc = compute_oracle_accuracy(test_data)
-    logger.info(f"  Oracle: {oracle_acc:.4f} ({oracle_acc*100:.1f}%)")
+    if is_main_process():
+        logger.info(f"  Oracle: {oracle_acc:.4f} ({oracle_acc*100:.1f}%)")
 
     # Load tokenizer
-    logger.info(f"\nLoading tokenizer from {args.base_model}...")
+    if is_main_process():
+        logger.info(f"\nLoading tokenizer from {args.base_model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # Load base model
-    logger.info(f"Loading base model from {args.base_model}...")
-    device = args.device
+    if is_main_process():
+        logger.info(f"Loading base model from {args.base_model}...")
 
     if args.use_4bit:
         bnb_config = BitsAndBytesConfig(
@@ -287,12 +377,14 @@ def main():
         ).to(device)
 
     # Load LoRA weights
-    logger.info(f"Loading LoRA from {args.model_dir}...")
+    if is_main_process():
+        logger.info(f"Loading LoRA from {args.model_dir}...")
     model = PeftModel.from_pretrained(base_model, args.model_dir)
     model.eval()
 
     # Load classifier head
-    logger.info("Loading classifier head...")
+    if is_main_process():
+        logger.info("Loading classifier head...")
     hidden_size = model.config.hidden_size
     classifier_head = MentorClassifierHead(hidden_size).to(device)
 
@@ -300,45 +392,54 @@ def main():
     classifier_head.load_state_dict(checkpoint['classifier'])
     classifier_head.eval()
 
+    # Synchronize before evaluation
+    if use_distributed:
+        dist.barrier()
+
     # Evaluate cascade
-    logger.info("\nEvaluating cascade...")
-    result = evaluate_cascade(
+    if is_main_process():
+        logger.info("\nEvaluating cascade...")
+    result = evaluate_cascade_distributed(
         model, classifier_head, tokenizer, test_data,
-        args.max_length, device
+        args.max_length, device, rank, world_size
     )
 
-    logger.info(f"\n{'='*60}")
-    logger.info("Results Summary")
-    logger.info(f"{'='*60}")
-    logger.info(f"Subset: {args.subset}")
-    logger.info(f"Test samples: {n_test}")
-    logger.info(f"\nBaseline:")
-    for tokens, acc in baseline_acc.items():
-        logger.info(f"  T{tokens}: {acc:.4f}")
-    logger.info(f"Oracle: {oracle_acc:.4f}")
-    logger.info(f"\nLoRA Cascade:")
-    logger.info(f"  Best Accuracy: {result['best_accuracy']:.4f} ({result['best_accuracy']*100:.1f}%)")
-    logger.info(f"  Thresholds: {result['best_thresholds']}")
+    # Only main process prints results and saves
+    if is_main_process():
+        logger.info(f"\n{'='*60}")
+        logger.info("Results Summary")
+        logger.info(f"{'='*60}")
+        logger.info(f"Subset: {args.subset}")
+        logger.info(f"Test samples: {n_test}")
+        logger.info(f"\nBaseline:")
+        for tokens, acc in baseline_acc.items():
+            logger.info(f"  T{tokens}: {acc:.4f}")
+        logger.info(f"Oracle: {oracle_acc:.4f}")
+        logger.info(f"\nLoRA Cascade:")
+        logger.info(f"  Best Accuracy: {result['best_accuracy']:.4f} ({result['best_accuracy']*100:.1f}%)")
+        logger.info(f"  Thresholds: {result['best_thresholds']}")
 
-    # Gap analysis
-    gap_to_oracle = oracle_acc - result['best_accuracy']
-    gap_to_best_baseline = result['best_accuracy'] - max(baseline_acc.values())
-    logger.info(f"\nGap to Oracle: {gap_to_oracle:.4f} ({gap_to_oracle*100:.1f}%)")
-    logger.info(f"Improvement over best baseline: {gap_to_best_baseline:.4f} ({gap_to_best_baseline*100:.1f}%)")
+        # Gap analysis
+        gap_to_oracle = oracle_acc - result['best_accuracy']
+        gap_to_best_baseline = result['best_accuracy'] - max(baseline_acc.values())
+        logger.info(f"\nGap to Oracle: {gap_to_oracle:.4f} ({gap_to_oracle*100:.1f}%)")
+        logger.info(f"Improvement over best baseline: {gap_to_best_baseline:.4f} ({gap_to_best_baseline*100:.1f}%)")
 
-    # Save results
-    output_file = os.path.join(args.model_dir, "cascade_eval.json")
-    results = {
-        'subset': args.subset,
-        'n_test': n_test,
-        'baseline': baseline_acc,
-        'oracle': oracle_acc,
-        'cascade_accuracy': result['best_accuracy'],
-        'thresholds': result['best_thresholds'],
-    }
-    with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    logger.info(f"\nResults saved to {output_file}")
+        # Save results
+        output_file = os.path.join(args.model_dir, "cascade_eval.json")
+        results = {
+            'subset': args.subset,
+            'n_test': n_test,
+            'baseline': baseline_acc,
+            'oracle': oracle_acc,
+            'cascade_accuracy': result['best_accuracy'],
+            'thresholds': result['best_thresholds'],
+        }
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"\nResults saved to {output_file}")
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

@@ -112,16 +112,44 @@ class MentorDataset(Dataset):
         data: Dict[int, List[Dict]],
         tokenizer,
         max_length: int = 2048,
+        filter_uniform: bool = True,
+        verbose: bool = True,
     ):
         self.samples = []
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-        # Flatten all stages into samples
+        n_samples = len(data[TOKEN_LEVELS[0]])
+
+        # Find questions with variation (not all correct or all wrong)
+        if filter_uniform:
+            varied_indices = []
+            all_correct_count = 0
+            all_wrong_count = 0
+
+            for i in range(n_samples):
+                labels = [1 if data[tokens][i].get('is_correct', False) else 0
+                          for tokens in TOKEN_LEVELS if tokens in data]
+                if all(l == 1 for l in labels):
+                    all_correct_count += 1
+                elif all(l == 0 for l in labels):
+                    all_wrong_count += 1
+                else:
+                    varied_indices.append(i)
+
+            if verbose:
+                logger.info(f"Filtering: {all_correct_count} all-correct, {all_wrong_count} all-wrong, "
+                           f"{len(varied_indices)} varied (kept)")
+            indices_to_use = varied_indices
+        else:
+            indices_to_use = list(range(n_samples))
+
+        # Flatten selected samples into training set
         for stage_idx, tokens in enumerate(TOKEN_LEVELS):
             if tokens not in data:
                 continue
-            for item in data[tokens]:
+            for i in indices_to_use:
+                item = data[tokens][i]
                 self.samples.append({
                     'question': item['question'],
                     'mentor_response': item.get('mentor_response', ''),
@@ -325,6 +353,8 @@ def main():
                         help="Use 4-bit quantization (not compatible with DDP)")
     parser.add_argument("--ddp", action="store_true",
                         help="Use DistributedDataParallel (use with torchrun)")
+    parser.add_argument("--no-filter", action="store_true",
+                        help="Don't filter out all-correct/all-wrong samples")
 
     args = parser.parse_args()
 
@@ -437,7 +467,10 @@ def main():
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
+            "gate_proj", "up_proj", "down_proj",      # FFN
+        ],
         lora_dropout=0.05,
         bias="none",
         task_type=TaskType.FEATURE_EXTRACTION,
@@ -460,8 +493,16 @@ def main():
         model = LoRAClassifier(base_model, classifier_head)
 
     # Create datasets
-    train_dataset = MentorDataset(train_data, tokenizer, args.max_length)
-    val_dataset = MentorDataset(val_data, tokenizer, args.max_length)
+    filter_uniform = not args.no_filter
+    verbose = is_main_process()
+    if verbose:
+        logger.info(f"Creating datasets (filter_uniform={filter_uniform})...")
+    train_dataset = MentorDataset(train_data, tokenizer, args.max_length, filter_uniform=filter_uniform, verbose=verbose)
+    val_dataset = MentorDataset(val_data, tokenizer, args.max_length, filter_uniform=False, verbose=verbose)
+
+    if verbose:
+        logger.info(f"Training dataset: {len(train_dataset)} samples ({len(train_dataset)//4} questions × 4 stages)")
+        logger.info(f"Validation dataset: {len(val_dataset)} samples")
 
     # Use DistributedSampler for DDP
     if use_ddp:
