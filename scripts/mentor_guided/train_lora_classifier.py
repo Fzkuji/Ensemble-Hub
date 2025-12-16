@@ -7,10 +7,19 @@ Architecture:
 2. Add LoRA adapters
 3. Add classification head on top of last token's hidden state
 4. Train to predict is_correct (0/1)
+
+Usage:
+    # Single GPU
+    python train_lora_classifier.py --use-4bit
+
+    # Multi-GPU with accelerate
+    accelerate launch --num_processes 4 train_lora_classifier.py
+
+    # Multi-GPU with torchrun (no 4-bit)
+    torchrun --nproc_per_node=4 train_lora_classifier.py --ddp
 """
 
 import argparse
-import glob
 import json
 import logging
 import os
@@ -18,13 +27,42 @@ from typing import Dict, List
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, TaskType
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def setup_distributed():
+    """Initialize distributed training if available."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+        torch.cuda.set_device(local_rank)
+        return rank, world_size, local_rank
+    return 0, 1, 0
+
+
+def cleanup_distributed():
+    """Clean up distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """Check if this is the main process."""
+    if dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
 
 TOKEN_LEVELS = [0, 100, 500, 1000]
 
@@ -284,15 +322,27 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--use-4bit", action="store_true",
-                        help="Use 4-bit quantization")
+                        help="Use 4-bit quantization (not compatible with DDP)")
+    parser.add_argument("--ddp", action="store_true",
+                        help="Use DistributedDataParallel (use with torchrun)")
 
     args = parser.parse_args()
-    device = args.device
+
+    # Setup distributed training
+    rank, world_size, local_rank = setup_distributed()
+    use_ddp = args.ddp or world_size > 1
+
+    if use_ddp:
+        device = f"cuda:{local_rank}"
+        if args.use_4bit:
+            logger.warning("4-bit quantization is not compatible with DDP, disabling")
+            args.use_4bit = False
+    else:
+        device = args.device
 
     # Determine subset directory
     if args.subset == "all":
         subset_dir = args.data_dir
-        # Use all_train / all_test folders
         train_split = "all_train"
         test_split = "all_test"
     else:
@@ -302,32 +352,41 @@ def main():
 
     # Validate data directory exists
     if not os.path.exists(subset_dir):
-        logger.error(f"Data directory not found: {subset_dir}")
-        logger.error(f"Please check --data-dir and --subset arguments")
+        if is_main_process():
+            logger.error(f"Data directory not found: {subset_dir}")
+            logger.error(f"Please check --data-dir and --subset arguments")
+        cleanup_distributed()
         return
 
     if args.output_dir is None:
         args.output_dir = os.path.join(subset_dir, "lora_model")
-    os.makedirs(args.output_dir, exist_ok=True)
+    if is_main_process():
+        os.makedirs(args.output_dir, exist_ok=True)
 
-    logger.info(f"Subset: {args.subset}")
-    logger.info(f"Data dir: {subset_dir}")
+    if is_main_process():
+        logger.info(f"Subset: {args.subset}")
+        logger.info(f"Data dir: {subset_dir}")
+        logger.info(f"DDP: {use_ddp}, World size: {world_size}")
 
     # Load train and test data separately (already split)
-    logger.info("Loading training data...")
+    if is_main_process():
+        logger.info("Loading training data...")
     train_data = load_json_data(subset_dir, split=train_split)
     if not train_data:
-        logger.error("No training data found!")
+        if is_main_process():
+            logger.error("No training data found!")
+        cleanup_distributed()
         return
 
-    logger.info("Loading test data...")
+    if is_main_process():
+        logger.info("Loading test data...")
     test_data = load_json_data(subset_dir, split=test_split)
     if not test_data:
-        logger.warning("No test data found, will use train data for validation")
-        # Fall back to train/val split
-        from sklearn.model_selection import train_test_split
+        if is_main_process():
+            logger.warning("No test data found, will use train data for validation")
+        from sklearn.model_selection import train_test_split as sk_split
         n_samples = len(train_data[TOKEN_LEVELS[0]])
-        train_idx, val_idx = train_test_split(
+        train_idx, val_idx = sk_split(
             np.arange(n_samples), test_size=0.2, random_state=42
         )
         val_data = {}
@@ -340,16 +399,19 @@ def main():
 
     n_train = len(train_data[TOKEN_LEVELS[0]])
     n_val = len(val_data[TOKEN_LEVELS[0]])
-    logger.info(f"Train: {n_train} samples, Val: {n_val} samples")
+    if is_main_process():
+        logger.info(f"Train: {n_train} samples, Val: {n_val} samples")
 
     # Load tokenizer
-    logger.info(f"Loading tokenizer from {args.model_path}...")
+    if is_main_process():
+        logger.info(f"Loading tokenizer from {args.model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # Load model with optional quantization
-    logger.info(f"Loading model from {args.model_path}...")
+    if is_main_process():
+        logger.info(f"Loading model from {args.model_path}...")
     if args.use_4bit:
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -366,12 +428,12 @@ def main():
     else:
         base_model = AutoModelForCausalLM.from_pretrained(
             args.model_path,
-            device_map=device,
             torch_dtype=torch.bfloat16,
-        )
+        ).to(device)
 
     # Add LoRA
-    logger.info(f"Adding LoRA (r={args.lora_r}, alpha={args.lora_alpha})...")
+    if is_main_process():
+        logger.info(f"Adding LoRA (r={args.lora_r}, alpha={args.lora_alpha})...")
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -381,7 +443,8 @@ def main():
         task_type=TaskType.FEATURE_EXTRACTION,
     )
     base_model = get_peft_model(base_model, lora_config)
-    base_model.print_trainable_parameters()
+    if is_main_process():
+        base_model.print_trainable_parameters()
 
     # Create classification head
     hidden_size = base_model.config.hidden_size
@@ -390,19 +453,37 @@ def main():
     # Combine into single model
     model = LoRAClassifier(base_model, classifier_head)
 
+    # Wrap with DDP if needed
+    if use_ddp:
+        # Only wrap classifier_head with DDP (base_model has device_map issues)
+        classifier_head = DDP(classifier_head, device_ids=[local_rank])
+        model = LoRAClassifier(base_model, classifier_head)
+
     # Create datasets
     train_dataset = MentorDataset(train_data, tokenizer, args.max_length)
     val_dataset = MentorDataset(val_data, tokenizer, args.max_length)
 
+    # Use DistributedSampler for DDP
+    if use_ddp:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        shuffle = False
+    else:
+        train_sampler = None
+        val_sampler = None
+        shuffle = True
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=shuffle,
+        sampler=train_sampler,
         collate_fn=lambda b: collate_fn(b, tokenizer),
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
+        sampler=val_sampler,
         collate_fn=lambda b: collate_fn(b, tokenizer),
     )
 
@@ -416,9 +497,10 @@ def main():
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     # Optimizer - only train LoRA params and classifier head
+    classifier_params = classifier_head.module.parameters() if use_ddp else classifier_head.parameters()
     trainable_params = [
         {'params': base_model.parameters(), 'lr': args.lr},
-        {'params': classifier_head.parameters(), 'lr': args.lr * 10},  # Higher LR for head
+        {'params': classifier_params, 'lr': args.lr * 10},
     ]
     optimizer = torch.optim.AdamW(trainable_params, weight_decay=0.01)
 
@@ -427,46 +509,56 @@ def main():
     best_state = None
 
     for epoch in range(args.epochs):
-        logger.info(f"\nEpoch {epoch + 1}/{args.epochs}")
+        if use_ddp:
+            train_sampler.set_epoch(epoch)
+
+        if is_main_process():
+            logger.info(f"\nEpoch {epoch + 1}/{args.epochs}")
 
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device, args.grad_accum
         )
         val_loss, val_acc, _, _, _ = eval_epoch(model, val_loader, criterion, device)
 
-        logger.info(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
-        logger.info(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+        if is_main_process():
+            logger.info(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
+            logger.info(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_state = {
-                'lora': base_model.state_dict(),
-                'classifier': classifier_head.state_dict(),
-            }
-            logger.info(f"New best! Saving...")
+            if is_main_process():
+                classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
+                best_state = {
+                    'lora': base_model.state_dict(),
+                    'classifier': classifier_state,
+                }
+                logger.info(f"New best! Saving...")
 
-    # Save best model
-    if best_state:
+    # Save best model (only main process)
+    if is_main_process() and best_state:
         torch.save(best_state, os.path.join(args.output_dir, "best_model.pt"))
         base_model.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
         logger.info(f"Model saved to {args.output_dir}")
 
-    # Final evaluation with per-stage accuracy
-    logger.info("\nFinal Evaluation:")
-    logger.info(f"Best Val Accuracy: {best_val_acc:.4f}")
+    if is_main_process():
+        logger.info("\nFinal Evaluation:")
+        logger.info(f"Best Val Accuracy: {best_val_acc:.4f}")
 
-    # Save results
-    results = {
-        'subset': args.subset,
-        'n_train': n_train,
-        'n_val': n_val,
-        'best_val_acc': float(best_val_acc),
-        'args': vars(args),
-    }
-    with open(os.path.join(args.output_dir, "results.json"), 'w') as f:
-        json.dump(results, f, indent=2)
-    logger.info(f"Results saved to {args.output_dir}/results.json")
+        # Save results
+        results = {
+            'subset': args.subset,
+            'n_train': n_train,
+            'n_val': n_val,
+            'best_val_acc': float(best_val_acc),
+            'world_size': world_size,
+            'args': vars(args),
+        }
+        with open(os.path.join(args.output_dir, "results.json"), 'w') as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"Results saved to {args.output_dir}/results.json")
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
