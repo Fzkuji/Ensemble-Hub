@@ -2,6 +2,9 @@
 """
 End-to-end transformer classifier evaluation on each hendrycks_math subset.
 Train on train split, evaluate on test split, compare with baselines.
+
+Supports DDP multi-GPU training:
+    torchrun --nproc_per_node=8 eval_e2e_subsets.py
 """
 
 import argparse
@@ -14,6 +17,8 @@ from typing import Dict, List
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -31,6 +36,27 @@ SUBSETS = [
     "prealgebra",
     "precalculus",
 ]
+
+
+def setup_distributed():
+    """Initialize distributed training."""
+    if 'RANK' in os.environ:
+        rank = int(os.environ['RANK'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+        return rank, local_rank, world_size
+    return 0, 0, 1
+
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    return not dist.is_initialized() or dist.get_rank() == 0
 
 
 class PositionalEncoding(nn.Module):
@@ -177,9 +203,11 @@ def train_on_subset(
     train_data: Dict[int, List[Dict]],
     hidden_dim: int,
     args,
+    local_rank: int,
+    world_size: int,
 ) -> nn.Module:
-    """Train transformer classifier on a single subset."""
-    device = args.device
+    """Train transformer classifier on a single subset with DDP."""
+    device = f"cuda:{local_rank}"
 
     classifier = TransformerClassifier(
         input_dim=hidden_dim,
@@ -188,6 +216,10 @@ def train_on_subset(
         nhead=args.nhead,
         num_layers=args.num_layers,
     ).to(device)
+
+    # Wrap with DDP if distributed
+    if world_size > 1:
+        classifier = DDP(classifier, device_ids=[local_rank])
 
     n_samples = len(train_data[TOKEN_LEVELS[0]])
     train_labels = [1 if item.get('is_correct', False) else 0 for item in train_data[TOKEN_LEVELS[0]]]
@@ -210,12 +242,23 @@ def train_on_subset(
 
     for epoch in range(args.epochs):
         classifier.train()
+
+        # Shuffle with same seed across all ranks
+        np.random.seed(epoch + 42)
         np.random.shuffle(indices)
+
+        # Each rank processes a shard of the data
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        shard_size = (n_samples + world_size - 1) // world_size
+        start_idx = rank * shard_size
+        end_idx = min(start_idx + shard_size, n_samples)
+        local_indices = indices[start_idx:end_idx]
+
         epoch_loss = 0
         n_batches = 0
 
-        for batch_start in range(0, n_samples, args.batch_size):
-            batch_idx = indices[batch_start:batch_start + args.batch_size]
+        for batch_start in range(0, len(local_indices), args.batch_size):
+            batch_idx = local_indices[batch_start:batch_start + args.batch_size]
             batch_stages = np.random.randint(0, len(TOKEN_LEVELS), size=len(batch_idx))
 
             questions = []
@@ -247,13 +290,25 @@ def train_on_subset(
             n_batches += 1
 
         scheduler.step()
-        avg_loss = epoch_loss / n_batches
+
+        # Average loss across all ranks
+        if world_size > 1:
+            loss_tensor = torch.tensor([epoch_loss, n_batches], device=device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            avg_loss = loss_tensor[0].item() / loss_tensor[1].item()
+        else:
+            avg_loss = epoch_loss / n_batches if n_batches > 0 else float('inf')
 
         if avg_loss < best_loss:
             best_loss = avg_loss
-            best_model_state = classifier.state_dict().copy()
+            # Get model state (unwrap DDP if needed)
+            model_to_save = classifier.module if hasattr(classifier, 'module') else classifier
+            best_model_state = {k: v.cpu().clone() for k, v in model_to_save.state_dict().items()}
 
-    classifier.load_state_dict(best_model_state)
+    # Load best model
+    model_to_load = classifier.module if hasattr(classifier, 'module') else classifier
+    model_to_load.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
+
     return classifier
 
 
@@ -263,10 +318,12 @@ def evaluate_cascade(
     tokenizer,
     test_data: Dict[int, List[Dict]],
     args,
+    device: str,
 ) -> Dict:
     """Evaluate cascade on test set, search for best thresholds."""
-    device = args.device
-    classifier.eval()
+    # Unwrap DDP if needed
+    model = classifier.module if hasattr(classifier, 'module') else classifier
+    model.eval()
     n_samples = len(test_data[TOKEN_LEVELS[0]])
 
     # Get ground truth
@@ -296,7 +353,7 @@ def evaluate_cascade(
                     )
                     stages_tensor = torch.tensor([stage_idx], device=device)
 
-                    logits = classifier(hidden.float(), mask, stages_tensor)
+                    logits = model(hidden.float(), mask, stages_tensor)
                     prob = torch.softmax(logits, dim=1)[0, 1].item()
 
                     if prob >= thresholds[stage_idx]:
@@ -330,18 +387,26 @@ def main():
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output-file", type=str, default=None)
 
     args = parser.parse_args()
 
-    # Load intern model once
-    logger.info(f"Loading intern model: {args.intern_model}")
+    # Setup distributed
+    rank, local_rank, world_size = setup_distributed()
+    device = f"cuda:{local_rank}"
+
+    if is_main_process():
+        logger.info(f"World size: {world_size}")
+
+    # Load intern model on each rank
+    if is_main_process():
+        logger.info(f"Loading intern model: {args.intern_model}")
+
     tokenizer = AutoTokenizer.from_pretrained(args.intern_model)
     intern_model = AutoModelForCausalLM.from_pretrained(
         args.intern_model,
         torch_dtype=torch.bfloat16,
-        device_map=args.device,
+        device_map=device,
         output_hidden_states=True,
     )
     intern_model.eval()
@@ -349,16 +414,19 @@ def main():
         param.requires_grad = False
 
     hidden_dim = intern_model.config.hidden_size
-    logger.info(f"Hidden dim: {hidden_dim}")
+    if is_main_process():
+        logger.info(f"Hidden dim: {hidden_dim}")
 
     results = {}
 
-    logger.info("\n" + "=" * 60)
-    logger.info("Evaluating each subset...")
-    logger.info("=" * 60)
+    if is_main_process():
+        logger.info("\n" + "=" * 60)
+        logger.info("Evaluating each subset...")
+        logger.info("=" * 60)
 
     for subset in SUBSETS:
-        logger.info(f"\n--- {subset} ---")
+        if is_main_process():
+            logger.info(f"\n--- {subset} ---")
 
         # Load train and test data
         train_data = {}
@@ -368,83 +436,106 @@ def main():
             test_data[tokens] = load_subset_json(args.data_dir, subset, "test", tokens)
 
         if not test_data.get(TOKEN_LEVELS[0]):
-            logger.warning(f"No test data for {subset}, skipping")
+            if is_main_process():
+                logger.warning(f"No test data for {subset}, skipping")
             continue
 
         n_train = len(train_data[TOKEN_LEVELS[0]])
         n_test = len(test_data[TOKEN_LEVELS[0]])
-        logger.info(f"Train: {n_train}, Test: {n_test}")
 
-        # Baseline accuracies
+        if is_main_process():
+            logger.info(f"Train: {n_train}, Test: {n_test}")
+
+        # Baseline accuracies (only compute on rank 0)
         baseline_acc = {}
-        for tokens in TOKEN_LEVELS:
-            if test_data[tokens]:
-                correct = sum(1 for item in test_data[tokens] if item.get('is_correct', False))
-                acc = correct / len(test_data[tokens])
-                baseline_acc[tokens] = acc
-                logger.info(f"  Tokens {tokens}: {acc:.4f}")
+        if is_main_process():
+            for tokens in TOKEN_LEVELS:
+                if test_data[tokens]:
+                    correct = sum(1 for item in test_data[tokens] if item.get('is_correct', False))
+                    acc = correct / len(test_data[tokens])
+                    baseline_acc[tokens] = acc
+                    logger.info(f"  Tokens {tokens}: {acc:.4f}")
 
-        # Oracle
-        oracle_acc = compute_oracle_accuracy(test_data)
-        logger.info(f"  Oracle: {oracle_acc:.4f}")
+            oracle_acc = compute_oracle_accuracy(test_data)
+            logger.info(f"  Oracle: {oracle_acc:.4f}")
+
+        # Synchronize before training
+        if world_size > 1:
+            dist.barrier()
 
         # Train transformer classifier
         if n_train > 0:
-            logger.info(f"  Training transformer classifier...")
+            if is_main_process():
+                logger.info(f"  Training transformer classifier...")
+
             classifier = train_on_subset(
-                intern_model, tokenizer, train_data, hidden_dim, args
+                intern_model, tokenizer, train_data, hidden_dim, args,
+                local_rank, world_size
             )
 
-            # Evaluate
-            logger.info(f"  Evaluating cascade...")
-            transformer_result = evaluate_cascade(
-                classifier, intern_model, tokenizer, test_data, args
-            )
-            logger.info(f"  Transformer Best: {transformer_result['best_accuracy']:.4f} "
-                       f"(thresholds: {transformer_result['best_thresholds']})")
+            # Synchronize after training
+            if world_size > 1:
+                dist.barrier()
 
-            results[subset] = {
-                'n_test': n_test,
-                'baseline': baseline_acc,
-                'oracle': oracle_acc,
-                'transformer': transformer_result,
-            }
+            # Evaluate only on rank 0
+            if is_main_process():
+                logger.info(f"  Evaluating cascade...")
+                transformer_result = evaluate_cascade(
+                    classifier, intern_model, tokenizer, test_data, args, device
+                )
+                logger.info(f"  Transformer Best: {transformer_result['best_accuracy']:.4f} "
+                           f"(thresholds: {transformer_result['best_thresholds']})")
+
+                results[subset] = {
+                    'n_test': n_test,
+                    'baseline': baseline_acc,
+                    'oracle': oracle_acc,
+                    'transformer': transformer_result,
+                }
         else:
-            logger.info("  (No training data, skipping)")
-            results[subset] = {
-                'n_test': n_test,
-                'baseline': baseline_acc,
-                'oracle': oracle_acc,
-            }
+            if is_main_process():
+                logger.info("  (No training data, skipping)")
+                results[subset] = {
+                    'n_test': n_test,
+                    'baseline': baseline_acc,
+                    'oracle': oracle_acc,
+                }
 
-    # Summary table
-    logger.info("\n" + "=" * 100)
-    logger.info("Summary")
-    logger.info("=" * 100)
+        # Synchronize between subsets
+        if world_size > 1:
+            dist.barrier()
 
-    header = f"{'Subset':<25} {'T0':<8} {'T100':<8} {'T500':<8} {'T1000':<8} {'Oracle':<8} {'Trans':<8}"
-    logger.info(header)
-    logger.info("-" * 100)
+    # Summary table (only on rank 0)
+    if is_main_process():
+        logger.info("\n" + "=" * 100)
+        logger.info("Summary")
+        logger.info("=" * 100)
 
-    for subset in SUBSETS:
-        if subset not in results:
-            continue
-        r = results[subset]
-        baseline = r['baseline']
-        t0 = baseline.get(0, 0)
-        t100 = baseline.get(100, 0)
-        t500 = baseline.get(500, 0)
-        t1000 = baseline.get(1000, 0)
-        oracle = r['oracle']
-        trans_acc = r.get('transformer', {}).get('best_accuracy', 0)
+        header = f"{'Subset':<25} {'T0':<8} {'T100':<8} {'T500':<8} {'T1000':<8} {'Oracle':<8} {'Trans':<8}"
+        logger.info(header)
+        logger.info("-" * 100)
 
-        logger.info(f"{subset:<25} {t0:<8.4f} {t100:<8.4f} {t500:<8.4f} {t1000:<8.4f} {oracle:<8.4f} {trans_acc:<8.4f}")
+        for subset in SUBSETS:
+            if subset not in results:
+                continue
+            r = results[subset]
+            baseline = r['baseline']
+            t0 = baseline.get(0, 0)
+            t100 = baseline.get(100, 0)
+            t500 = baseline.get(500, 0)
+            t1000 = baseline.get(1000, 0)
+            oracle = r['oracle']
+            trans_acc = r.get('transformer', {}).get('best_accuracy', 0)
 
-    # Save results
-    if args.output_file:
-        with open(args.output_file, 'w') as f:
-            json.dump(results, f, indent=2)
-        logger.info(f"\nResults saved to {args.output_file}")
+            logger.info(f"{subset:<25} {t0:<8.4f} {t100:<8.4f} {t500:<8.4f} {t1000:<8.4f} {oracle:<8.4f} {trans_acc:<8.4f}")
+
+        # Save results
+        if args.output_file:
+            with open(args.output_file, 'w') as f:
+                json.dump(results, f, indent=2)
+            logger.info(f"\nResults saved to {args.output_file}")
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
