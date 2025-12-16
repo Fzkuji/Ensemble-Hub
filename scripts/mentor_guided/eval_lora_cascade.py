@@ -45,10 +45,7 @@ class MentorClassifierHead(nn.Module):
             nn.Linear(hidden_size + 64, 256),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 2),
+            nn.Linear(256, 2),
         )
 
     def forward(self, hidden_state, stage_idx):
