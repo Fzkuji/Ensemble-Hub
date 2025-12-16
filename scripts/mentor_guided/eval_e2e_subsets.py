@@ -55,41 +55,47 @@ class PositionalEncoding(nn.Module):
 
 
 class TransformerClassifier(nn.Module):
+    """
+    Lightweight transformer classifier.
+    First compresses hidden states to a small dimension, then applies 1 transformer layer.
+    """
     def __init__(
         self,
         input_dim: int,
         num_stages: int = 4,
-        d_model: int = 256,
+        compress_dim: int = 64,  # Compress hidden states to this dim
         nhead: int = 4,
-        num_layers: int = 2,
-        dim_feedforward: int = 512,
+        dim_feedforward: int = 128,
         dropout: float = 0.1,
         max_seq_len: int = 1024,
     ):
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, d_model)
-        self.stage_embedding = nn.Embedding(num_stages, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, max_seq_len, dropout)
+        # Compress input hidden states: input_dim (3584) -> compress_dim (64)
+        self.input_compress = nn.Linear(input_dim, compress_dim)
+        self.stage_embedding = nn.Embedding(num_stages, compress_dim)
+        self.pos_encoder = PositionalEncoding(compress_dim, max_seq_len, dropout)
 
+        # Single transformer layer
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
+            d_model=compress_dim,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
 
         self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(compress_dim, compress_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 2),
+            nn.Linear(compress_dim // 2, 2),
         )
 
     def forward(self, hidden_states, attention_mask, stages):
         batch_size = hidden_states.size(0)
-        x = self.input_proj(hidden_states)
+        # Compress: [batch, seq, input_dim] -> [batch, seq, compress_dim]
+        x = self.input_compress(hidden_states)
         stage_embed = self.stage_embedding(stages).unsqueeze(1)
         x = torch.cat([stage_embed, x], dim=1)
         stage_mask = torch.ones(batch_size, 1, device=attention_mask.device)
@@ -187,9 +193,8 @@ def train_on_subset(
     classifier = TransformerClassifier(
         input_dim=hidden_dim,
         num_stages=len(TOKEN_LEVELS),
-        d_model=args.d_model,
+        compress_dim=args.compress_dim,
         nhead=args.nhead,
-        num_layers=args.num_layers,
     ).to(device)
 
     n_samples = len(train_data[TOKEN_LEVELS[0]])
@@ -379,9 +384,9 @@ def main():
     parser.add_argument("--intern-model", type=str,
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
     parser.add_argument("--max-mentor-tokens", type=int, default=1024)
-    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--compress-dim", type=int, default=64,
+                        help="Compress hidden states to this dimension (default: 64)")
     parser.add_argument("--nhead", type=int, default=4)
-    parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
