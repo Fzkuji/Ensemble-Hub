@@ -327,32 +327,38 @@ def evaluate_cascade(
     # Get ground truth
     gt = {tokens: cached_test[tokens]['labels'].numpy() for tokens in TOKEN_LEVELS}
 
-    # Reduced threshold candidates for faster search: 4^4 = 256 combinations
+    # Step 1: Pre-compute ALL classifier predictions (do this ONCE)
+    logger.info("    Pre-computing classifier predictions...")
+    all_probs = {}  # {tokens: [n_samples] array of probabilities}
+
+    with torch.no_grad():
+        for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+            hidden = cached_test[tokens]['hidden_states'].to(device)
+            mask = cached_test[tokens]['attention_mask'].to(device)
+            stages_tensor = torch.full((n_samples,), stage_idx, dtype=torch.long, device=device)
+
+            # Batch forward pass
+            logits = classifier(hidden.float(), mask, stages_tensor)
+            probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+            all_probs[tokens] = probs
+
+    # Step 2: Threshold search (pure numpy, very fast)
+    logger.info("    Searching thresholds...")
     threshold_candidates = [0.3, 0.5, 0.7, 0.9]
     best_acc = 0
     best_thresholds = None
-
-    logger.info("    Searching thresholds...")
 
     for combo in product(threshold_candidates, repeat=len(TOKEN_LEVELS)):
         thresholds = list(combo)
         correct = 0
 
-        with torch.no_grad():
-            for i in range(n_samples):
-                for stage_idx, tokens in enumerate(TOKEN_LEVELS):
-                    hidden = cached_test[tokens]['hidden_states'][i:i+1].to(device)
-                    mask = cached_test[tokens]['attention_mask'][i:i+1].to(device)
-                    stages_tensor = torch.tensor([stage_idx], device=device)
-
-                    logits = classifier(hidden.float(), mask, stages_tensor)
-                    prob = torch.softmax(logits, dim=1)[0, 1].item()
-
-                    if prob >= thresholds[stage_idx]:
-                        correct += gt[tokens][i]
-                        break
-                    elif stage_idx == len(TOKEN_LEVELS) - 1:
-                        correct += gt[TOKEN_LEVELS[0]][i]
+        for i in range(n_samples):
+            for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+                if all_probs[tokens][i] >= thresholds[stage_idx]:
+                    correct += gt[tokens][i]
+                    break
+                elif stage_idx == len(TOKEN_LEVELS) - 1:
+                    correct += gt[TOKEN_LEVELS[0]][i]
 
         acc = correct / n_samples
         if acc > best_acc:
