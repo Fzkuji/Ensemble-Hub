@@ -654,7 +654,7 @@ def main():
     classifier_params = classifier_head.module.parameters() if use_ddp else classifier_head.parameters()
     trainable_params = [
         {'params': base_model.parameters(), 'lr': args.lr},
-        {'params': classifier_params, 'lr': args.lr * 10},
+        {'params': classifier_params, 'lr': args.lr},
     ]
     optimizer = torch.optim.AdamW(trainable_params, weight_decay=0.01)
 
