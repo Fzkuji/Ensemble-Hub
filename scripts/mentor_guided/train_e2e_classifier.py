@@ -230,7 +230,7 @@ def main():
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
     parser.add_argument("--token-levels", type=int, nargs='+',
                         default=[0, 100, 500, 1000])
-    parser.add_argument("--max-mentor-tokens", type=int, default=256)
+    parser.add_argument("--max-mentor-tokens", type=int, default=1024)
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=2)
