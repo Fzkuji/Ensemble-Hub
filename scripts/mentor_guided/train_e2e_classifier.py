@@ -223,7 +223,8 @@ def load_json_data(data_dir: str, token_level: int) -> List[Dict]:
 
 def main():
     parser = argparse.ArgumentParser(description="End-to-end classifier training")
-    parser.add_argument("--data-dir", type=str, required=True,
+    parser.add_argument("--data-dir", type=str,
+                        default="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_all_DeepSeek-R1-Distill-Qwen-32B",
                         help="Directory with collected JSON files")
     parser.add_argument("--intern-model", type=str,
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
