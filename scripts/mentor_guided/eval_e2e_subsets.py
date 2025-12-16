@@ -421,12 +421,17 @@ def evaluate_cascade(
         correct = 0
 
         for i in range(n_samples):
+            decided = False
             for stage_idx, tokens in enumerate(TOKEN_LEVELS):
                 if all_probs[tokens][i] >= thresholds[stage_idx]:
                     correct += gt[tokens][i]
+                    decided = True
                     break
-                elif stage_idx == len(TOKEN_LEVELS) - 1:
-                    correct += gt[TOKEN_LEVELS[0]][i]
+
+            if not decided:
+                # No stage passed threshold, select the one with highest confidence
+                best_tokens = max(TOKEN_LEVELS, key=lambda t: all_probs[t][i])
+                correct += gt[best_tokens][i]
 
         acc = correct / n_samples
         if acc > best_acc:

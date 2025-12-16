@@ -143,6 +143,10 @@ def train_and_eval_xgboost(
         final_correct = np.zeros(n_test, dtype=bool)
 
         for i in range(n_test):
+            # Track probabilities for fallback selection
+            stage_probs = []
+            decided = False
+
             for stage_idx, tokens in enumerate(TOKEN_LEVELS):
                 hidden = test_data[tokens]['hidden_states'][i:i+1].numpy()
                 if hidden.ndim == 3:
@@ -150,13 +154,17 @@ def train_and_eval_xgboost(
 
                 proba = stage_models[stage_idx].predict_proba(hidden)
                 prob_sufficient = proba[0, 1]
+                stage_probs.append((tokens, prob_sufficient))
 
                 if prob_sufficient >= thresholds[stage_idx]:
                     final_correct[i] = gt[tokens][i] == 1
+                    decided = True
                     break
-                elif stage_idx == len(TOKEN_LEVELS) - 1:
-                    # Fall back to stage 0
-                    final_correct[i] = gt[0][i] == 1
+
+            if not decided:
+                # No stage passed threshold, select the one with highest confidence
+                best_tokens, _ = max(stage_probs, key=lambda x: x[1])
+                final_correct[i] = gt[best_tokens][i] == 1
 
         acc = final_correct.mean()
         if acc > best_acc:

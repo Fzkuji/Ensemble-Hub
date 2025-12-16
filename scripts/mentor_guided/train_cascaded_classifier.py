@@ -332,6 +332,10 @@ def simulate_cascade(
 
     with torch.no_grad():
         for i in range(n_samples):
+            # Track probabilities for fallback selection
+            stage_probs = []
+            decided = False
+
             for stage_idx, tokens in enumerate(TOKEN_LEVELS):
                 hidden = data[tokens]['hidden_states'][i:i+1]
                 if hidden.dim() == 3:
@@ -341,17 +345,21 @@ def simulate_cascade(
 
                 output = model(hidden, stage_tensor)
                 prob_sufficient = torch.softmax(output, dim=1)[0, 1].item()
+                stage_probs.append((stage_idx, tokens, prob_sufficient))
 
                 stage_threshold = thresholds[stage_idx]
                 if prob_sufficient >= stage_threshold:
                     # Predict sufficient at this stage
                     final_tokens[i] = tokens
                     final_correct[i] = gt[tokens][i] == 1
+                    decided = True
                     break
-                elif stage_idx == len(TOKEN_LEVELS) - 1:
-                    # Last stage, fall back to stage 0
-                    final_tokens[i] = 0
-                    final_correct[i] = gt[0][i] == 1
+
+            if not decided:
+                # No stage passed threshold, select the one with highest confidence
+                best_stage_idx, best_tokens, _ = max(stage_probs, key=lambda x: x[2])
+                final_tokens[i] = best_tokens
+                final_correct[i] = gt[best_tokens][i] == 1
 
     # Compute statistics
     accuracy = final_correct.mean()
@@ -466,6 +474,10 @@ def simulate_cascade_xgb(
     final_correct = np.zeros(n_samples, dtype=bool)
 
     for i in range(n_samples):
+        # Track probabilities for fallback selection
+        stage_probs = []
+        decided = False
+
         for stage_idx, tokens in enumerate(TOKEN_LEVELS):
             hidden = data[tokens]['hidden_states'][i:i+1].numpy()
             if hidden.ndim == 3:
@@ -473,14 +485,19 @@ def simulate_cascade_xgb(
 
             proba = model.predict_proba(hidden, stage_idx)
             prob_sufficient = proba[0, 1]
+            stage_probs.append((stage_idx, tokens, prob_sufficient))
 
             if prob_sufficient >= thresholds[stage_idx]:
                 final_tokens[i] = tokens
                 final_correct[i] = gt[tokens][i] == 1
+                decided = True
                 break
-            elif stage_idx == len(TOKEN_LEVELS) - 1:
-                final_tokens[i] = 0
-                final_correct[i] = gt[0][i] == 1
+
+        if not decided:
+            # No stage passed threshold, select the one with highest confidence
+            best_stage_idx, best_tokens, _ = max(stage_probs, key=lambda x: x[2])
+            final_tokens[i] = best_tokens
+            final_correct[i] = gt[best_tokens][i] == 1
 
     accuracy = final_correct.mean()
     avg_tokens = final_tokens.mean()
