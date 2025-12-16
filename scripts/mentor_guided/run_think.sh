@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
-cd /home/fzkuji/PycharmProjects/Ensemble-Hub/scripts/mentor_guided
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B"
 SUBSETS="algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus"

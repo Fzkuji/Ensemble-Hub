@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
-cd /home/fzkuji/PycharmProjects/Ensemble-Hub/scripts/mentor_guided
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 SUBSETS="algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus"
 
