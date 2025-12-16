@@ -165,6 +165,7 @@ def evaluate_cascade_distributed(
     device: str,
     rank: int,
     world_size: int,
+    fixed_thresholds: List[float] = None,
 ) -> Dict:
     """Evaluate cascade accuracy with threshold search (distributed version)."""
     model.eval()
@@ -229,40 +230,43 @@ def evaluate_cascade_distributed(
             for idx, prob in local_probs[tokens].items():
                 all_probs[tokens][idx] = prob
 
-    # Threshold search (only on main process, but all processes need result)
-    if is_main_process():
-        logger.info("Searching thresholds...")
-
-    threshold_candidates = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-    best_acc = 0
-    best_thresholds = None
-
-    for combo in product(threshold_candidates, repeat=len(TOKEN_LEVELS)):
-        thresholds = list(combo)
+    def compute_cascade_acc(thresholds):
+        """Compute cascade accuracy for given thresholds."""
         correct = 0
-
         for i in range(n_samples):
             decided = False
             stage_probs = []
-
             for stage_idx, tokens in enumerate(TOKEN_LEVELS):
                 prob = all_probs[tokens][i]
                 stage_probs.append((tokens, prob))
-
                 if prob >= thresholds[stage_idx]:
                     correct += int(gt[tokens][i])
                     decided = True
                     break
-
             if not decided:
-                # No stage passed threshold, select the one with highest confidence
                 best_tokens, _ = max(stage_probs, key=lambda x: x[1])
                 correct += int(gt[best_tokens][i])
+        return correct / n_samples
 
-        acc = correct / n_samples
-        if acc > best_acc:
-            best_acc = acc
-            best_thresholds = thresholds
+    # Use fixed thresholds or search
+    if fixed_thresholds is not None:
+        if is_main_process():
+            logger.info(f"Using saved thresholds: {fixed_thresholds}")
+        best_acc = compute_cascade_acc(fixed_thresholds)
+        best_thresholds = fixed_thresholds
+    else:
+        if is_main_process():
+            logger.info("Searching thresholds...")
+        threshold_candidates = [round(0.05 + i * 0.05, 2) for i in range(19)]  # 0.05 to 0.95
+        best_acc = 0
+        best_thresholds = None
+
+        for combo in product(threshold_candidates, repeat=len(TOKEN_LEVELS)):
+            thresholds = list(combo)
+            acc = compute_cascade_acc(thresholds)
+            if acc > best_acc:
+                best_acc = acc
+                best_thresholds = thresholds
 
     return {
         'best_accuracy': float(best_acc),
@@ -286,6 +290,8 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--use-4bit", action="store_true",
                         help="Use 4-bit quantization")
+    parser.add_argument("--search-thresholds", action="store_true",
+                        help="Search for best thresholds instead of using saved ones")
 
     args = parser.parse_args()
 
@@ -392,6 +398,20 @@ def main():
     classifier_head.load_state_dict(checkpoint['classifier'])
     classifier_head.eval()
 
+    # Get saved thresholds from checkpoint (if available and not searching)
+    saved_thresholds = checkpoint.get('thresholds', None)
+    if saved_thresholds and not args.search_thresholds:
+        if is_main_process():
+            logger.info(f"Found saved thresholds in checkpoint: {saved_thresholds}")
+        fixed_thresholds = saved_thresholds
+    else:
+        if is_main_process():
+            if args.search_thresholds:
+                logger.info("--search-thresholds specified, will search for best thresholds")
+            else:
+                logger.info("No saved thresholds found, will search for best thresholds")
+        fixed_thresholds = None
+
     # Synchronize before evaluation
     if use_distributed:
         dist.barrier()
@@ -401,7 +421,8 @@ def main():
         logger.info("\nEvaluating cascade...")
     result = evaluate_cascade_distributed(
         model, classifier_head, tokenizer, test_data,
-        args.max_length, device, rank, world_size
+        args.max_length, device, rank, world_size,
+        fixed_thresholds=fixed_thresholds,
     )
 
     # Only main process prints results and saves
