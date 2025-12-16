@@ -23,7 +23,8 @@ import argparse
 import json
 import logging
 import os
-from typing import Dict, List
+from itertools import product
+from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
@@ -325,6 +326,107 @@ def eval_epoch(model, dataloader, criterion, device):
     return total_loss / len(dataloader), correct / total, all_preds, all_labels, all_stages
 
 
+def eval_cascade_on_val(
+    model,
+    val_data: Dict[int, List[Dict]],
+    tokenizer,
+    max_length: int,
+    device: str,
+) -> Tuple[float, List[float], Dict]:
+    """
+    Evaluate cascade accuracy on validation set with threshold search.
+    Returns best_accuracy, best_thresholds, detailed_results.
+    """
+    model.eval()
+    n_samples = len(val_data[TOKEN_LEVELS[0]])
+
+    # Collect predictions for each stage
+    all_probs = {tokens: [] for tokens in TOKEN_LEVELS}
+    gt = {tokens: [] for tokens in TOKEN_LEVELS}
+
+    for i in tqdm(range(n_samples), desc="Cascade eval", disable=not is_main_process()):
+        for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+            item = val_data[tokens][i]
+            question = item['question']
+            mentor_response = item.get('mentor_response', '')
+
+            # Build prompt
+            if mentor_response:
+                text = f"Question: {question}\n\nHint: {mentor_response}\n\nAnswer:"
+            else:
+                text = f"Question: {question}\n\nAnswer:"
+
+            encoded = tokenizer(
+                text,
+                truncation=True,
+                max_length=max_length,
+                padding=False,
+                return_tensors="pt",
+            )
+
+            input_ids = encoded['input_ids'].to(device)
+            attention_mask = encoded['attention_mask'].to(device)
+            stages = torch.tensor([stage_idx], device=device)
+
+            with torch.no_grad():
+                logits = model(input_ids, attention_mask, stages)
+                prob = torch.softmax(logits, dim=1)[0, 1].item()
+
+            all_probs[tokens].append(prob)
+            gt[tokens].append(1 if item.get('is_correct', False) else 0)
+
+        if i % 50 == 0:
+            torch.cuda.empty_cache()
+
+    # Threshold search with finer granularity
+    threshold_candidates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    best_acc = 0
+    best_thresholds = None
+
+    for combo in product(threshold_candidates, repeat=len(TOKEN_LEVELS)):
+        thresholds = list(combo)
+        correct = 0
+
+        for i in range(n_samples):
+            decided = False
+            stage_probs = []
+
+            for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+                prob = all_probs[tokens][i]
+                stage_probs.append((tokens, prob))
+
+                if prob >= thresholds[stage_idx]:
+                    correct += gt[tokens][i]
+                    decided = True
+                    break
+
+            if not decided:
+                # No stage passed threshold, select the one with highest confidence
+                best_tokens, _ = max(stage_probs, key=lambda x: x[1])
+                correct += gt[best_tokens][i]
+
+        acc = correct / n_samples
+        if acc > best_acc:
+            best_acc = acc
+            best_thresholds = thresholds
+
+    # Compute oracle for reference
+    oracle_correct = 0
+    for i in range(n_samples):
+        for tokens in TOKEN_LEVELS:
+            if gt[tokens][i] == 1:
+                oracle_correct += 1
+                break
+    oracle_acc = oracle_correct / n_samples
+
+    detailed = {
+        'oracle': oracle_acc,
+        'baseline': {tokens: sum(gt[tokens]) / n_samples for tokens in TOKEN_LEVELS},
+    }
+
+    return best_acc, best_thresholds, detailed
+
+
 def main():
     parser = argparse.ArgumentParser(description="LoRA fine-tuning for mentor classification")
     parser.add_argument("--data-dir", type=str,
@@ -357,6 +459,8 @@ def main():
                         help="Don't filter out all-correct/all-wrong samples")
     parser.add_argument("--dropout", type=float, default=0.1,
                         help="Dropout rate for classifier head")
+    parser.add_argument("--val-ratio", type=float, default=0.3,
+                        help="Validation split ratio from training data (default: 0.3)")
 
     args = parser.parse_args()
 
@@ -400,7 +504,7 @@ def main():
         logger.info(f"Data dir: {subset_dir}")
         logger.info(f"DDP: {use_ddp}, World size: {world_size}")
 
-    # Load train and test data separately (already split)
+    # Load train data and split into train/val
     if is_main_process():
         logger.info("Loading training data...")
     train_data = load_json_data(subset_dir, split=train_split)
@@ -410,29 +514,25 @@ def main():
         cleanup_distributed()
         return
 
-    if is_main_process():
-        logger.info("Loading test data...")
-    test_data = load_json_data(subset_dir, split=test_split)
-    if not test_data:
-        if is_main_process():
-            logger.warning("No test data found, will use train data for validation")
-        from sklearn.model_selection import train_test_split as sk_split
-        n_samples = len(train_data[TOKEN_LEVELS[0]])
-        train_idx, val_idx = sk_split(
-            np.arange(n_samples), test_size=0.2, random_state=42
-        )
-        val_data = {}
-        for tokens in TOKEN_LEVELS:
-            if tokens in train_data:
-                val_data[tokens] = [train_data[tokens][i] for i in val_idx]
-                train_data[tokens] = [train_data[tokens][i] for i in train_idx]
-    else:
-        val_data = test_data
+    # Split train data into train/val (e.g., 70/30)
+    from sklearn.model_selection import train_test_split as sk_split
+    n_samples = len(train_data[TOKEN_LEVELS[0]])
+    train_idx, val_idx = sk_split(
+        np.arange(n_samples), test_size=args.val_ratio, random_state=42
+    )
+
+    val_data = {}
+    actual_train_data = {}
+    for tokens in TOKEN_LEVELS:
+        if tokens in train_data:
+            val_data[tokens] = [train_data[tokens][i] for i in val_idx]
+            actual_train_data[tokens] = [train_data[tokens][i] for i in train_idx]
+    train_data = actual_train_data
 
     n_train = len(train_data[TOKEN_LEVELS[0]])
     n_val = len(val_data[TOKEN_LEVELS[0]])
     if is_main_process():
-        logger.info(f"Train: {n_train} samples, Val: {n_val} samples")
+        logger.info(f"Train: {n_train} samples, Val: {n_val} samples (split ratio: {1-args.val_ratio:.0%}/{args.val_ratio:.0%})")
 
     # Load tokenizer
     if is_main_process():
@@ -548,7 +648,8 @@ def main():
     optimizer = torch.optim.AdamW(trainable_params, weight_decay=0.01)
 
     # Training loop
-    best_val_acc = 0
+    best_cascade_acc = 0
+    best_thresholds = None
     best_state = None
 
     for epoch in range(args.epochs):
@@ -564,18 +665,32 @@ def main():
         val_loss, val_acc, _, _, _ = eval_epoch(model, val_loader, criterion, device)
 
         if is_main_process():
-            logger.info(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
-            logger.info(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+            logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+            logger.info(f"Val Loss: {val_loss:.4f}, Val Acc (per-sample): {val_acc:.4f}")
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Cascade evaluation on validation set (the real metric)
+        if is_main_process():
+            logger.info("Running cascade evaluation on validation set...")
+        cascade_acc, thresholds, detailed = eval_cascade_on_val(
+            model, val_data, tokenizer, args.max_length, device
+        )
+
+        if is_main_process():
+            logger.info(f"Val Cascade Acc: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
+            logger.info(f"Thresholds: {thresholds}")
+
+        # Save based on cascade accuracy
+        if cascade_acc > best_cascade_acc:
+            best_cascade_acc = cascade_acc
+            best_thresholds = thresholds
             if is_main_process():
                 classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
                 best_state = {
                     'lora': base_model.state_dict(),
                     'classifier': classifier_state,
+                    'thresholds': thresholds,
                 }
-                logger.info(f"New best! Saving...")
+                logger.info(f"New best cascade acc! Saving...")
 
     # Save best model (only main process)
     if is_main_process() and best_state:
@@ -596,14 +711,17 @@ def main():
 
     if is_main_process():
         logger.info("\nFinal Evaluation:")
-        logger.info(f"Best Val Accuracy: {best_val_acc:.4f}")
+        logger.info(f"Best Val Cascade Accuracy: {best_cascade_acc:.4f}")
+        logger.info(f"Best Thresholds: {best_thresholds}")
 
         # Save results
         results = {
             'subset': args.subset,
             'n_train': n_train,
             'n_val': n_val,
-            'best_val_acc': float(best_val_acc),
+            'val_ratio': args.val_ratio,
+            'best_cascade_acc': float(best_cascade_acc),
+            'best_thresholds': best_thresholds,
             'world_size': world_size,
             'args': vars(args),
         }
