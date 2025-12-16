@@ -582,7 +582,17 @@ def main():
         torch.save(best_state, os.path.join(args.output_dir, "best_model.pt"))
         base_model.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
-        logger.info(f"Model saved to {args.output_dir}")
+        logger.info(f"Best model saved to {args.output_dir}")
+
+    # Save last epoch model
+    if is_main_process():
+        classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
+        last_state = {
+            'lora': base_model.state_dict(),
+            'classifier': classifier_state,
+        }
+        torch.save(last_state, os.path.join(args.output_dir, "last_model.pt"))
+        logger.info(f"Last model saved to {args.output_dir}/last_model.pt")
 
     if is_main_process():
         logger.info("\nFinal Evaluation:")
