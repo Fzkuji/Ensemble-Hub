@@ -378,34 +378,33 @@ def eval_cascade_on_val(
         if i % 50 == 0:
             torch.cuda.empty_cache()
 
-    # Threshold search with finer granularity
-    threshold_candidates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    def compute_cascade_acc(thresholds, all_probs, gt, n_samples):
+        """Compute cascade accuracy for given thresholds."""
+        correct = 0
+        for i in range(n_samples):
+            decided = False
+            stage_probs = []
+            for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+                prob = all_probs[tokens][i]
+                stage_probs.append((tokens, prob))
+                if prob >= thresholds[stage_idx]:
+                    correct += gt[tokens][i]
+                    decided = True
+                    break
+            if not decided:
+                best_tokens, _ = max(stage_probs, key=lambda x: x[1])
+                correct += gt[best_tokens][i]
+        return correct / n_samples
+
+    # Direct fine-grained threshold search (0.05 step)
+    # 19^4 = 130321 combinations, still fast since compute_cascade_acc is O(n_samples)
+    threshold_candidates = [round(0.05 + i * 0.05, 2) for i in range(19)]  # 0.05 to 0.95
     best_acc = 0
     best_thresholds = None
 
     for combo in product(threshold_candidates, repeat=len(TOKEN_LEVELS)):
         thresholds = list(combo)
-        correct = 0
-
-        for i in range(n_samples):
-            decided = False
-            stage_probs = []
-
-            for stage_idx, tokens in enumerate(TOKEN_LEVELS):
-                prob = all_probs[tokens][i]
-                stage_probs.append((tokens, prob))
-
-                if prob >= thresholds[stage_idx]:
-                    correct += gt[tokens][i]
-                    decided = True
-                    break
-
-            if not decided:
-                # No stage passed threshold, select the one with highest confidence
-                best_tokens, _ = max(stage_probs, key=lambda x: x[1])
-                correct += gt[best_tokens][i]
-
-        acc = correct / n_samples
+        acc = compute_cascade_acc(thresholds, all_probs, gt, n_samples)
         if acc > best_acc:
             best_acc = acc
             best_thresholds = thresholds
