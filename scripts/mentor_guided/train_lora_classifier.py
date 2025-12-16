@@ -34,6 +34,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, TaskType
+from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -418,9 +419,20 @@ def eval_cascade_on_val(
                 break
     oracle_acc = oracle_correct / n_samples
 
+    # Compute per-stage AUC
+    stage_auc = {}
+    for tokens in TOKEN_LEVELS:
+        try:
+            auc = roc_auc_score(gt[tokens], all_probs[tokens])
+            stage_auc[tokens] = auc
+        except ValueError:
+            # All labels are the same
+            stage_auc[tokens] = 0.5
+
     detailed = {
         'oracle': oracle_acc,
         'baseline': {tokens: sum(gt[tokens]) / n_samples for tokens in TOKEN_LEVELS},
+        'auc': stage_auc,
     }
 
     return best_acc, best_thresholds, detailed
@@ -677,6 +689,8 @@ def main():
         if is_main_process():
             logger.info(f"Val Cascade Acc: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
             logger.info(f"Thresholds: {thresholds}")
+            auc_str = ", ".join([f"T{t}={detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
+            logger.info(f"Per-stage AUC: {auc_str}")
 
         # Save based on cascade accuracy
         if cascade_acc > best_cascade_acc:

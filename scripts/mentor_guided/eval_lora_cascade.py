@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
+from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -268,9 +269,19 @@ def evaluate_cascade_distributed(
                 best_acc = acc
                 best_thresholds = thresholds
 
+    # Compute per-stage AUC
+    stage_auc = {}
+    for tokens in TOKEN_LEVELS:
+        try:
+            auc = roc_auc_score(gt[tokens], all_probs[tokens])
+            stage_auc[tokens] = auc
+        except ValueError:
+            stage_auc[tokens] = 0.5
+
     return {
         'best_accuracy': float(best_acc),
         'best_thresholds': best_thresholds,
+        'auc': stage_auc,
     }
 
 
@@ -439,6 +450,8 @@ def main():
         logger.info(f"\nLoRA Cascade:")
         logger.info(f"  Best Accuracy: {result['best_accuracy']:.4f} ({result['best_accuracy']*100:.1f}%)")
         logger.info(f"  Thresholds: {result['best_thresholds']}")
+        auc_str = ", ".join([f"T{t}={result['auc'][t]:.4f}" for t in TOKEN_LEVELS])
+        logger.info(f"  Per-stage AUC: {auc_str}")
 
         # Gap analysis
         gap_to_oracle = oracle_acc - result['best_accuracy']
@@ -455,6 +468,7 @@ def main():
             'oracle': oracle_acc,
             'cascade_accuracy': result['best_accuracy'],
             'thresholds': result['best_thresholds'],
+            'auc': {str(k): v for k, v in result['auc'].items()},
         }
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)
