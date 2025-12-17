@@ -314,16 +314,97 @@ def summarize(data_dir: str, show_length: bool = True):
     print()
 
 
+def summarize_single(data_dir: str, subset: str, model_dir: str = None, show_length: bool = True):
+    """Summarize results for a single subset (e.g., math500, all)."""
+    if model_dir is None:
+        model_dir = os.path.join(data_dir, "all", "lora_model")
+
+    result_file = os.path.join(model_dir, "cascade_eval.json")
+    if not os.path.exists(result_file):
+        print(f"Results file not found: {result_file}")
+        return
+
+    with open(result_file, 'r') as f:
+        r = json.load(f)
+
+    n = r['n_test']
+    b = r['baseline']
+    oracle = r['oracle']
+    cascade = r['cascade_accuracy']
+
+    # Handle both string and int keys
+    t0 = b.get('0', b.get(0, 0))
+    t100 = b.get('100', b.get(100, 0))
+    t500 = b.get('500', b.get(500, 0))
+    t1000 = b.get('1000', b.get(1000, 0))
+
+    best_baseline = max(b.values())
+    gap = cascade - best_baseline
+
+    print("\n" + "=" * 100)
+    print(f"Results for: {subset} (N={n})")
+    print("=" * 100)
+
+    if show_length:
+        # 计算长度统计
+        length_stats = compute_length_stats(data_dir, subset)
+
+        # Header with length columns
+        print(f"\n{'Strategy':<15} {'Acc':<10} {'M_Len':<10} {'I_Len':<10}")
+        print("-" * 45)
+
+        for tokens in TOKEN_LEVELS:
+            acc = b.get(str(tokens), b.get(tokens, 0))
+            l_stat = length_stats.get(tokens)
+            m_len = l_stat.get('mentor', {}).get('mean', 0) if l_stat else 0
+            i_len = l_stat.get('intern', {}).get('mean', 0) if l_stat else 0
+
+            m_str = f"{m_len:.1f}" if m_len else "-"
+            i_str = f"{i_len:.1f}" if i_len else "-"
+            print(f"T{tokens:<14} {acc:<10.4f} {m_str:<10} {i_str:<10}")
+
+        print("-" * 45)
+        print(f"{'Oracle':<15} {oracle:<10.4f}")
+        print(f"{'Cascade':<15} {cascade:<10.4f}")
+        print(f"{'Gap':<15} {gap:+.4f}")
+    else:
+        print(f"\n{'Strategy':<15} {'Accuracy':<10}")
+        print("-" * 25)
+        for tokens in TOKEN_LEVELS:
+            acc = b.get(str(tokens), b.get(tokens, 0))
+            print(f"T{tokens:<14} {acc:<10.4f}")
+        print("-" * 25)
+        print(f"{'Oracle':<15} {oracle:<10.4f}")
+        print(f"{'Cascade':<15} {cascade:<10.4f}")
+        print(f"{'Gap':<15} {gap:+.4f}")
+
+    print("\n" + "=" * 100)
+
+    # Thresholds used
+    if 'thresholds' in r:
+        print("\nThresholds used:")
+        for i, thresh in enumerate(r['thresholds']):
+            print(f"  Stage {i} (T{TOKEN_LEVELS[i]} -> T{TOKEN_LEVELS[i+1]}): {thresh:.4f}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Summarize evaluation results")
     parser.add_argument("--data-dir", type=str,
                         default="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split",
                         help="Data directory")
+    parser.add_argument("--subset", type=str, default=None,
+                        help="Single subset to summarize (e.g., math500, all). If not specified, summarize all MATH subsets")
+    parser.add_argument("--model-dir", type=str, default=None,
+                        help="Model directory for single subset mode")
     parser.add_argument("--no-length", action="store_true",
                         help="Don't show generation length statistics")
 
     args = parser.parse_args()
-    summarize(args.data_dir, show_length=not args.no_length)
+
+    if args.subset:
+        summarize_single(args.data_dir, args.subset, args.model_dir, show_length=not args.no_length)
+    else:
+        summarize(args.data_dir, show_length=not args.no_length)
 
 
 if __name__ == "__main__":

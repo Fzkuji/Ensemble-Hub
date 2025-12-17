@@ -489,9 +489,9 @@ def main():
 
     # Determine subset directory
     if args.subset == "all":
-        subset_dir = args.data_dir
-        train_split = "all_train"
-        test_split = "all_test"
+        subset_dir = os.path.join(args.data_dir, "all")
+        train_split = "train"
+        test_split = "test"
     else:
         subset_dir = os.path.join(args.data_dir, args.subset)
         train_split = "train"

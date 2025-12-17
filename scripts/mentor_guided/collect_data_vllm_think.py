@@ -280,6 +280,59 @@ def load_hendrycks_math_subset(
     return data
 
 
+def load_math500() -> List[Dict[str, Any]]:
+    """Load MATH-500 dataset from HuggingFaceH4/MATH-500.
+
+    Returns:
+        List of 500 math problems
+    """
+    from datasets import load_dataset
+
+    logger.info("Loading HuggingFaceH4/MATH-500...")
+    dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+
+    data = []
+    for item in dataset:
+        data.append({
+            'question': item['problem'],
+            'ground_truth': item['solution'],
+            'type': item.get('type', ''),
+            'level': item.get('level', ''),
+            'subset': 'math500',
+        })
+
+    logger.info(f"  Loaded {len(data)} problems from MATH-500")
+    return data
+
+
+def load_hendrycks_math_all(split: str = "train") -> List[Dict[str, Any]]:
+    """Load all subsets of hendrycks_math merged together.
+
+    Args:
+        split: "train" or "test"
+
+    Returns:
+        List of all problems from all subsets
+    """
+    MATH_SUBSETS = [
+        "algebra",
+        "counting_and_probability",
+        "geometry",
+        "intermediate_algebra",
+        "number_theory",
+        "prealgebra",
+        "precalculus",
+    ]
+
+    all_data = []
+    for subset in MATH_SUBSETS:
+        data = load_hendrycks_math_subset(subset, split)
+        all_data.extend(data)
+
+    logger.info(f"Total: {len(all_data)} problems from all subsets ({split})")
+    return all_data
+
+
 def collect_data_for_token_level(
     model: VLLMInference,
     data: List[Dict[str, Any]],
@@ -454,11 +507,13 @@ def main():
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
                         help="Model name")
     parser.add_argument("--dataset", type=str, default="hendrycks_math",
-                        choices=["hendrycks_math"])
+                        choices=["hendrycks_math", "math500", "hendrycks_math_all"],
+                        help="Dataset: hendrycks_math (by subset), math500 (MATH-500), hendrycks_math_all (all subsets merged)")
     parser.add_argument("--subset", type=str, default=None,
-                        help="Specific subset (e.g., algebra). If None, process all subsets")
+                        help="Specific subset for hendrycks_math (e.g., algebra). If None, process all subsets")
     parser.add_argument("--split", type=str, default="test",
-                        choices=["train", "test"])
+                        choices=["train", "test"],
+                        help="Split for hendrycks_math/hendrycks_math_all (ignored for math500)")
     parser.add_argument("--gpu", type=int, default=0,
                         help="GPU ID to use (single GPU mode)")
     parser.add_argument("--batch-size", type=int, default=8,
@@ -484,9 +539,14 @@ def main():
     gpus = [int(g.strip()) for g in args.gpus.split(",")]
 
     # Set output directory (default: server path)
+    model_name = args.model.split('/')[-1]
     if args.output_dir is None:
-        model_name = args.model.split('/')[-1]
-        args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_{model_name}"
+        if args.dataset == "math500":
+            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/math500_think_{model_name}"
+        elif args.dataset == "hendrycks_math_all":
+            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_all_think_{model_name}"
+        else:
+            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_{model_name}"
 
     os.makedirs(args.output_dir, exist_ok=True)
     logger.info(f"Output directory: {args.output_dir}")
@@ -502,25 +562,11 @@ def main():
         "precalculus",
     ]
 
-    subsets = [args.subset] if args.subset else MATH_SUBSETS
+    def collect_and_save(data: List[Dict[str, Any]], output_subdir: str):
+        """Helper to collect data and save results."""
+        os.makedirs(output_subdir, exist_ok=True)
 
-    if args.parallel:
-        # Parallel mode: each GPU processes a shard of the data
-        logger.info(f"Parallel mode with {len(gpus)} GPUs: {gpus}")
-
-        for subset in subsets:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Processing subset: {subset}")
-            logger.info(f"{'='*60}")
-
-            # Load data
-            data = load_hendrycks_math_subset(subset, args.split)
-
-            # Create output directory for this subset
-            subset_dir = os.path.join(args.output_dir, subset, args.split)
-            os.makedirs(subset_dir, exist_ok=True)
-
-            # Collect data in parallel
+        if args.parallel:
             all_results = collect_parallel(
                 model_name=args.model,
                 max_model_len=args.max_model_len,
@@ -529,71 +575,67 @@ def main():
                 token_levels=token_levels,
                 gpus=gpus,
             )
-
-            # Save results for each token level
+        else:
+            model = VLLMInference(
+                model_name=args.model,
+                gpu_id=args.gpu,
+                max_model_len=args.max_model_len,
+            )
+            all_results = {}
             for token_level in token_levels:
-                results = all_results.get(token_level, [])
-                correct = sum(1 for r in results if r['is_correct'])
-                accuracy = correct / len(results) if results else 0
-                logger.info(f"  tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
+                logger.info(f"\nCollecting data for tokens={token_level}...")
+                results = collect_data_for_token_level(model, data, token_level, args.batch_size)
+                all_results[token_level] = results
 
-                output_file = os.path.join(subset_dir, f"tokens{token_level}.json")
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    json.dump(results, f, indent=2, ensure_ascii=False)
-                logger.info(f"  Saved to {output_file}")
+        # Save results
+        for token_level in token_levels:
+            results = all_results.get(token_level, [])
+            correct = sum(1 for r in results if r['is_correct'])
+            accuracy = correct / len(results) if results else 0
+            logger.info(f"  tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
+
+            output_file = os.path.join(output_subdir, f"tokens{token_level}.json")
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            logger.info(f"  Saved to {output_file}")
+
+    if args.parallel:
+        logger.info(f"Parallel mode with {len(gpus)} GPUs: {gpus}")
     else:
-        # Single GPU mode
         logger.info(f"Single GPU mode on GPU {args.gpu}")
 
-        # Initialize model
-        model = VLLMInference(
-            model_name=args.model,
-            gpu_id=args.gpu,
-            max_model_len=args.max_model_len,
-        )
+    if args.dataset == "math500":
+        # MATH-500 dataset
+        logger.info(f"\n{'='*60}")
+        logger.info("Processing MATH-500")
+        logger.info(f"{'='*60}")
 
-        # Process each subset
+        data = load_math500()
+        output_subdir = os.path.join(args.output_dir, "math500", "test")
+        collect_and_save(data, output_subdir)
+
+    elif args.dataset == "hendrycks_math_all":
+        # All hendrycks_math subsets merged
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing hendrycks_math_all ({args.split})")
+        logger.info(f"{'='*60}")
+
+        data = load_hendrycks_math_all(args.split)
+        output_subdir = os.path.join(args.output_dir, "all", args.split)
+        collect_and_save(data, output_subdir)
+
+    else:
+        # hendrycks_math by subset
+        subsets = [args.subset] if args.subset else MATH_SUBSETS
+
         for subset in subsets:
             logger.info(f"\n{'='*60}")
             logger.info(f"Processing subset: {subset}")
             logger.info(f"{'='*60}")
 
-            # Load data
             data = load_hendrycks_math_subset(subset, args.split)
-
-            # Create output directory for this subset
-            subset_dir = os.path.join(args.output_dir, subset, args.split)
-            os.makedirs(subset_dir, exist_ok=True)
-
-            # Collect data for each token level
-            for token_level in token_levels:
-                logger.info(f"\nCollecting data for tokens={token_level}...")
-
-                results = collect_data_for_token_level(
-                    model, data, token_level, args.batch_size
-                )
-
-                # Calculate accuracy
-                correct = sum(1 for r in results if r['is_correct'])
-                accuracy = correct / len(results) if results else 0
-                logger.info(f"  Accuracy: {accuracy:.4f} ({correct}/{len(results)})")
-
-                # Save results
-                output_file = os.path.join(subset_dir, f"tokens{token_level}.json")
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    json.dump(results, f, indent=2, ensure_ascii=False)
-                logger.info(f"  Saved to {output_file}")
-
-            # Summary for this subset
-            logger.info(f"\nSubset {subset} summary:")
-            for token_level in token_levels:
-                output_file = os.path.join(subset_dir, f"tokens{token_level}.json")
-                if os.path.exists(output_file):
-                    with open(output_file, 'r') as f:
-                        results = json.load(f)
-                    correct = sum(1 for r in results if r['is_correct'])
-                    accuracy = correct / len(results) if results else 0
-                    logger.info(f"  tokens={token_level}: {accuracy:.4f}")
+            output_subdir = os.path.join(args.output_dir, subset, args.split)
+            collect_and_save(data, output_subdir)
 
     logger.info("\nData collection complete!")
 

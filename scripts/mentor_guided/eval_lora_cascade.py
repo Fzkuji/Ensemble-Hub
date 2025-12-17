@@ -291,8 +291,10 @@ def main():
                         default="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split",
                         help="Base directory with subset folders")
     parser.add_argument("--subset", type=str, default="algebra",
-                        choices=SUBSETS,
+                        choices=SUBSETS + ["all", "math500"],
                         help="Which subset to evaluate")
+    parser.add_argument("--test-data-dir", type=str, default=None,
+                        help="Override test data directory (e.g., for cross-dataset evaluation)")
     parser.add_argument("--model-dir", type=str, default=None,
                         help="Directory with trained LoRA model (default: data_dir/{subset}/lora_model)")
     parser.add_argument("--base-model", type=str,
@@ -315,9 +317,31 @@ def main():
     else:
         device = args.device
 
-    subset_dir = os.path.join(args.data_dir, args.subset)
+    # Determine model and test data directories
+    if args.subset == "all":
+        subset_dir = args.data_dir
+        test_subdir = "all"
+        test_split = "test"
+    elif args.subset == "math500":
+        subset_dir = args.data_dir
+        test_subdir = "math500"
+        test_split = "test"
+    else:
+        subset_dir = os.path.join(args.data_dir, args.subset)
+        test_subdir = args.subset
+        test_split = "test"
+
     if args.model_dir is None:
-        args.model_dir = os.path.join(subset_dir, "lora_model")
+        if args.subset in ["all", "math500"]:
+            args.model_dir = os.path.join(args.data_dir, "all", "lora_model")
+        else:
+            args.model_dir = os.path.join(subset_dir, "lora_model")
+
+    # Override test data directory if specified
+    if args.test_data_dir:
+        test_data_path = args.test_data_dir
+    else:
+        test_data_path = os.path.join(args.data_dir, test_subdir)
 
     # Check model exists
     model_path = os.path.join(args.model_dir, "best_model.pt")
@@ -330,12 +354,13 @@ def main():
     if is_main_process():
         logger.info(f"Subset: {args.subset}")
         logger.info(f"Model dir: {args.model_dir}")
+        logger.info(f"Test data: {test_data_path}")
         logger.info(f"Distributed: {use_distributed}, World size: {world_size}")
 
     # Load test data
     if is_main_process():
         logger.info("Loading test data...")
-    test_data = load_json_data(subset_dir, split="test")
+    test_data = load_json_data(test_data_path, split="test")
     if not test_data:
         if is_main_process():
             logger.error("No test data found!")
