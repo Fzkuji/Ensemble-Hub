@@ -6,34 +6,9 @@ cd "$SCRIPT_DIR"
 DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B"
 SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
 
-echo "========== Step 1: Collect Data (7 subsets on 7 GPUs) =========="
-# Train split - parallel across GPUs
-pids=()
-for i in "${!SUBSETS[@]}"; do
-    subset="${SUBSETS[$i]}"
-    gpu=$((i % 8))
-    echo "Starting train collection: $subset on GPU $gpu"
-    python collect_data_vllm_think.py --split train --subset $subset --gpu $gpu &
-    pids+=($!)
-done
-echo "Waiting for train collection to complete..."
-for pid in "${pids[@]}"; do
-    wait $pid
-done
-
-# Test split - parallel across GPUs
-pids=()
-for i in "${!SUBSETS[@]}"; do
-    subset="${SUBSETS[$i]}"
-    gpu=$((i % 8))
-    echo "Starting test collection: $subset on GPU $gpu"
-    python collect_data_vllm_think.py --split test --subset $subset --gpu $gpu &
-    pids+=($!)
-done
-echo "Waiting for test collection to complete..."
-for pid in "${pids[@]}"; do
-    wait $pid
-done
+echo "========== Step 1: Collect Data (8 GPUs parallel) =========="
+python collect_data_vllm_think.py --split train --parallel --gpus 0,1,2,3,4,5,6,7
+python collect_data_vllm_think.py --split test --parallel --gpus 0,1,2,3,4,5,6,7
 
 echo "========== Step 2: Data Statistics =========="
 python compute_stats.py --data-dir $DATA_DIR --split train

@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 import multiprocessing as mp
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
 
 # Add scripts directory to path for imports
@@ -349,6 +349,105 @@ def collect_data_for_token_level(
     return results
 
 
+def worker_process(
+    rank: int,
+    world_size: int,
+    gpu_id: int,
+    model_name: str,
+    max_model_len: int,
+    batch_size: int,
+    data: List[Dict[str, Any]],
+    token_levels: List[int],
+    result_queue: mp.Queue,
+):
+    """Worker process for parallel data collection.
+
+    Each worker loads its own vLLM model and processes a shard of the data.
+    """
+    # Shard data for this worker
+    shard_data = [d for i, d in enumerate(data) if i % world_size == rank]
+
+    if not shard_data:
+        result_queue.put((rank, {}))
+        return
+
+    logger.info(f"[Worker {rank}] GPU {gpu_id}: Processing {len(shard_data)} samples")
+
+    # Initialize model on this GPU
+    model = VLLMInference(
+        model_name=model_name,
+        gpu_id=gpu_id,
+        max_model_len=max_model_len,
+    )
+
+    # Collect data for each token level
+    results_by_level = {}
+    for token_level in token_levels:
+        logger.info(f"[Worker {rank}] Collecting tokens={token_level}...")
+        results = collect_data_for_token_level(model, shard_data, token_level, batch_size)
+        results_by_level[token_level] = results
+
+        correct = sum(1 for r in results if r['is_correct'])
+        accuracy = correct / len(results) if results else 0
+        logger.info(f"[Worker {rank}] tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
+
+    result_queue.put((rank, results_by_level))
+    logger.info(f"[Worker {rank}] Done")
+
+
+def collect_parallel(
+    model_name: str,
+    max_model_len: int,
+    batch_size: int,
+    data: List[Dict[str, Any]],
+    token_levels: List[int],
+    gpus: List[int],
+) -> Dict[int, List[Dict[str, Any]]]:
+    """Collect data in parallel across multiple GPUs.
+
+    Args:
+        model_name: HuggingFace model name
+        max_model_len: Maximum model context length
+        batch_size: Batch size for inference
+        data: List of problems to process
+        token_levels: List of token levels to collect
+        gpus: List of GPU IDs to use
+
+    Returns:
+        Dictionary mapping token_level -> list of results
+    """
+    world_size = len(gpus)
+    logger.info(f"Starting parallel collection with {world_size} workers on GPUs {gpus}")
+
+    mp.set_start_method('spawn', force=True)
+    result_queue = mp.Queue()
+
+    # Start workers
+    processes = []
+    for rank, gpu_id in enumerate(gpus):
+        p = mp.Process(
+            target=worker_process,
+            args=(rank, world_size, gpu_id, model_name, max_model_len, batch_size, data, token_levels, result_queue)
+        )
+        p.start()
+        processes.append(p)
+
+    # Collect results
+    all_results = {}
+    for _ in range(world_size):
+        rank, results_by_level = result_queue.get()
+        for token_level, results in results_by_level.items():
+            if token_level not in all_results:
+                all_results[token_level] = []
+            all_results[token_level].extend(results)
+
+    # Wait for all workers
+    for p in processes:
+        p.join()
+
+    return all_results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Collect data with vLLM and thinking prompt")
     parser.add_argument("--model", type=str,
@@ -361,7 +460,7 @@ def main():
     parser.add_argument("--split", type=str, default="test",
                         choices=["train", "test"])
     parser.add_argument("--gpu", type=int, default=0,
-                        help="GPU ID to use")
+                        help="GPU ID to use (single GPU mode)")
     parser.add_argument("--batch-size", type=int, default=8,
                         help="Batch size for inference")
     parser.add_argument("--max-model-len", type=int, default=8192,
@@ -370,11 +469,19 @@ def main():
                         help="Output directory")
     parser.add_argument("--token-levels", type=str, default="0,100,500,1000",
                         help="Comma-separated token levels to collect")
+    # Parallel mode arguments
+    parser.add_argument("--parallel", action="store_true",
+                        help="Enable parallel data collection with multiple GPUs")
+    parser.add_argument("--gpus", type=str, default="0,1,2,3,4,5,6,7",
+                        help="Comma-separated list of GPUs for parallel mode")
 
     args = parser.parse_args()
 
     # Parse token levels
     token_levels = [int(x) for x in args.token_levels.split(",")]
+
+    # Parse GPUs for parallel mode
+    gpus = [int(g.strip()) for g in args.gpus.split(",")]
 
     # Set output directory (default: server path)
     if args.output_dir is None:
@@ -383,13 +490,6 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     logger.info(f"Output directory: {args.output_dir}")
-
-    # Initialize model
-    model = VLLMInference(
-        model_name=args.model,
-        gpu_id=args.gpu,
-        max_model_len=args.max_model_len,
-    )
 
     # Define subsets
     MATH_SUBSETS = [
@@ -404,48 +504,96 @@ def main():
 
     subsets = [args.subset] if args.subset else MATH_SUBSETS
 
-    # Process each subset
-    for subset in subsets:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Processing subset: {subset}")
-        logger.info(f"{'='*60}")
+    if args.parallel:
+        # Parallel mode: each GPU processes a shard of the data
+        logger.info(f"Parallel mode with {len(gpus)} GPUs: {gpus}")
 
-        # Load data
-        data = load_hendrycks_math_subset(subset, args.split)
+        for subset in subsets:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Processing subset: {subset}")
+            logger.info(f"{'='*60}")
 
-        # Create output directory for this subset
-        subset_dir = os.path.join(args.output_dir, subset, args.split)
-        os.makedirs(subset_dir, exist_ok=True)
+            # Load data
+            data = load_hendrycks_math_subset(subset, args.split)
 
-        # Collect data for each token level
-        for token_level in token_levels:
-            logger.info(f"\nCollecting data for tokens={token_level}...")
+            # Create output directory for this subset
+            subset_dir = os.path.join(args.output_dir, subset, args.split)
+            os.makedirs(subset_dir, exist_ok=True)
 
-            results = collect_data_for_token_level(
-                model, data, token_level, args.batch_size
+            # Collect data in parallel
+            all_results = collect_parallel(
+                model_name=args.model,
+                max_model_len=args.max_model_len,
+                batch_size=args.batch_size,
+                data=data,
+                token_levels=token_levels,
+                gpus=gpus,
             )
 
-            # Calculate accuracy
-            correct = sum(1 for r in results if r['is_correct'])
-            accuracy = correct / len(results) if results else 0
-            logger.info(f"  Accuracy: {accuracy:.4f} ({correct}/{len(results)})")
-
-            # Save results
-            output_file = os.path.join(subset_dir, f"tokens{token_level}.json")
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(results, f, indent=2, ensure_ascii=False)
-            logger.info(f"  Saved to {output_file}")
-
-        # Summary for this subset
-        logger.info(f"\nSubset {subset} summary:")
-        for token_level in token_levels:
-            output_file = os.path.join(subset_dir, f"tokens{token_level}.json")
-            if os.path.exists(output_file):
-                with open(output_file, 'r') as f:
-                    results = json.load(f)
+            # Save results for each token level
+            for token_level in token_levels:
+                results = all_results.get(token_level, [])
                 correct = sum(1 for r in results if r['is_correct'])
                 accuracy = correct / len(results) if results else 0
-                logger.info(f"  tokens={token_level}: {accuracy:.4f}")
+                logger.info(f"  tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
+
+                output_file = os.path.join(subset_dir, f"tokens{token_level}.json")
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(results, f, indent=2, ensure_ascii=False)
+                logger.info(f"  Saved to {output_file}")
+    else:
+        # Single GPU mode
+        logger.info(f"Single GPU mode on GPU {args.gpu}")
+
+        # Initialize model
+        model = VLLMInference(
+            model_name=args.model,
+            gpu_id=args.gpu,
+            max_model_len=args.max_model_len,
+        )
+
+        # Process each subset
+        for subset in subsets:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Processing subset: {subset}")
+            logger.info(f"{'='*60}")
+
+            # Load data
+            data = load_hendrycks_math_subset(subset, args.split)
+
+            # Create output directory for this subset
+            subset_dir = os.path.join(args.output_dir, subset, args.split)
+            os.makedirs(subset_dir, exist_ok=True)
+
+            # Collect data for each token level
+            for token_level in token_levels:
+                logger.info(f"\nCollecting data for tokens={token_level}...")
+
+                results = collect_data_for_token_level(
+                    model, data, token_level, args.batch_size
+                )
+
+                # Calculate accuracy
+                correct = sum(1 for r in results if r['is_correct'])
+                accuracy = correct / len(results) if results else 0
+                logger.info(f"  Accuracy: {accuracy:.4f} ({correct}/{len(results)})")
+
+                # Save results
+                output_file = os.path.join(subset_dir, f"tokens{token_level}.json")
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(results, f, indent=2, ensure_ascii=False)
+                logger.info(f"  Saved to {output_file}")
+
+            # Summary for this subset
+            logger.info(f"\nSubset {subset} summary:")
+            for token_level in token_levels:
+                output_file = os.path.join(subset_dir, f"tokens{token_level}.json")
+                if os.path.exists(output_file):
+                    with open(output_file, 'r') as f:
+                        results = json.load(f)
+                    correct = sum(1 for r in results if r['is_correct'])
+                    accuracy = correct / len(results) if results else 0
+                    logger.info(f"  tokens={token_level}: {accuracy:.4f}")
 
     logger.info("\nData collection complete!")
 
