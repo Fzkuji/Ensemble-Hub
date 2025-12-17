@@ -1,4 +1,14 @@
 #!/bin/bash
+# MATH-500 Experiment Pipeline
+# Usage: ./run_math500.sh [GPUS] [EXP_NAME]
+#   GPUS: Comma-separated GPU IDs (default: 0,1,2,3,4,5,6,7)
+#   EXP_NAME: Custom experiment name for output directory (default: model name)
+#
+# Examples:
+#   ./run_math500.sh                              # Default: 8 GPUs, model name
+#   ./run_math500.sh 0,1,2,3                      # 4 GPUs, model name
+#   ./run_math500.sh 0,1,2,3,4,5,6,7 R1_m32B_i7B  # 8 GPUs, custom name
+
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -6,14 +16,16 @@ cd "$SCRIPT_DIR"
 # Configuration
 MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 MODEL_NAME=$(echo $MODEL | sed 's|.*/||')
-DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/math500_exp_think_${MODEL_NAME}"
 GPUS="${1:-0,1,2,3,4,5,6,7}"
+EXP_NAME="${2:-$MODEL_NAME}"  # Optional: custom experiment name (e.g., R1_m32B_i7B)
+DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/math500_exp_think_${EXP_NAME}"
 VAL_RATIO=0.4  # 6:4 train/val split
 
 echo "============================================================"
 echo "MATH-500 Experiment Pipeline"
 echo "============================================================"
 echo "Model: $MODEL"
+echo "Exp name: $EXP_NAME"
 echo "Data dir: $DATA_DIR"
 echo "GPUs: $GPUS"
 echo "Val ratio: $VAL_RATIO (train:val = $((100-$(echo "$VAL_RATIO*100" | bc | cut -d. -f1))):$(echo "$VAL_RATIO*100" | bc | cut -d. -f1))"

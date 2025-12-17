@@ -411,17 +411,19 @@ def worker_process(
     batch_size: int,
     data: List[Dict[str, Any]],
     token_levels: List[int],
-    result_queue: mp.Queue,
+    output_dir: str,
+    done_queue: mp.Queue,
 ):
     """Worker process for parallel data collection.
 
     Each worker loads its own vLLM model and processes a shard of the data.
+    Results are saved directly to temp files to avoid Queue memory issues.
     """
     # Shard data for this worker
     shard_data = [d for i, d in enumerate(data) if i % world_size == rank]
 
     if not shard_data:
-        result_queue.put((rank, {}))
+        done_queue.put((rank, True))
         return
 
     logger.info(f"[Worker {rank}] GPU {gpu_id}: Processing {len(shard_data)} samples")
@@ -433,18 +435,22 @@ def worker_process(
         max_model_len=max_model_len,
     )
 
-    # Collect data for each token level
-    results_by_level = {}
+    # Collect data for each token level and save to temp file
     for token_level in token_levels:
         logger.info(f"[Worker {rank}] Collecting tokens={token_level}...")
         results = collect_data_for_token_level(model, shard_data, token_level, batch_size)
-        results_by_level[token_level] = results
 
         correct = sum(1 for r in results if r['is_correct'])
         accuracy = correct / len(results) if results else 0
         logger.info(f"[Worker {rank}] tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
 
-    result_queue.put((rank, results_by_level))
+        # Save to temp file immediately
+        temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+        logger.info(f"[Worker {rank}] Saved {len(results)} results to {temp_file}")
+
+    done_queue.put((rank, True))
     logger.info(f"[Worker {rank}] Done")
 
 
@@ -455,6 +461,7 @@ def collect_parallel(
     data: List[Dict[str, Any]],
     token_levels: List[int],
     gpus: List[int],
+    output_dir: str,
 ) -> Dict[int, List[Dict[str, Any]]]:
     """Collect data in parallel across multiple GPUs.
 
@@ -465,6 +472,7 @@ def collect_parallel(
         data: List of problems to process
         token_levels: List of token levels to collect
         gpus: List of GPU IDs to use
+        output_dir: Output directory for temp files
 
     Returns:
         Dictionary mapping token_level -> list of results
@@ -473,30 +481,54 @@ def collect_parallel(
     logger.info(f"Starting parallel collection with {world_size} workers on GPUs {gpus}")
 
     mp.set_start_method('spawn', force=True)
-    result_queue = mp.Queue()
+    done_queue = mp.Queue()
+
+    # Create output dir
+    os.makedirs(output_dir, exist_ok=True)
 
     # Start workers
     processes = []
     for rank, gpu_id in enumerate(gpus):
         p = mp.Process(
             target=worker_process,
-            args=(rank, world_size, gpu_id, model_name, max_model_len, batch_size, data, token_levels, result_queue)
+            args=(rank, world_size, gpu_id, model_name, max_model_len, batch_size, data, token_levels, output_dir, done_queue)
         )
         p.start()
         processes.append(p)
 
-    # Collect results
-    all_results = {}
-    for _ in range(world_size):
-        rank, results_by_level = result_queue.get()
-        for token_level, results in results_by_level.items():
-            if token_level not in all_results:
-                all_results[token_level] = []
-            all_results[token_level].extend(results)
+    # Wait for all workers to signal done
+    completed = 0
+    while completed < world_size:
+        try:
+            rank, success = done_queue.get(timeout=60)
+            completed += 1
+            logger.info(f"Worker {rank} completed ({completed}/{world_size})")
+        except:
+            # Check if workers are still alive
+            alive = sum(1 for p in processes if p.is_alive())
+            if alive == 0:
+                logger.warning(f"All workers exited, got {completed}/{world_size} completions")
+                break
 
-    # Wait for all workers
+    # Wait for all workers to finish
     for p in processes:
-        p.join()
+        p.join(timeout=30)
+        if p.is_alive():
+            logger.warning(f"Terminating stuck worker...")
+            p.terminate()
+
+    # Merge results from temp files
+    all_results = {}
+    for token_level in token_levels:
+        all_results[token_level] = []
+        for rank in range(world_size):
+            temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
+            if os.path.exists(temp_file):
+                with open(temp_file, 'r', encoding='utf-8') as f:
+                    results = json.load(f)
+                all_results[token_level].extend(results)
+                os.remove(temp_file)  # Clean up temp file
+                logger.info(f"Merged {len(results)} results from {temp_file}")
 
     return all_results
 
@@ -522,6 +554,8 @@ def main():
                         help="Maximum model context length")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory")
+    parser.add_argument("--exp-name", type=str, default=None,
+                        help="Experiment name for output directory (e.g., R1_m32B_i7B). If not set, uses model name.")
     parser.add_argument("--token-levels", type=str, default="0,100,500,1000",
                         help="Comma-separated token levels to collect")
     # Parallel mode arguments
@@ -539,14 +573,15 @@ def main():
     gpus = [int(g.strip()) for g in args.gpus.split(",")]
 
     # Set output directory (default: server path)
-    model_name = args.model.split('/')[-1]
+    # Use exp_name if provided, otherwise use model name
+    exp_name = args.exp_name if args.exp_name else args.model.split('/')[-1]
     if args.output_dir is None:
         if args.dataset == "math500":
-            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/math500_think_{model_name}"
+            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/math500_think_{exp_name}"
         elif args.dataset == "hendrycks_math_all":
-            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_all_think_{model_name}"
+            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_all_think_{exp_name}"
         else:
-            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_{model_name}"
+            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_{exp_name}"
 
     os.makedirs(args.output_dir, exist_ok=True)
     logger.info(f"Output directory: {args.output_dir}")
@@ -574,6 +609,7 @@ def main():
                 data=data,
                 token_levels=token_levels,
                 gpus=gpus,
+                output_dir=output_subdir,
             )
         else:
             model = VLLMInference(

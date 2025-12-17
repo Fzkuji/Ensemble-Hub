@@ -260,6 +260,70 @@ TOTAL (weighted)          5000   0.5538  -       278.3   0.5723  81.2    234.6  
 
 ---
 
+## 8. 实验命名规范（Experiment Naming）
+
+使用 `--exp-name` 参数指定自定义实验名称，避免不同模型组合导致文件冲突。
+
+### 推荐命名格式
+
+```
+{MODEL_SERIES}_m{MENTOR_SIZE}_i{INTERN_SIZE}
+```
+
+### 模型缩写映射表
+
+| 完整模型名 | 缩写 | 备注 |
+|------------|------|------|
+| **DeepSeek R1 Distill 系列** | | |
+| deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B | R1_1.5B | Intern |
+| deepseek-ai/DeepSeek-R1-Distill-Qwen-7B | R1_7B | Mentor/Intern |
+| deepseek-ai/DeepSeek-R1-Distill-Qwen-14B | R1_14B | Mentor/Intern |
+| deepseek-ai/DeepSeek-R1-Distill-Qwen-32B | R1_32B | Mentor |
+| deepseek-ai/DeepSeek-R1-Distill-Llama-8B | R1_L8B | Mentor/Intern |
+| deepseek-ai/DeepSeek-R1-Distill-Llama-70B | R1_L70B | Mentor |
+| **Qwen 系列** | | |
+| Qwen/Qwen2.5-0.5B-Instruct | Q2.5_0.5B | Intern |
+| Qwen/Qwen2.5-1.5B-Instruct | Q2.5_1.5B | Intern |
+| Qwen/Qwen2.5-3B-Instruct | Q2.5_3B | Intern |
+| Qwen/Qwen2.5-7B-Instruct | Q2.5_7B | Mentor/Intern |
+| Qwen/Qwen2.5-14B-Instruct | Q2.5_14B | Mentor |
+| Qwen/Qwen2.5-32B-Instruct | Q2.5_32B | Mentor |
+| Qwen/Qwen2.5-72B-Instruct | Q2.5_72B | Mentor |
+| Qwen/QwQ-32B-Preview | QwQ_32B | Mentor (reasoning) |
+| **LLaMA 系列** | | |
+| meta-llama/Llama-3.1-8B-Instruct | L3.1_8B | Mentor/Intern |
+| meta-llama/Llama-3.1-70B-Instruct | L3.1_70B | Mentor |
+| meta-llama/Llama-3.3-70B-Instruct | L3.3_70B | Mentor |
+| **Mistral 系列** | | |
+| mistralai/Mistral-7B-Instruct-v0.3 | M_7B | Mentor/Intern |
+| mistralai/Mixtral-8x7B-Instruct-v0.1 | Mx_8x7B | Mentor |
+
+### 实验名称示例
+
+| Mentor 模型 | Intern 模型 | Exp Name |
+|-------------|-------------|----------|
+| DeepSeek-R1-Distill-Qwen-32B | DeepSeek-R1-Distill-Qwen-7B | `R1_m32B_i7B` |
+| DeepSeek-R1-Distill-Qwen-14B | DeepSeek-R1-Distill-Qwen-1.5B | `R1_m14B_i1.5B` |
+| Qwen2.5-72B-Instruct | Qwen2.5-7B-Instruct | `Q2.5_m72B_i7B` |
+| Llama-3.1-70B-Instruct | Llama-3.1-8B-Instruct | `L3.1_m70B_i8B` |
+| DeepSeek-R1-Distill-Qwen-32B | Qwen2.5-7B-Instruct | `R1m32B_Q2.5i7B` |
+
+### 使用方式
+
+```bash
+# 使用 exp-name 参数
+python collect_data_vllm_think.py \
+    --dataset math500 \
+    --exp-name R1_m32B_i7B \
+    --parallel \
+    --gpus 0,1,2,3,4,5,6,7
+
+# 输出目录将会是:
+# /mnt/data/.../math500_think_R1_m32B_i7B/
+```
+
+---
+
 ## 附录
 
 ### A. 数据目录结构
@@ -327,7 +391,7 @@ TOTAL (weighted)          5000   0.5538  -       278.3   0.5723  81.2    234.6  
 
 ---
 
-## 8. 单独模型评测
+## 9. 单独模型评测
 
 用于对比不同模型的性能（准确率、生成长度、推理速度）。
 
