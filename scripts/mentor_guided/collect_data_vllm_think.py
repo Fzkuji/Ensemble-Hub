@@ -207,7 +207,7 @@ class VLLMInference:
             top_p=top_p,
         )
 
-        outputs = self.model.generate(prompts, sampling_params)
+        outputs = self.model.generate(prompts, sampling_params, use_tqdm=False)
 
         responses = []
         for output in outputs:
@@ -238,7 +238,7 @@ class VLLMInference:
             top_p=0.95,
         )
 
-        outputs = self.model.generate(prompts, sampling_params)
+        outputs = self.model.generate(prompts, sampling_params, use_tqdm=False)
 
         responses = []
         for output in outputs:
@@ -351,9 +351,10 @@ def collect_data_for_token_level(
         List of results with responses and correctness
     """
     results = []
+    total_batches = (len(data) + batch_size - 1) // batch_size
 
     # Process in batches
-    for batch_start in tqdm(range(0, len(data), batch_size), desc=f"tokens={token_level}"):
+    for batch_start in tqdm(range(0, len(data), batch_size), desc=f"tokens={token_level}", total=total_batches, unit="batch", ncols=80):
         batch = data[batch_start:batch_start + batch_size]
 
         if token_level == 0:
