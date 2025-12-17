@@ -454,6 +454,10 @@ def worker_process(
     done_queue.put((rank, True))
     logger.info(f"[Worker {rank}] Done")
 
+    # Force exit to avoid vLLM background threads keeping the process alive
+    import os
+    os._exit(0)
+
 
 def collect_parallel(
     model_name: str,
