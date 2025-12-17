@@ -3,9 +3,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-SUBSETS="algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus"
+SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
 
-echo "========== Step 1: Collect Data =========="
+echo "========== Step 1: Collect Data (8 GPUs parallel) =========="
 python collect_progressive_data.py --dataset hendrycks_math --split train --parallel --gpus 0,1,2,3,4,5,6,7
 python collect_progressive_data.py --dataset hendrycks_math --split test --parallel --gpus 0,1,2,3,4,5,6,7
 
@@ -14,13 +14,13 @@ python compute_stats.py --split train
 python compute_stats.py --split test
 
 echo "========== Step 3: Train LoRA Classifiers =========="
-for subset in $SUBSETS; do
+for subset in "${SUBSETS[@]}"; do
     echo "Training: $subset"
     torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset $subset
 done
 
 echo "========== Step 4: Evaluate Cascade =========="
-for subset in $SUBSETS; do
+for subset in "${SUBSETS[@]}"; do
     echo "Evaluating: $subset"
     torchrun --nproc_per_node=8 eval_lora_cascade.py --subset $subset
 done
