@@ -231,9 +231,10 @@ def evaluate_cascade_distributed(
             for idx, prob in local_probs[tokens].items():
                 all_probs[tokens][idx] = prob
 
-    def compute_cascade_acc(thresholds):
+    def compute_cascade_acc(thresholds, return_decisions=False):
         """Compute cascade accuracy for given thresholds."""
         correct = 0
+        decisions = []  # which token level each sample is assigned to
         for i in range(n_samples):
             decided = False
             stage_probs = []
@@ -242,11 +243,15 @@ def evaluate_cascade_distributed(
                 stage_probs.append((tokens, prob))
                 if prob >= thresholds[stage_idx]:
                     correct += int(gt[tokens][i])
+                    decisions.append(tokens)
                     decided = True
                     break
             if not decided:
                 best_tokens, _ = max(stage_probs, key=lambda x: x[1])
                 correct += int(gt[best_tokens][i])
+                decisions.append(best_tokens)
+        if return_decisions:
+            return correct / n_samples, decisions
         return correct / n_samples
 
     # Use fixed thresholds or search
@@ -269,6 +274,19 @@ def evaluate_cascade_distributed(
                 best_acc = acc
                 best_thresholds = thresholds
 
+    # Get cascade decisions with best thresholds
+    _, cascade_decisions = compute_cascade_acc(best_thresholds, return_decisions=True)
+
+    # Compute Oracle decisions (lowest token level that gets correct answer)
+    oracle_decisions = []
+    for i in range(n_samples):
+        chosen = TOKEN_LEVELS[-1]  # default to highest
+        for tokens in TOKEN_LEVELS:
+            if gt[tokens][i]:  # correct at this level
+                chosen = tokens
+                break
+        oracle_decisions.append(chosen)
+
     # Compute per-stage AUC
     stage_auc = {}
     for tokens in TOKEN_LEVELS:
@@ -282,6 +300,8 @@ def evaluate_cascade_distributed(
         'best_accuracy': float(best_acc),
         'best_thresholds': best_thresholds,
         'auc': stage_auc,
+        'cascade_decisions': cascade_decisions,
+        'oracle_decisions': oracle_decisions,
     }
 
 
@@ -484,6 +504,47 @@ def main():
         logger.info(f"\nGap to Oracle: {gap_to_oracle:.4f} ({gap_to_oracle*100:.1f}%)")
         logger.info(f"Improvement over best baseline: {gap_to_best_baseline:.4f} ({gap_to_best_baseline*100:.1f}%)")
 
+        # Compute length statistics for Oracle and Cascade decisions
+        def get_item_length(item):
+            """Get mentor and intern length from an item."""
+            m_len = item.get('mentor_length', 0)
+            if not m_len and 'mentor_response' in item and item['mentor_response']:
+                m_len = len(item['mentor_response']) // 4  # estimate tokens
+            i_len = item.get('intern_length', item.get('num_tokens', 0))
+            if not i_len and 'response' in item:
+                i_len = len(item['response']) // 4
+            return m_len, i_len
+
+        # Compute Oracle length stats
+        oracle_m_lens, oracle_i_lens = [], []
+        for i, decision in enumerate(result['oracle_decisions']):
+            item = test_data[decision][i]
+            m_len, i_len = get_item_length(item)
+            oracle_m_lens.append(m_len)
+            oracle_i_lens.append(i_len)
+
+        oracle_length = {
+            'mentor_mean': float(np.mean(oracle_m_lens)) if oracle_m_lens else 0,
+            'intern_mean': float(np.mean(oracle_i_lens)) if oracle_i_lens else 0,
+        }
+
+        # Compute Cascade length stats
+        cascade_m_lens, cascade_i_lens = [], []
+        for i, decision in enumerate(result['cascade_decisions']):
+            item = test_data[decision][i]
+            m_len, i_len = get_item_length(item)
+            cascade_m_lens.append(m_len)
+            cascade_i_lens.append(i_len)
+
+        cascade_length = {
+            'mentor_mean': float(np.mean(cascade_m_lens)) if cascade_m_lens else 0,
+            'intern_mean': float(np.mean(cascade_i_lens)) if cascade_i_lens else 0,
+        }
+
+        logger.info(f"\nLength Statistics:")
+        logger.info(f"  Oracle  - M_Len: {oracle_length['mentor_mean']:.1f}, I_Len: {oracle_length['intern_mean']:.1f}")
+        logger.info(f"  Cascade - M_Len: {cascade_length['mentor_mean']:.1f}, I_Len: {cascade_length['intern_mean']:.1f}")
+
         # Save results
         output_file = os.path.join(args.model_dir, "cascade_eval.json")
         results = {
@@ -494,6 +555,8 @@ def main():
             'cascade_accuracy': result['best_accuracy'],
             'thresholds': result['best_thresholds'],
             'auc': {str(k): v for k, v in result['auc'].items()},
+            'oracle_length': oracle_length,
+            'cascade_length': cascade_length,
         }
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)

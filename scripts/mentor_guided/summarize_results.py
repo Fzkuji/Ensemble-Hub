@@ -364,8 +364,21 @@ def summarize_single(data_dir: str, subset: str, model_dir: str = None, show_len
             print(f"T{tokens:<14} {acc:<10.4f} {m_str:<10} {i_str:<10}")
 
         print("-" * 45)
-        print(f"{'Oracle':<15} {oracle:<10.4f}")
-        print(f"{'Cascade':<15} {cascade:<10.4f}")
+        # Oracle with length
+        oracle_len = r.get('oracle_length', {})
+        o_m = oracle_len.get('mentor_mean', 0)
+        o_i = oracle_len.get('intern_mean', 0)
+        o_m_str = f"{o_m:.1f}" if o_m else "-"
+        o_i_str = f"{o_i:.1f}" if o_i else "-"
+        print(f"{'Oracle':<15} {oracle:<10.4f} {o_m_str:<10} {o_i_str:<10}")
+
+        # Cascade with length
+        cascade_len = r.get('cascade_length', {})
+        c_m = cascade_len.get('mentor_mean', 0)
+        c_i = cascade_len.get('intern_mean', 0)
+        c_m_str = f"{c_m:.1f}" if c_m else "-"
+        c_i_str = f"{c_i:.1f}" if c_i else "-"
+        print(f"{'Cascade':<15} {cascade:<10.4f} {c_m_str:<10} {c_i_str:<10}")
         print(f"{'Gap':<15} {gap:+.4f}")
     else:
         print(f"\n{'Strategy':<15} {'Accuracy':<10}")
