@@ -14,7 +14,7 @@ cd "$SCRIPT_DIR"
 
 # Default values
 GPUS="0,1,2,3,4,5,6,7"
-DATA_DIR="/home/fzkuji/PycharmProjects/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split"
+DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split"
 MODEL_PATH="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 EPOCHS=3
 BATCH_SIZE=2
