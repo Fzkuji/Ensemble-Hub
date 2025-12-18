@@ -485,12 +485,34 @@ def worker_process_all_tasks(
             accuracy = correct / len(results) if results else 0
             logger.info(f"[Worker {rank}] {subset_name} tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
 
-            # Save to temp file (will be merged by main process after all workers complete)
+            # Save to temp file
             os.makedirs(output_dir, exist_ok=True)
             temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
             with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(results, f, indent=2, ensure_ascii=False)
             logger.info(f"[Worker {rank}] Saved: {temp_file}")
+
+            # Check if all ranks finished this (subset, token_level) - if so, merge
+            all_exist = all(
+                os.path.exists(os.path.join(output_dir, f"tokens{token_level}_rank{r}.json"))
+                for r in range(world_size)
+            )
+            if all_exist:
+                # Use lock file to prevent race condition
+                lock_file = os.path.join(output_dir, f".lock_tokens{token_level}")
+                merged_file = os.path.join(output_dir, f"tokens{token_level}.json")
+                try:
+                    # Try to create lock file (atomic on most filesystems)
+                    fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.close(fd)
+                    # We got the lock - do the merge
+                    if not os.path.exists(merged_file):
+                        total, correct_cnt, acc = merge_rank_files(output_dir, token_level, world_size)
+                        print(f"[MERGED] {subset_name} tokens={token_level}: {total} samples, acc={acc:.4f}", flush=True)
+                    os.remove(lock_file)
+                except FileExistsError:
+                    # Another worker is merging, skip
+                    pass
 
     logger.info(f"[Worker {rank}] All tasks completed")
     os._exit(0)
@@ -562,8 +584,7 @@ def collect_all_parallel(
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """Collect data for ALL subsets in parallel with ONE model init per GPU.
 
-    Real-time merge: monitors for completed rank files and merges immediately
-    when all ranks finish a (subset, token_level).
+    Workers merge results immediately after each (subset, token_level) completes.
     """
     world_size = len(gpus)
 
@@ -580,7 +601,7 @@ def collect_all_parallel(
     except RuntimeError:
         pass
 
-    # Clean up old rank files
+    # Clean up old files
     for subset_name, output_dir, _ in all_tasks:
         os.makedirs(output_dir, exist_ok=True)
         for token_level in token_levels:
@@ -588,6 +609,13 @@ def collect_all_parallel(
                 temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
                 if os.path.exists(temp_file):
                     os.remove(temp_file)
+            # Also clean lock files and merged files
+            lock_file = os.path.join(output_dir, f".lock_tokens{token_level}")
+            merged_file = os.path.join(output_dir, f"tokens{token_level}.json")
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+            if os.path.exists(merged_file):
+                os.remove(merged_file)
 
     # Start all workers
     processes = []
@@ -600,75 +628,17 @@ def collect_all_parallel(
         processes.append(p)
         print(f"[MAIN] Started worker {rank} on GPU {gpu_id} (PID: {p.pid})", flush=True)
 
-    print(f"\n[MAIN] All {world_size} workers started. Monitoring...\n", flush=True)
+    print(f"\n[MAIN] All {world_size} workers started. Waiting...\n", flush=True)
 
-    # Real-time merge: check for completed tasks while workers run
-    merged_tasks = set()  # (subset_name, token_level)
-    all_results = {}
-    total_tasks_count = len(all_tasks) * len(token_levels)
-
-    while True:
-        # Check each (subset, token_level) for completion
-        for subset_name, output_dir, _ in all_tasks:
-            if subset_name not in all_results:
-                all_results[subset_name] = {}
-
-            for token_level in token_levels:
-                if (subset_name, token_level) in merged_tasks:
-                    continue
-
-                # Check if ALL rank files exist for this task
-                all_exist = True
-                for rank in range(world_size):
-                    temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
-                    if not os.path.exists(temp_file):
-                        all_exist = False
-                        break
-
-                if all_exist:
-                    # All rank files ready - merge now!
-                    print(f"\n[MERGE] {subset_name} tokens={token_level}:", flush=True)
-                    total, correct, accuracy = merge_rank_files(output_dir, token_level, world_size)
-                    merged_tasks.add((subset_name, token_level))
-
-                    if total > 0:
-                        print(
-                            f"[MERGE] ✓ {subset_name} tokens={token_level}: {total} samples, "
-                            f"acc={accuracy:.4f} ({correct}/{total}) [{len(merged_tasks)}/{total_tasks_count}]",
-                            flush=True,
-                        )
-                        all_results[subset_name][token_level] = {
-                            'total': total,
-                            'correct': correct,
-                            'accuracy': accuracy,
-                            'output_file': os.path.join(output_dir, f"tokens{token_level}.json"),
-                        }
-                    else:
-                        print(f"[MERGE] ✗ No results! [{len(merged_tasks)}/{total_tasks_count}]", flush=True)
-
-        # Exit conditions
-        if len(merged_tasks) >= total_tasks_count:
-            print(f"\n[MAIN] All {total_tasks_count} tasks merged!", flush=True)
-            break
-
-        alive = sum(1 for p in processes if p.is_alive())
-        if alive == 0:
-            print(f"\n[MAIN] All workers exited. Merged {len(merged_tasks)}/{total_tasks_count}.", flush=True)
-            break
-
-        time.sleep(1)
-
-    # Cleanup workers
+    # Wait for all workers
     for p in processes:
-        p.join(timeout=5)
-        if p.is_alive():
-            p.terminate()
+        p.join()
 
     print(f"\n{'='*60}", flush=True)
-    print(f"[MAIN] Done! {len(merged_tasks)}/{total_tasks_count} tasks merged.", flush=True)
+    print(f"[MAIN] All workers finished.", flush=True)
     print(f"{'='*60}\n", flush=True)
 
-    return all_results
+    return {}
 
 
 def main():
