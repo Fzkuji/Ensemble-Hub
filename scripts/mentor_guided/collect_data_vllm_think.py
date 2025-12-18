@@ -485,7 +485,7 @@ def worker_process_all_tasks(
             accuracy = correct / len(results) if results else 0
             logger.info(f"[Worker {rank}] {subset_name} tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
 
-            # Save to temp file
+            # Save to temp file (will be merged by main process after all workers complete)
             os.makedirs(output_dir, exist_ok=True)
             temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
             with open(temp_file, 'w', encoding='utf-8') as f:
@@ -523,6 +523,33 @@ def collect_parallel(
     return results.get("single", {})
 
 
+def merge_rank_files(output_dir: str, token_level: int, world_size: int) -> Tuple[int, float]:
+    """Merge all rank files for a single token level.
+
+    Returns: (total_samples, accuracy)
+    """
+    merged = []
+    for rank in range(world_size):
+        temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
+        if os.path.exists(temp_file):
+            with open(temp_file, 'r', encoding='utf-8') as f:
+                results = json.load(f)
+            merged.extend(results)
+            os.remove(temp_file)
+            print(f"  [MERGE] Loaded {len(results)} samples from rank {rank}", flush=True)
+
+    if merged:
+        correct = sum(1 for r in merged if r['is_correct'])
+        accuracy = correct / len(merged)
+
+        output_file = os.path.join(output_dir, f"tokens{token_level}.json")
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(merged, f, indent=2, ensure_ascii=False)
+
+        return len(merged), accuracy
+    return 0, 0.0
+
+
 def collect_all_parallel(
     model_name: str,
     max_model_len: int,
@@ -534,13 +561,19 @@ def collect_all_parallel(
 ) -> Dict[str, Dict[int, List[Dict[str, Any]]]]:
     """Collect data for ALL subsets in parallel with ONE model init per GPU.
 
-    NEW IMPLEMENTATION: Workers save temp files, main process waits for all
-    processes to exit (via join), then merges results. No file-based signaling.
+    Simple approach:
+    1. Start all workers
+    2. Wait for all workers to complete
+    3. Merge all rank files
     """
     world_size = len(gpus)
 
-    logger.info(f"Starting parallel collection: {world_size} GPUs, {len(all_tasks)} subsets")
-    logger.info(f"Model will be initialized ONCE per GPU")
+    print(f"\n{'='*60}", flush=True)
+    print(f"[MAIN] Starting parallel collection", flush=True)
+    print(f"[MAIN] GPUs: {gpus} ({world_size} workers)", flush=True)
+    print(f"[MAIN] Subsets: {len(all_tasks)}", flush=True)
+    print(f"[MAIN] Token levels: {token_levels}", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
     # Set spawn method
     try:
@@ -548,7 +581,7 @@ def collect_all_parallel(
     except RuntimeError:
         pass
 
-    # Clean up old temp files
+    # Clean up old rank files
     for subset_name, output_dir, _ in all_tasks:
         os.makedirs(output_dir, exist_ok=True)
         for token_level in token_levels:
@@ -566,61 +599,43 @@ def collect_all_parallel(
         )
         p.start()
         processes.append(p)
-        logger.info(f"Started worker {rank} on GPU {gpu_id}")
+        print(f"[MAIN] Started worker {rank} on GPU {gpu_id} (PID: {p.pid})", flush=True)
 
-    # Simply wait for all processes to complete (they use os._exit(0))
-    print(f"\n[MAIN] Waiting for {world_size} workers to complete...", flush=True)
+    print(f"\n[MAIN] All {world_size} workers started. Waiting for completion...\n", flush=True)
+
+    # Wait for all workers to complete
     for i, p in enumerate(processes):
-        p.join()  # Block until process exits
-        print(f"[MAIN] Worker {i} exited (code: {p.exitcode})", flush=True)
+        p.join()
+        print(f"[MAIN] Worker {i} finished (exit code: {p.exitcode})", flush=True)
 
-    print(f"\n[MAIN] *** ALL {world_size} WORKERS COMPLETED ***", flush=True)
-
-    # Now merge all temp files
     print(f"\n{'='*60}", flush=True)
-    print(f"[MAIN] MERGING RESULTS...", flush=True)
-    print(f"{'='*60}", flush=True)
+    print(f"[MAIN] All workers completed. Starting merge phase...", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
+    # Now merge all rank files
     all_results = {}
+    total_merged = 0
+    total_tasks_count = len(all_tasks) * len(token_levels)
+
     for subset_name, output_dir, _ in all_tasks:
         all_results[subset_name] = {}
+        print(f"\n[MERGE] Processing subset: {subset_name}", flush=True)
+        print(f"[MERGE] Output dir: {output_dir}", flush=True)
 
         for token_level in token_levels:
-            merged = []
-            files_found = 0
+            print(f"\n[MERGE] {subset_name} tokens={token_level}:", flush=True)
+            total, accuracy = merge_rank_files(output_dir, token_level, world_size)
+            total_merged += 1
 
-            for rank in range(world_size):
-                temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
-                if os.path.exists(temp_file):
-                    with open(temp_file, 'r', encoding='utf-8') as f:
-                        results = json.load(f)
-                    merged.extend(results)
-                    files_found += 1
-                    # Keep temp file for now (in case of issues)
-
-            all_results[subset_name][token_level] = merged
-
-            if merged:
-                correct = sum(1 for r in merged if r['is_correct'])
-                accuracy = correct / len(merged)
-                print(f"  {subset_name} tokens={token_level}: {accuracy:.4f} ({correct}/{len(merged)}) [from {files_found} files]", flush=True)
-
-                output_file = os.path.join(output_dir, f"tokens{token_level}.json")
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    json.dump(merged, f, indent=2, ensure_ascii=False)
-                print(f"  -> Saved: {output_file}", flush=True)
-
-                # Now delete temp files
-                for rank in range(world_size):
-                    temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
+            if total > 0:
+                print(f"[MERGE] ✓ Saved {total} samples, accuracy={accuracy:.4f} [{total_merged}/{total_tasks_count}]", flush=True)
+                all_results[subset_name][token_level] = []  # Placeholder
             else:
-                print(f"  {subset_name} tokens={token_level}: No results!", flush=True)
+                print(f"[MERGE] ✗ No results found! [{total_merged}/{total_tasks_count}]", flush=True)
 
     print(f"\n{'='*60}", flush=True)
-    print(f"[MAIN] MERGE COMPLETE!", flush=True)
-    print(f"{'='*60}", flush=True)
+    print(f"[MAIN] Merge complete! {total_merged} tasks processed.", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
     return all_results
 
