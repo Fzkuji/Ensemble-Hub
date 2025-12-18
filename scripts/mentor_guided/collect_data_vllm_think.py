@@ -569,17 +569,17 @@ def collect_all_parallel(
         logger.info(f"Started worker {rank} on GPU {gpu_id}")
 
     # Simply wait for all processes to complete (they use os._exit(0))
-    logger.info(f"Waiting for {world_size} workers to complete...")
+    print(f"\n[MAIN] Waiting for {world_size} workers to complete...", flush=True)
     for i, p in enumerate(processes):
         p.join()  # Block until process exits
-        logger.info(f"Worker {i} completed (exit code: {p.exitcode})")
+        print(f"[MAIN] Worker {i} exited (code: {p.exitcode})", flush=True)
 
-    logger.info("All workers completed!")
+    print(f"\n[MAIN] *** ALL {world_size} WORKERS COMPLETED ***", flush=True)
 
     # Now merge all temp files
-    logger.info(f"\n{'='*60}")
-    logger.info("Merging results from all workers...")
-    logger.info(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"[MAIN] MERGING RESULTS...", flush=True)
+    print(f"{'='*60}", flush=True)
 
     all_results = {}
     for subset_name, output_dir, _ in all_tasks:
@@ -603,11 +603,12 @@ def collect_all_parallel(
             if merged:
                 correct = sum(1 for r in merged if r['is_correct'])
                 accuracy = correct / len(merged)
-                logger.info(f"  {subset_name} tokens={token_level}: {accuracy:.4f} ({correct}/{len(merged)}) [from {files_found} files]")
+                print(f"  {subset_name} tokens={token_level}: {accuracy:.4f} ({correct}/{len(merged)}) [from {files_found} files]", flush=True)
 
                 output_file = os.path.join(output_dir, f"tokens{token_level}.json")
                 with open(output_file, 'w', encoding='utf-8') as f:
                     json.dump(merged, f, indent=2, ensure_ascii=False)
+                print(f"  -> Saved: {output_file}", flush=True)
 
                 # Now delete temp files
                 for rank in range(world_size):
@@ -615,11 +616,11 @@ def collect_all_parallel(
                     if os.path.exists(temp_file):
                         os.remove(temp_file)
             else:
-                logger.warning(f"  {subset_name} tokens={token_level}: No results!")
+                print(f"  {subset_name} tokens={token_level}: No results!", flush=True)
 
-    logger.info(f"\n{'='*60}")
-    logger.info("Merge complete!")
-    logger.info(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"[MAIN] MERGE COMPLETE!", flush=True)
+    print(f"{'='*60}", flush=True)
 
     return all_results
 
