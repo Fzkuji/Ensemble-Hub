@@ -426,7 +426,7 @@ def collect_data_for_token_level(
     return results
 
 
-def worker_process(
+def worker_process_single_level(
     rank: int,
     world_size: int,
     gpu_id: int,
@@ -434,24 +434,28 @@ def worker_process(
     max_model_len: int,
     batch_size: int,
     data: List[Dict[str, Any]],
-    token_levels: List[int],
+    token_level: int,
     output_dir: str,
-    done_queue: mp.Queue,
     use_think: bool = True,
 ):
-    """Worker process for parallel data collection.
+    """Worker process for parallel data collection (single token level).
 
-    Each worker loads its own vLLM model and processes a shard of the data.
-    Results are saved directly to temp files to avoid Queue memory issues.
+    Each worker loads its own vLLM model and processes a shard of the data
+    for ONE token level only. This avoids vLLM state accumulation issues.
+    Uses file-based signaling instead of Queue for reliability.
     """
     # Shard data for this worker
     shard_data = [d for i, d in enumerate(data) if i % world_size == rank]
 
+    done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
+
     if not shard_data:
-        done_queue.put((rank, True))
+        # Mark as done with empty result
+        with open(done_file, 'w') as f:
+            f.write("empty")
         return
 
-    logger.info(f"[Worker {rank}] GPU {gpu_id}: Processing {len(shard_data)} samples (use_think={use_think})")
+    logger.info(f"[Worker {rank}] GPU {gpu_id}: Processing {len(shard_data)} samples for tokens={token_level} (use_think={use_think})")
 
     # Initialize model on this GPU
     model = VLLMInference(
@@ -460,26 +464,26 @@ def worker_process(
         max_model_len=max_model_len,
     )
 
-    # Collect data for each token level and save to temp file
-    for token_level in token_levels:
-        logger.info(f"[Worker {rank}] Collecting tokens={token_level}...")
-        results = collect_data_for_token_level(model, shard_data, token_level, batch_size, use_think=use_think)
+    # Collect data for this token level only
+    logger.info(f"[Worker {rank}] Collecting tokens={token_level}...")
+    results = collect_data_for_token_level(model, shard_data, token_level, batch_size, use_think=use_think)
 
-        correct = sum(1 for r in results if r['is_correct'])
-        accuracy = correct / len(results) if results else 0
-        logger.info(f"[Worker {rank}] tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
+    correct = sum(1 for r in results if r['is_correct'])
+    accuracy = correct / len(results) if results else 0
+    logger.info(f"[Worker {rank}] tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
 
-        # Save to temp file immediately
-        temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
-        with open(temp_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        logger.info(f"[Worker {rank}] Saved {len(results)} results to {temp_file}")
+    # Save to temp file immediately
+    temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
+    with open(temp_file, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    logger.info(f"[Worker {rank}] Saved {len(results)} results to {temp_file}")
 
-    done_queue.put((rank, True))
-    logger.info(f"[Worker {rank}] Done")
+    # Write done file as signal (more reliable than Queue)
+    with open(done_file, 'w') as f:
+        f.write("done")
+    logger.info(f"[Worker {rank}] Done with tokens={token_level}")
 
     # Force exit to avoid vLLM background threads keeping the process alive
-    import os
     os._exit(0)
 
 
@@ -495,6 +499,10 @@ def collect_parallel(
 ) -> Dict[int, List[Dict[str, Any]]]:
     """Collect data in parallel across multiple GPUs.
 
+    Each token level is processed with fresh worker processes to avoid
+    vLLM state accumulation issues that cause hangs.
+    Uses file-based signaling for reliability.
+
     Args:
         model_name: HuggingFace model name
         max_model_len: Maximum model context length
@@ -508,49 +516,80 @@ def collect_parallel(
     Returns:
         Dictionary mapping token_level -> list of results
     """
+    import time
+
     world_size = len(gpus)
     logger.info(f"Starting parallel collection with {world_size} workers on GPUs {gpus} (use_think={use_think})")
 
-    mp.set_start_method('spawn', force=True)
-    done_queue = mp.Queue()
+    # Set spawn method once at the beginning
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
 
     # Create output dir
     os.makedirs(output_dir, exist_ok=True)
 
-    # Start workers
-    processes = []
-    for rank, gpu_id in enumerate(gpus):
-        p = mp.Process(
-            target=worker_process,
-            args=(rank, world_size, gpu_id, model_name, max_model_len, batch_size, data, token_levels, output_dir, done_queue, use_think)
-        )
-        p.start()
-        processes.append(p)
+    all_results = {}
 
-    # Wait for all workers to signal done
-    completed = 0
-    while completed < world_size:
-        try:
-            rank, success = done_queue.get(timeout=60)
-            completed += 1
-            logger.info(f"Worker {rank} completed ({completed}/{world_size})")
-        except:
-            # Check if workers are still alive
-            alive = sum(1 for p in processes if p.is_alive())
-            if alive == 0:
-                logger.warning(f"All workers exited, got {completed}/{world_size} completions")
+    # Process each token level with fresh workers
+    for token_level in token_levels:
+        logger.info(f"\n{'='*40}")
+        logger.info(f"Starting collection for tokens={token_level}")
+        logger.info(f"{'='*40}")
+
+        # Clean up any old done files
+        for rank in range(world_size):
+            done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
+            if os.path.exists(done_file):
+                os.remove(done_file)
+
+        # Start workers for this token level
+        processes = []
+        for rank, gpu_id in enumerate(gpus):
+            p = mp.Process(
+                target=worker_process_single_level,
+                args=(rank, world_size, gpu_id, model_name, max_model_len, batch_size, data, token_level, output_dir, use_think)
+            )
+            p.start()
+            processes.append(p)
+
+        # Wait for all workers to signal done via file
+        max_wait_time = 3600  # 1 hour max
+        check_interval = 10  # Check every 10 seconds
+        elapsed = 0
+
+        while elapsed < max_wait_time:
+            # Count done files
+            done_count = 0
+            for rank in range(world_size):
+                done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
+                if os.path.exists(done_file):
+                    done_count += 1
+
+            if done_count >= world_size:
+                logger.info(f"All {world_size} workers completed tokens={token_level}")
                 break
 
-    # Wait for all workers to finish
-    for p in processes:
-        p.join(timeout=30)
-        if p.is_alive():
-            logger.warning(f"Terminating stuck worker...")
-            p.terminate()
+            # Check if workers are still alive
+            alive = sum(1 for p in processes if p.is_alive())
+            if alive == 0 and done_count < world_size:
+                logger.warning(f"All workers exited, got {done_count}/{world_size} completions for tokens={token_level}")
+                break
 
-    # Merge results from temp files
-    all_results = {}
-    for token_level in token_levels:
+            logger.info(f"Waiting for workers... {done_count}/{world_size} done, {alive} alive")
+            time.sleep(check_interval)
+            elapsed += check_interval
+
+        # Wait for all workers to finish
+        for p in processes:
+            p.join(timeout=30)
+            if p.is_alive():
+                logger.warning(f"Terminating stuck worker...")
+                p.terminate()
+                p.join(timeout=5)
+
+        # Merge results for this token level
         all_results[token_level] = []
         for rank in range(world_size):
             temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
@@ -560,6 +599,17 @@ def collect_parallel(
                 all_results[token_level].extend(results)
                 os.remove(temp_file)  # Clean up temp file
                 logger.info(f"Merged {len(results)} results from {temp_file}")
+
+            # Clean up done file
+            done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
+            if os.path.exists(done_file):
+                os.remove(done_file)
+
+        # Summary for this token level
+        total = len(all_results[token_level])
+        correct = sum(1 for r in all_results[token_level] if r['is_correct'])
+        accuracy = correct / total if total > 0 else 0
+        logger.info(f"tokens={token_level} complete: {accuracy:.4f} ({correct}/{total})")
 
     return all_results
 
