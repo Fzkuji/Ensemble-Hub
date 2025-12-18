@@ -31,6 +31,7 @@ import os
 import sys
 import multiprocessing as mp
 from typing import List, Dict, Any, Optional, Tuple
+import time
 from tqdm import tqdm
 
 # Add scripts directory to path for imports
@@ -426,64 +427,76 @@ def collect_data_for_token_level(
     return results
 
 
-def worker_process_single_level(
+def worker_process_all_tasks(
     rank: int,
     world_size: int,
     gpu_id: int,
     model_name: str,
     max_model_len: int,
     batch_size: int,
-    data: List[Dict[str, Any]],
-    token_level: int,
-    output_dir: str,
+    all_tasks: List[Tuple[str, str, List[Dict[str, Any]]]],  # [(subset, output_dir, data), ...]
+    token_levels: List[int],
     use_think: bool = True,
 ):
-    """Worker process for parallel data collection (single token level).
+    """Worker process that processes ALL subsets and token levels with ONE model init.
 
-    Each worker loads its own vLLM model and processes a shard of the data
-    for ONE token level only. This avoids vLLM state accumulation issues.
-    Uses file-based signaling instead of Queue for reliability.
+    Args:
+        rank: Worker rank
+        world_size: Total number of workers
+        gpu_id: GPU ID to use
+        model_name: Model name
+        max_model_len: Max model context length
+        batch_size: Batch size
+        all_tasks: List of (subset_name, output_dir, data) tuples
+        token_levels: List of token levels to collect
+        use_think: Whether to use think prompt
     """
-    # Shard data for this worker
-    shard_data = [d for i, d in enumerate(data) if i % world_size == rank]
+    logger.info(f"[Worker {rank}] GPU {gpu_id}: Initializing model (one time for all tasks)...")
 
-    done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
-
-    if not shard_data:
-        # Mark as done with empty result
-        with open(done_file, 'w') as f:
-            f.write("empty")
-        return
-
-    logger.info(f"[Worker {rank}] GPU {gpu_id}: Processing {len(shard_data)} samples for tokens={token_level} (use_think={use_think})")
-
-    # Initialize model on this GPU
+    # Initialize model ONCE
     model = VLLMInference(
         model_name=model_name,
         gpu_id=gpu_id,
         max_model_len=max_model_len,
     )
 
-    # Collect data for this token level only
-    logger.info(f"[Worker {rank}] Collecting tokens={token_level}...")
-    results = collect_data_for_token_level(model, shard_data, token_level, batch_size, use_think=use_think)
+    logger.info(f"[Worker {rank}] Model loaded, processing {len(all_tasks)} subsets × {len(token_levels)} token levels")
 
-    correct = sum(1 for r in results if r['is_correct'])
-    accuracy = correct / len(results) if results else 0
-    logger.info(f"[Worker {rank}] tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
+    # Process all tasks
+    for subset_name, output_dir, data in all_tasks:
+        # Shard data for this worker
+        shard_data = [d for i, d in enumerate(data) if i % world_size == rank]
 
-    # Save to temp file immediately
-    temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
-    with open(temp_file, 'w', encoding='utf-8') as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-    logger.info(f"[Worker {rank}] Saved {len(results)} results to {temp_file}")
+        if not shard_data:
+            # Mark all token levels as done for this subset
+            for token_level in token_levels:
+                done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
+                with open(done_file, 'w') as f:
+                    f.write("empty")
+            continue
 
-    # Write done file as signal (more reliable than Queue)
-    with open(done_file, 'w') as f:
-        f.write("done")
-    logger.info(f"[Worker {rank}] Done with tokens={token_level}")
+        logger.info(f"[Worker {rank}] Processing subset {subset_name}: {len(shard_data)} samples")
 
-    # Force exit to avoid vLLM background threads keeping the process alive
+        for token_level in token_levels:
+            logger.info(f"[Worker {rank}] {subset_name} tokens={token_level}...")
+            results = collect_data_for_token_level(model, shard_data, token_level, batch_size, use_think=use_think)
+
+            correct = sum(1 for r in results if r['is_correct'])
+            accuracy = correct / len(results) if results else 0
+            logger.info(f"[Worker {rank}] {subset_name} tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
+
+            # Save to temp file
+            os.makedirs(output_dir, exist_ok=True)
+            temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+
+            # Write done file
+            done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
+            with open(done_file, 'w') as f:
+                f.write("done")
+
+    logger.info(f"[Worker {rank}] All tasks completed")
     os._exit(0)
 
 
@@ -497,119 +510,142 @@ def collect_parallel(
     output_dir: str,
     use_think: bool = True,
 ) -> Dict[int, List[Dict[str, Any]]]:
-    """Collect data in parallel across multiple GPUs.
+    """Collect data for a single dataset in parallel.
 
-    Each token level is processed with fresh worker processes to avoid
-    vLLM state accumulation issues that cause hangs.
-    Uses file-based signaling for reliability.
+    This is a wrapper that uses collect_all_parallel for a single task.
+    """
+    all_tasks = [("single", output_dir, data)]
+    results = collect_all_parallel(
+        model_name=model_name,
+        max_model_len=max_model_len,
+        batch_size=batch_size,
+        all_tasks=all_tasks,
+        token_levels=token_levels,
+        gpus=gpus,
+        use_think=use_think,
+    )
+    return results.get("single", {})
+
+
+def collect_all_parallel(
+    model_name: str,
+    max_model_len: int,
+    batch_size: int,
+    all_tasks: List[Tuple[str, str, List[Dict[str, Any]]]],
+    token_levels: List[int],
+    gpus: List[int],
+    use_think: bool = True,
+) -> Dict[str, Dict[int, List[Dict[str, Any]]]]:
+    """Collect data for ALL subsets in parallel with ONE model init per GPU.
 
     Args:
         model_name: HuggingFace model name
         max_model_len: Maximum model context length
         batch_size: Batch size for inference
-        data: List of problems to process
+        all_tasks: List of (subset_name, output_dir, data) tuples
         token_levels: List of token levels to collect
         gpus: List of GPU IDs to use
-        output_dir: Output directory for temp files
         use_think: Whether to use structured thinking prompt
 
     Returns:
-        Dictionary mapping token_level -> list of results
+        Dictionary mapping subset_name -> {token_level -> list of results}
     """
-    import time
-
     world_size = len(gpus)
-    logger.info(f"Starting parallel collection with {world_size} workers on GPUs {gpus} (use_think={use_think})")
+    total_subsets = len(all_tasks)
+    total_token_levels = len(token_levels)
 
-    # Set spawn method once at the beginning
+    logger.info(f"Starting parallel collection: {world_size} GPUs, {total_subsets} subsets, {total_token_levels} token levels")
+    logger.info(f"Model will be initialized ONCE per GPU (not {total_subsets * total_token_levels} times)")
+
+    # Set spawn method
     try:
         mp.set_start_method('spawn', force=True)
     except RuntimeError:
-        pass  # Already set
+        pass
 
-    # Create output dir
-    os.makedirs(output_dir, exist_ok=True)
-
-    all_results = {}
-
-    # Process each token level with fresh workers
-    for token_level in token_levels:
-        logger.info(f"\n{'='*40}")
-        logger.info(f"Starting collection for tokens={token_level}")
-        logger.info(f"{'='*40}")
-
-        # Clean up any old done files
-        for rank in range(world_size):
-            done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
-            if os.path.exists(done_file):
-                os.remove(done_file)
-
-        # Start workers for this token level
-        processes = []
-        for rank, gpu_id in enumerate(gpus):
-            p = mp.Process(
-                target=worker_process_single_level,
-                args=(rank, world_size, gpu_id, model_name, max_model_len, batch_size, data, token_level, output_dir, use_think)
-            )
-            p.start()
-            processes.append(p)
-
-        # Wait for all workers to signal done via file
-        max_wait_time = 3600  # 1 hour max
-        check_interval = 10  # Check every 10 seconds
-        elapsed = 0
-
-        while elapsed < max_wait_time:
-            # Count done files
-            done_count = 0
+    # Clean up old done files for all tasks
+    for subset_name, output_dir, _ in all_tasks:
+        os.makedirs(output_dir, exist_ok=True)
+        for token_level in token_levels:
             for rank in range(world_size):
                 done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
                 if os.path.exists(done_file):
-                    done_count += 1
+                    os.remove(done_file)
 
-            if done_count >= world_size:
-                logger.info(f"All {world_size} workers completed tokens={token_level}")
-                break
+    # Start workers - each will process ALL tasks
+    processes = []
+    for rank, gpu_id in enumerate(gpus):
+        p = mp.Process(
+            target=worker_process_all_tasks,
+            args=(rank, world_size, gpu_id, model_name, max_model_len, batch_size, all_tasks, token_levels, use_think)
+        )
+        p.start()
+        processes.append(p)
 
-            # Check if workers are still alive
-            alive = sum(1 for p in processes if p.is_alive())
-            if alive == 0 and done_count < world_size:
-                logger.warning(f"All workers exited, got {done_count}/{world_size} completions for tokens={token_level}")
-                break
+    # Wait for all workers to complete all tasks
+    total_done_files = total_subsets * total_token_levels * world_size
+    max_wait_time = 7200  # 2 hours max for all tasks
+    check_interval = 30
+    elapsed = 0
 
-            logger.info(f"Waiting for workers... {done_count}/{world_size} done, {alive} alive")
-            time.sleep(check_interval)
-            elapsed += check_interval
+    while elapsed < max_wait_time:
+        done_count = 0
+        for subset_name, output_dir, _ in all_tasks:
+            for token_level in token_levels:
+                for rank in range(world_size):
+                    done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
+                    if os.path.exists(done_file):
+                        done_count += 1
 
-        # Wait for all workers to finish
-        for p in processes:
-            p.join(timeout=30)
-            if p.is_alive():
-                logger.warning(f"Terminating stuck worker...")
-                p.terminate()
-                p.join(timeout=5)
+        if done_count >= total_done_files:
+            logger.info(f"All workers completed all tasks ({done_count}/{total_done_files})")
+            break
 
-        # Merge results for this token level
-        all_results[token_level] = []
-        for rank in range(world_size):
-            temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
-            if os.path.exists(temp_file):
-                with open(temp_file, 'r', encoding='utf-8') as f:
-                    results = json.load(f)
-                all_results[token_level].extend(results)
-                os.remove(temp_file)  # Clean up temp file
-                logger.info(f"Merged {len(results)} results from {temp_file}")
+        alive = sum(1 for p in processes if p.is_alive())
+        if alive == 0 and done_count < total_done_files:
+            logger.warning(f"All workers exited early, got {done_count}/{total_done_files} completions")
+            break
 
-            # Clean up done file
-            done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
-            if os.path.exists(done_file):
-                os.remove(done_file)
+        logger.info(f"Progress: {done_count}/{total_done_files} tasks done, {alive}/{world_size} workers alive")
+        time.sleep(check_interval)
+        elapsed += check_interval
 
-        # Summary for this token level
-        total = len(all_results[token_level])
-        correct = sum(1 for r in all_results[token_level] if r['is_correct'])
-        accuracy = correct / total if total > 0 else 0
-        logger.info(f"tokens={token_level} complete: {accuracy:.4f} ({correct}/{total})")
+    # Wait for workers to finish
+    for p in processes:
+        p.join(timeout=60)
+        if p.is_alive():
+            logger.warning("Terminating stuck worker...")
+            p.terminate()
+            p.join(timeout=5)
+
+    # Merge results
+    all_results = {}
+    for subset_name, output_dir, _ in all_tasks:
+        all_results[subset_name] = {}
+        for token_level in token_levels:
+            all_results[subset_name][token_level] = []
+            for rank in range(world_size):
+                temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
+                if os.path.exists(temp_file):
+                    with open(temp_file, 'r', encoding='utf-8') as f:
+                        results = json.load(f)
+                    all_results[subset_name][token_level].extend(results)
+                    os.remove(temp_file)
+
+                done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
+                if os.path.exists(done_file):
+                    os.remove(done_file)
+
+            # Save merged results
+            total = len(all_results[subset_name][token_level])
+            if total > 0:
+                correct = sum(1 for r in all_results[subset_name][token_level] if r['is_correct'])
+                accuracy = correct / total
+                logger.info(f"{subset_name} tokens={token_level}: {accuracy:.4f} ({correct}/{total})")
+
+                output_file = os.path.join(output_dir, f"tokens{token_level}.json")
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(all_results[subset_name][token_level], f, indent=2, ensure_ascii=False)
 
     return all_results
 
@@ -755,14 +791,39 @@ def main():
         # hendrycks_math by subset
         subsets = [args.subset] if args.subset else MATH_SUBSETS
 
-        for subset in subsets:
+        if args.parallel and len(subsets) > 1:
+            # Parallel mode: load all subsets and process together (ONE model init per GPU)
             logger.info(f"\n{'='*60}")
-            logger.info(f"Processing subset: {subset}")
+            logger.info(f"Loading all {len(subsets)} subsets for parallel processing...")
             logger.info(f"{'='*60}")
 
-            data = load_hendrycks_math_subset(subset, args.split)
-            output_subdir = os.path.join(args.output_dir, subset, args.split)
-            collect_and_save(data, output_subdir)
+            all_tasks = []
+            for subset in subsets:
+                data = load_hendrycks_math_subset(subset, args.split)
+                output_subdir = os.path.join(args.output_dir, subset, args.split)
+                all_tasks.append((subset, output_subdir, data))
+
+            logger.info(f"Total samples across all subsets: {sum(len(t[2]) for t in all_tasks)}")
+
+            collect_all_parallel(
+                model_name=args.model,
+                max_model_len=args.max_model_len,
+                batch_size=args.batch_size,
+                all_tasks=all_tasks,
+                token_levels=token_levels,
+                gpus=gpus,
+                use_think=use_think,
+            )
+        else:
+            # Sequential mode or single subset
+            for subset in subsets:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Processing subset: {subset}")
+                logger.info(f"{'='*60}")
+
+                data = load_hendrycks_math_subset(subset, args.split)
+                output_subdir = os.path.join(args.output_dir, subset, args.split)
+                collect_and_save(data, output_subdir)
 
     logger.info("\nData collection complete!")
 
