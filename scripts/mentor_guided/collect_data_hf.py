@@ -2,13 +2,15 @@
 """
 Collect Progressive Data with HuggingFace Transformers (No vLLM)
 
-This script uses pure HuggingFace transformers for inference,
-which may give different results than vLLM due to different
-sampling implementations.
+Supports multi-GPU parallel inference where each GPU loads a separate model
+and processes a shard of the data.
 
 Usage:
+    # Single GPU
     python collect_data_hf.py --split test --gpu 0
-    python collect_data_hf.py --split train --gpu 0 --no-think
+
+    # Multi-GPU parallel
+    python collect_data_hf.py --split test --parallel --gpus 0,1,2,3,4,5,6,7
 """
 
 import argparse
@@ -16,8 +18,10 @@ import json
 import logging
 import os
 import sys
-from typing import List, Dict, Any, Optional
+import multiprocessing as mp
+from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
+import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -132,6 +136,8 @@ class HFInference:
         torch_dtype: str = "bfloat16",
     ):
         self.device = device
+        self.model_name = model_name
+
         logger.info(f"Loading tokenizer: {model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
@@ -187,82 +193,71 @@ class HFInference:
     @torch.no_grad()
     def generate(
         self,
-        prompts: List[str],
+        prompt: str,
         max_new_tokens: int = 4096,
         temperature: float = 0.7,
         top_p: float = 0.95,
         do_sample: bool = True,
-    ) -> List[str]:
-        """Generate responses for prompts."""
-        responses = []
+    ) -> str:
+        """Generate response for a single prompt."""
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=8192,
+        ).to(self.device)
 
-        for prompt in prompts:
-            inputs = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=8192,
-            ).to(self.device)
+        input_len = inputs['input_ids'].shape[1]
 
-            input_len = inputs['input_ids'].shape[1]
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
 
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=do_sample,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-
-            # Decode only the new tokens
-            response = self.tokenizer.decode(
-                outputs[0][input_len:],
-                skip_special_tokens=True,
-            )
-            responses.append(response)
-
-        return responses
+        response = self.tokenizer.decode(
+            outputs[0][input_len:],
+            skip_special_tokens=True,
+        )
+        return response
 
     @torch.no_grad()
     def generate_mentor_tokens(
         self,
-        prompts: List[str],
+        prompt: str,
         max_tokens: int = 100,
         temperature: float = 0.7,
         top_p: float = 0.95,
-    ) -> List[str]:
+    ) -> str:
         """Generate exactly max_tokens from mentor."""
-        hints = []
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=8192,
+        ).to(self.device)
 
-        for prompt in prompts:
-            inputs = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=8192,
-            ).to(self.device)
+        input_len = inputs['input_ids'].shape[1]
 
-            input_len = inputs['input_ids'].shape[1]
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=True,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
 
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-
-            hint = self.tokenizer.decode(
-                outputs[0][input_len:],
-                skip_special_tokens=True,
-            )
-            hints.append(hint)
-
-        return hints
+        hint = self.tokenizer.decode(
+            outputs[0][input_len:],
+            skip_special_tokens=True,
+        )
+        return hint
 
 
 def collect_data_for_token_level(
@@ -270,24 +265,27 @@ def collect_data_for_token_level(
     data: List[Dict[str, Any]],
     token_level: int,
     use_think: bool = True,
+    show_progress: bool = True,
 ) -> List[Dict[str, Any]]:
     """Collect data for a specific token level."""
     results = []
 
-    for item in tqdm(data, desc=f"tokens={token_level}"):
+    iterator = tqdm(data, desc=f"tokens={token_level}") if show_progress else data
+
+    for item in iterator:
         if token_level == 0:
             # No mentor hint - direct generation
             prompt = model.build_chat_prompt(item['question'], use_think=use_think)
-            response = model.generate([prompt])[0]
+            response = model.generate(prompt)
             hint = ""
         else:
             # First generate mentor hint
             mentor_prompt = model.build_chat_prompt(item['question'], use_think=use_think)
-            hint = model.generate_mentor_tokens([mentor_prompt], max_tokens=token_level)[0]
+            hint = model.generate_mentor_tokens(mentor_prompt, max_tokens=token_level)
 
             # Then generate with hint
             prompt_with_hint = model.build_chat_prompt(item['question'], hint=hint, use_think=use_think)
-            response = model.generate([prompt_with_hint])[0]
+            response = model.generate(prompt_with_hint)
 
         full_response = hint + response if hint else response
         is_correct = check_math_correctness(full_response, item['ground_truth'])
@@ -306,6 +304,158 @@ def collect_data_for_token_level(
     return results
 
 
+def merge_rank_files(output_dir: str, token_level: int, world_size: int) -> Tuple[int, int, float]:
+    """Merge all rank files for a single token level."""
+    merged = []
+    for rank in range(world_size):
+        temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
+        if os.path.exists(temp_file):
+            with open(temp_file, 'r', encoding='utf-8') as f:
+                results = json.load(f)
+            merged.extend(results)
+            os.remove(temp_file)
+            print(f"  [MERGE] Loaded {len(results)} samples from rank {rank}", flush=True)
+
+    if merged:
+        correct = sum(1 for r in merged if r['is_correct'])
+        accuracy = correct / len(merged)
+
+        output_file = os.path.join(output_dir, f"tokens{token_level}.json")
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(merged, f, indent=2, ensure_ascii=False)
+
+        return len(merged), correct, accuracy
+    return 0, 0, 0.0
+
+
+def worker_process(
+    rank: int,
+    world_size: int,
+    gpu_id: int,
+    model_name: str,
+    all_tasks: List[Tuple[str, str, List[Dict[str, Any]]]],
+    token_levels: List[int],
+    use_think: bool = True,
+):
+    """Worker process that processes data shard on a single GPU."""
+    device = f"cuda:{gpu_id}"
+    logger.info(f"[Worker {rank}] GPU {gpu_id}: Initializing model...")
+
+    # Initialize model
+    model = HFInference(
+        model_name=model_name,
+        device=device,
+    )
+
+    logger.info(f"[Worker {rank}] Model loaded, processing {len(all_tasks)} subsets × {len(token_levels)} token levels")
+
+    # Process all tasks
+    for subset_name, output_dir, data in all_tasks:
+        # Shard data for this worker
+        shard_data = [d for i, d in enumerate(data) if i % world_size == rank]
+
+        if not shard_data:
+            logger.info(f"[Worker {rank}] No data for subset {subset_name}, skipping")
+            continue
+
+        logger.info(f"[Worker {rank}] Processing subset {subset_name}: {len(shard_data)} samples")
+
+        for token_level in token_levels:
+            logger.info(f"[Worker {rank}] {subset_name} tokens={token_level}...")
+            results = collect_data_for_token_level(
+                model, shard_data, token_level, use_think=use_think, show_progress=False
+            )
+
+            correct = sum(1 for r in results if r['is_correct'])
+            accuracy = correct / len(results) if results else 0
+            logger.info(f"[Worker {rank}] {subset_name} tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
+
+            # Save to temp file
+            os.makedirs(output_dir, exist_ok=True)
+            temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            logger.info(f"[Worker {rank}] Saved: {temp_file}")
+
+            # Check if all ranks finished - if so, merge
+            all_exist = all(
+                os.path.exists(os.path.join(output_dir, f"tokens{token_level}_rank{r}.json"))
+                for r in range(world_size)
+            )
+            if all_exist:
+                lock_file = os.path.join(output_dir, f".lock_tokens{token_level}")
+                merged_file = os.path.join(output_dir, f"tokens{token_level}.json")
+                try:
+                    fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.close(fd)
+                    if not os.path.exists(merged_file):
+                        total, correct_cnt, acc = merge_rank_files(output_dir, token_level, world_size)
+                        print(f"[MERGED] {subset_name} tokens={token_level}: {total} samples, acc={acc:.4f}", flush=True)
+                    os.remove(lock_file)
+                except FileExistsError:
+                    pass
+
+    logger.info(f"[Worker {rank}] All tasks completed")
+    os._exit(0)
+
+
+def collect_all_parallel(
+    model_name: str,
+    all_tasks: List[Tuple[str, str, List[Dict[str, Any]]]],
+    token_levels: List[int],
+    gpus: List[int],
+    use_think: bool = True,
+):
+    """Collect data in parallel across multiple GPUs."""
+    world_size = len(gpus)
+
+    print(f"\n{'='*60}", flush=True)
+    print(f"[MAIN] Starting parallel collection (HuggingFace)", flush=True)
+    print(f"[MAIN] GPUs: {gpus} ({world_size} workers)", flush=True)
+    print(f"[MAIN] Subsets: {len(all_tasks)}", flush=True)
+    print(f"[MAIN] Token levels: {token_levels}", flush=True)
+    print(f"{'='*60}\n", flush=True)
+
+    # Set spawn method
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
+    # Clean up old files
+    for subset_name, output_dir, _ in all_tasks:
+        os.makedirs(output_dir, exist_ok=True)
+        for token_level in token_levels:
+            for rank in range(world_size):
+                temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            lock_file = os.path.join(output_dir, f".lock_tokens{token_level}")
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+
+    # Start all workers
+    processes = []
+    for rank, gpu_id in enumerate(gpus):
+        p = mp.Process(
+            target=worker_process,
+            args=(rank, world_size, gpu_id, model_name, all_tasks, token_levels, use_think)
+        )
+        p.start()
+        processes.append(p)
+        print(f"[MAIN] Started worker {rank} on GPU {gpu_id} (PID: {p.pid})", flush=True)
+
+    print(f"\n[MAIN] All {world_size} workers started. Waiting...\n", flush=True)
+
+    # Wait for all workers
+    for p in processes:
+        p.join()
+
+    print(f"\n{'='*60}", flush=True)
+    print(f"[MAIN] All workers finished.", flush=True)
+    print(f"{'='*60}\n", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Collect data with HuggingFace Transformers")
     parser.add_argument("--model", type=str,
@@ -320,7 +470,7 @@ def main():
                         choices=["train", "test"],
                         help="Split")
     parser.add_argument("--gpu", type=int, default=0,
-                        help="GPU ID")
+                        help="GPU ID (single GPU mode)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory")
     parser.add_argument("--token-levels", type=str, default="0,100,500,1000",
@@ -329,12 +479,17 @@ def main():
                         help="Disable thinking mode")
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Max samples per subset (for testing)")
+    # Parallel mode
+    parser.add_argument("--parallel", action="store_true",
+                        help="Enable parallel data collection with multiple GPUs")
+    parser.add_argument("--gpus", type=str, default="0,1,2,3,4,5,6,7",
+                        help="Comma-separated list of GPUs for parallel mode")
 
     args = parser.parse_args()
 
     use_think = not args.no_think
     token_levels = [int(x) for x in args.token_levels.split(",")]
-    device = f"cuda:{args.gpu}"
+    gpus = [int(g.strip()) for g in args.gpus.split(",")]
 
     # Set output directory
     model_name = args.model.split('/')[-1]
@@ -359,49 +514,67 @@ def main():
 
     subsets = [args.subset] if args.subset else MATH_SUBSETS
 
-    # Load model
-    model = HFInference(
-        model_name=args.model,
-        device=device,
-    )
+    if args.parallel:
+        # Parallel mode: load all data and process together
+        logger.info(f"Parallel mode with {len(gpus)} GPUs: {gpus}")
 
-    # Process each subset
-    for subset in subsets:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Processing subset: {subset}")
-        logger.info(f"{'='*60}")
+        all_tasks = []
+        for subset in subsets:
+            data = load_hendrycks_math_subset(subset, args.split)
+            if args.max_samples:
+                data = data[:args.max_samples]
+            output_subdir = os.path.join(args.output_dir, subset, args.split)
+            all_tasks.append((subset, output_subdir, data))
+            logger.info(f"Loaded {subset}: {len(data)} samples")
 
-        # Load data
-        data = load_hendrycks_math_subset(subset, args.split)
-        if args.max_samples:
-            data = data[:args.max_samples]
-        logger.info(f"Loaded {len(data)} samples")
+        collect_all_parallel(
+            model_name=args.model,
+            all_tasks=all_tasks,
+            token_levels=token_levels,
+            gpus=gpus,
+            use_think=use_think,
+        )
 
-        # Output directory for this subset
-        output_subdir = os.path.join(args.output_dir, subset, args.split)
-        os.makedirs(output_subdir, exist_ok=True)
+    else:
+        # Single GPU mode
+        device = f"cuda:{args.gpu}"
+        logger.info(f"Single GPU mode on {device}")
 
-        # Collect for each token level
-        for token_level in token_levels:
-            output_file = os.path.join(output_subdir, f"tokens{token_level}.json")
+        model = HFInference(
+            model_name=args.model,
+            device=device,
+        )
 
-            # Skip if already exists
-            if os.path.exists(output_file):
-                logger.info(f"Skipping tokens={token_level} (already exists)")
-                continue
+        for subset in subsets:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Processing subset: {subset}")
+            logger.info(f"{'='*60}")
 
-            logger.info(f"\nCollecting tokens={token_level}...")
-            results = collect_data_for_token_level(model, data, token_level, use_think=use_think)
+            data = load_hendrycks_math_subset(subset, args.split)
+            if args.max_samples:
+                data = data[:args.max_samples]
+            logger.info(f"Loaded {len(data)} samples")
 
-            # Compute accuracy
-            correct = sum(1 for r in results if r['is_correct'])
-            accuracy = correct / len(results) if results else 0
-            logger.info(f"tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
+            output_subdir = os.path.join(args.output_dir, subset, args.split)
+            os.makedirs(output_subdir, exist_ok=True)
 
-            # Save results
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(results, f, indent=2, ensure_ascii=False)
-            logger.info(f"Saved to {output_file}")
+            for token_level in token_levels:
+                output_file = os.path.join(output_subdir, f"tokens{token_level}.json")
+
+                if os.path.exists(output_file):
+                    logger.info(f"Skipping tokens={token_level} (already exists)")
+                    continue
+
+                logger.info(f"\nCollecting tokens={token_level}...")
+                results = collect_data_for_token_level(model, data, token_level, use_think=use_think)
+
+                correct = sum(1 for r in results if r['is_correct'])
+                accuracy = correct / len(results) if results else 0
+                logger.info(f"tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
+
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(results, f, indent=2, ensure_ascii=False)
+                logger.info(f"Saved to {output_file}")
 
     logger.info("\nData collection complete!")
 
