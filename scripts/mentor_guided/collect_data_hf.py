@@ -38,50 +38,8 @@ logger = logging.getLogger(__name__)
 # Token levels to collect
 TOKEN_LEVELS = [0, 100, 500, 1000]
 
-# System prompts
-THINKING_SYSTEM_PROMPT = """You are a mathematical reasoning expert. When solving problems, structure your thinking using the following framework:
-
-<think>
-**Goal (I₁)**: Define the ultimate objective or question to be solved. Clarify what you aim to achieve.
-
-**Planning (I₂)**: Outline the high-level reasoning strategy. Decompose subproblems and select solution paths.
-
-**Retrieval (I₃)**: Recall relevant knowledge, facts, formulas, or contextual information necessary for solving.
-
-**Action (I₄)**: Execute concrete reasoning steps, calculations, or logical operations leading to the answer.
-</think>
-
-After your reasoning, provide the final answer in \\boxed{}.
-"""
-
-THINKING_SYSTEM_PROMPT_WITH_HINT = """You are a mathematical reasoning expert. When solving problems, structure your thinking using the following framework:
-
-<think>
-**Goal (I₁)**: Define the ultimate objective or question to be solved. Clarify what you aim to achieve.
-
-**Planning (I₂)**: Outline the high-level reasoning strategy. Decompose subproblems and select solution paths.
-
-**Retrieval (I₃)**: Recall relevant knowledge, facts, formulas, or contextual information necessary for solving.
-
-**Action (I₄)**: Execute concrete reasoning steps, calculations, or logical operations leading to the answer.
-</think>
-
-You are also provided with a hint from a mentor model. Use the hint to guide your reasoning, but still follow the structured thinking framework above.
-
-After your reasoning, provide the final answer in \\boxed{}.
-"""
-
-STANDARD_SYSTEM_PROMPT = """You are a mathematical reasoning expert. Solve the problem step by step, showing your work clearly.
-
-After your reasoning, provide the final answer in \\boxed{}.
-"""
-
-STANDARD_SYSTEM_PROMPT_WITH_HINT = """You are a mathematical reasoning expert. Solve the problem step by step, showing your work clearly.
-
-You are also provided with a hint from a mentor model. Use the hint to guide your reasoning.
-
-After your reasoning, provide the final answer in \\boxed{}.
-"""
+# Simple system prompt (no complex framework - ACT-E uses simple prompts)
+SYSTEM_PROMPT = """Please reason step by step, and put your final answer within \\boxed{}."""
 
 
 def extract_boxed_answer(text: str) -> str:
@@ -168,26 +126,16 @@ class HFInference:
     def build_chat_prompt(
         self,
         question: str,
-        hint: Optional[str] = None,
         use_think: bool = True,
     ) -> str:
-        """Build chat prompt with template."""
-        if hint:
-            if use_think:
-                system_prompt = THINKING_SYSTEM_PROMPT_WITH_HINT
-            else:
-                system_prompt = STANDARD_SYSTEM_PROMPT_WITH_HINT
-            user_content = f"Problem: {question}\n\nHint from mentor:\n{hint}"
-        else:
-            if use_think:
-                system_prompt = THINKING_SYSTEM_PROMPT
-            else:
-                system_prompt = STANDARD_SYSTEM_PROMPT
-            user_content = f"Problem: {question}"
+        """Build simple chat prompt.
 
+        ACT-E uses simple prompts without complex frameworks.
+        For DeepSeek R1 no-think mode, we pre-fill empty think block.
+        """
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
         ]
 
         prompt = self.tokenizer.apply_chat_template(
@@ -279,34 +227,42 @@ def collect_data_for_token_level(
     use_think: bool = True,
     show_progress: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Collect data for a specific token level."""
+    """Collect data for a specific token level.
+
+    ACT-E approach:
+    - token_level=0: Intern generates from scratch
+    - token_level>0: Mentor generates first N tokens, then Intern CONTINUES from there
+    """
     results = []
 
     iterator = tqdm(data, desc=f"tokens={token_level}") if show_progress else data
 
     for item in iterator:
+        prompt = model.build_chat_prompt(item['question'], use_think=use_think)
+
         if token_level == 0:
-            # No mentor hint - direct generation
-            prompt = model.build_chat_prompt(item['question'], use_think=use_think)
+            # No mentor - intern generates from scratch
             response = model.generate(prompt)
-            hint = ""
+            mentor_output = ""
         else:
-            # First generate mentor hint
-            mentor_prompt = model.build_chat_prompt(item['question'], use_think=use_think)
-            hint = model.generate_mentor_tokens(mentor_prompt, max_tokens=token_level)
+            # Mentor generates first N tokens
+            mentor_output = model.generate_mentor_tokens(prompt, max_tokens=token_level)
 
-            # Then generate with hint
-            prompt_with_hint = model.build_chat_prompt(item['question'], hint=hint, use_think=use_think)
-            response = model.generate(prompt_with_hint)
+            # Intern CONTINUES from mentor's output (not starting over)
+            # Concatenate prompt + mentor_output, then continue generating
+            continued_prompt = prompt + mentor_output
+            intern_continuation = model.generate(continued_prompt)
 
-        full_response = hint + response if hint else response
-        is_correct = check_math_correctness(full_response, item['ground_truth'])
+            # Full response = mentor_output + intern_continuation
+            response = mentor_output + intern_continuation
+
+        is_correct = check_math_correctness(response, item['ground_truth'])
 
         results.append({
             'question': item['question'],
             'ground_truth': item['ground_truth'],
             'mentor_tokens': token_level,
-            'mentor_response': hint,
+            'mentor_response': mentor_output,
             'response': response,
             'is_correct': is_correct,
             'subset': item.get('subset', ''),
