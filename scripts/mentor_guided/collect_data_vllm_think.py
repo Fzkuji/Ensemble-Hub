@@ -44,8 +44,9 @@ from grader import grade_answer
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Token levels to collect (0 = no mentor, just intern)
+# Token levels to collect (0 = no mentor, just intern; -1 = mentor only, no intern)
 TOKEN_LEVELS = [0, 100, 500, 1000]
+MENTOR_ONLY_LEVEL = -1  # Special level for mentor-only baseline
 
 # Simple system prompt (ACT-E uses simple prompts)
 SYSTEM_PROMPT = """Please reason step by step, and put your final answer within \\boxed{}."""
@@ -313,13 +314,14 @@ def collect_data_for_token_level(
     """Collect data for a specific token level.
 
     ACT-E approach:
+    - token_level=-1: Mentor generates full answer (mentor only baseline)
     - token_level=0: Intern generates from scratch
     - token_level>0: Mentor generates first N tokens, then Intern CONTINUES from there
 
     Args:
         model: VLLMInference instance
         data: List of problems
-        token_level: 0 for intern only, >0 for mentor tokens
+        token_level: -1 for mentor only, 0 for intern only, >0 for mentor tokens
         batch_size: Batch size for inference
         use_think: Whether to use think mode
 
@@ -330,10 +332,31 @@ def collect_data_for_token_level(
     total_batches = (len(data) + batch_size - 1) // batch_size
 
     # Process in batches
-    for batch_start in tqdm(range(0, len(data), batch_size), desc=f"tokens={token_level}", total=total_batches, unit="batch", ncols=80):
+    level_desc = "mentor_only" if token_level == MENTOR_ONLY_LEVEL else f"tokens={token_level}"
+    for batch_start in tqdm(range(0, len(data), batch_size), desc=level_desc, total=total_batches, unit="batch", ncols=80):
         batch = data[batch_start:batch_start + batch_size]
 
-        if token_level == 0:
+        if token_level == MENTOR_ONLY_LEVEL:
+            # Mentor only - mentor generates full answer, no intern
+            prompts = [model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
+            responses = model.generate(prompts)
+
+            for item, response in zip(batch, responses):
+                is_correct = check_math_correctness(response, item['ground_truth'])
+                mentor_length = len(model.tokenizer.encode(response)) if response else 0
+                results.append({
+                    'question': item['question'],
+                    'ground_truth': item['ground_truth'],
+                    'mentor_tokens': -1,  # indicates mentor only
+                    'mentor_response': response,
+                    'response': response,
+                    'is_correct': is_correct,
+                    'mentor_length': mentor_length,
+                    'intern_length': 0,  # no intern
+                    'subset': item.get('subset', ''),
+                    'level': item.get('level', ''),
+                })
+        elif token_level == 0:
             # No mentor - intern generates from scratch
             prompts = [model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
             responses = model.generate(prompts)

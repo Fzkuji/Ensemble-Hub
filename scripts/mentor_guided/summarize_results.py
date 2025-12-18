@@ -22,7 +22,9 @@ SUBSETS = [
     "precalculus",
 ]
 
+# Token levels: -1 = mentor only, 0 = intern only, others = mentor hint + intern
 TOKEN_LEVELS = [0, 100, 500, 1000]
+MENTOR_ONLY_LEVEL = -1
 
 # 列宽定义
 W_SUBSET = 25
@@ -34,6 +36,38 @@ W_ORACLE = 8
 W_CASCADE = 8
 W_GAP = 8
 LINE_WIDTH = W_SUBSET + W_N + W_TOKEN_GROUP * 4 + W_ORACLE + W_CASCADE + W_GAP + 10  # 约180
+
+
+def compute_mentor_only_stats(data_dir: str, subset: str, split: str = "test"):
+    """计算 mentor only 的准确率和长度统计"""
+    data_file = os.path.join(data_dir, subset, split, "tokens-1.json")
+    if not os.path.exists(data_file):
+        return None
+
+    with open(data_file, 'r') as f:
+        data = json.load(f)
+
+    if not data:
+        return None
+
+    correct = sum(1 for item in data if item.get('is_correct', False))
+    accuracy = correct / len(data) if data else 0
+
+    # 统计长度
+    mentor_lengths = []
+    for item in data:
+        if 'mentor_length' in item:
+            mentor_lengths.append(item['mentor_length'])
+        elif 'mentor_response' in item and item['mentor_response']:
+            mentor_lengths.append(len(item['mentor_response']) // 4)
+
+    return {
+        'accuracy': accuracy,
+        'n_samples': len(data),
+        'n_correct': correct,
+        'mentor_length_mean': np.mean(mentor_lengths) if mentor_lengths else 0,
+        'mentor_length_std': np.std(mentor_lengths) if mentor_lengths else 0,
+    }
 
 
 def compute_length_stats(data_dir: str, subset: str, split: str = "test"):
@@ -311,6 +345,45 @@ def summarize(data_dir: str, show_length: bool = True):
 
         print("\n  m = mentor (大模型), i = intern (小模型)")
 
+    # Mentor Only 结果
+    print("\n" + "=" * 70)
+    print("Mentor Only Results (baseline: mentor model without intern)")
+    print("=" * 70)
+    print(f"{'Subset':<{W_SUBSET}} {'N':<{W_N}} {'Acc':<10} {'Len (avg)':<12}")
+    print("-" * 70)
+
+    mentor_only_total_n = 0
+    mentor_only_total_correct = 0
+    mentor_only_total_len = 0
+    mentor_only_count = 0
+
+    for subset in SUBSETS:
+        mentor_stats = compute_mentor_only_stats(data_dir, subset)
+        if mentor_stats:
+            acc = mentor_stats['accuracy']
+            n = mentor_stats['n_samples']
+            m_len = mentor_stats['mentor_length_mean']
+            print(f"{subset:<{W_SUBSET}} {n:<{W_N}} {acc:<10.4f} {m_len:<12.1f}")
+            mentor_only_total_n += n
+            mentor_only_total_correct += mentor_stats['n_correct']
+            mentor_only_total_len += m_len * n
+            mentor_only_count += n
+        else:
+            print(f"{subset:<{W_SUBSET}} (no mentor-only data)")
+
+    if mentor_only_total_n > 0:
+        print("-" * 70)
+        avg_acc = mentor_only_total_correct / mentor_only_total_n
+        avg_len = mentor_only_total_len / mentor_only_count if mentor_only_count > 0 else 0
+        print(f"{'TOTAL (weighted)':<{W_SUBSET}} {mentor_only_total_n:<{W_N}} {avg_acc:<10.4f} {avg_len:<12.1f}")
+
+        # 比较 mentor only vs cascade
+        if total_n > 0:
+            print("\n" + "-" * 70)
+            avg_cascade = total_cascade / total_n
+            cascade_vs_mentor = avg_cascade - avg_acc
+            print(f"Cascade vs Mentor-Only: {cascade_vs_mentor:+.4f} ({cascade_vs_mentor*100:+.2f}%)")
+
     print()
 
 
@@ -398,6 +471,16 @@ def summarize_single(data_dir: str, subset: str, model_dir: str = None, show_len
         print("\nThresholds used:")
         for i, thresh in enumerate(r['thresholds']):
             print(f"  Stage {i} (T{TOKEN_LEVELS[i]} -> T{TOKEN_LEVELS[i+1]}): {thresh:.4f}")
+
+    # Mentor Only 结果
+    mentor_stats = compute_mentor_only_stats(data_dir, subset)
+    if mentor_stats:
+        print("\n" + "-" * 50)
+        print("Mentor Only Baseline:")
+        print(f"  Accuracy: {mentor_stats['accuracy']:.4f}")
+        print(f"  Avg Length: {mentor_stats['mentor_length_mean']:.1f} tokens")
+        cascade_vs_mentor = cascade - mentor_stats['accuracy']
+        print(f"  Cascade vs Mentor-Only: {cascade_vs_mentor:+.4f} ({cascade_vs_mentor*100:+.2f}%)")
 
 
 def main():

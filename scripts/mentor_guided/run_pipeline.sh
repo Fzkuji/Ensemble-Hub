@@ -62,6 +62,9 @@ fi
 DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_${MODE}_${MODEL_NAME}"
 SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
 
+# Token levels: -1 = mentor only, 0 = intern only, others = mentor hint + intern
+TOKEN_LEVELS="-1,0,100,500,1000"
+
 # Parse GPU count
 IFS=',' read -ra GPU_ARRAY <<< "$GPUS"
 NUM_GPUS=${#GPU_ARRAY[@]}
@@ -103,7 +106,7 @@ if [ "$TRAIN_EXISTS" = true ]; then
     echo "Train data already exists, skipping collection..."
 else
     echo "Collecting train data..."
-    python collect_data_vllm_think.py --split train --parallel --gpus $GPUS $THINK_FLAG
+    python collect_data_vllm_think.py --split train --parallel --gpus $GPUS --token-levels $TOKEN_LEVELS $THINK_FLAG
 fi
 
 # Check if test data already exists
@@ -119,7 +122,7 @@ if [ "$TEST_EXISTS" = true ]; then
     echo "Test data already exists, skipping collection..."
 else
     echo "Collecting test data..."
-    python collect_data_vllm_think.py --split test --parallel --gpus $GPUS $THINK_FLAG
+    python collect_data_vllm_think.py --split test --parallel --gpus $GPUS --token-levels $TOKEN_LEVELS $THINK_FLAG
 fi
 
 echo ""
