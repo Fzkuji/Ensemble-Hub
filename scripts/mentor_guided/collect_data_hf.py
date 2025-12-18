@@ -110,19 +110,31 @@ def check_math_correctness(response: str, ground_truth: str) -> bool:
 
 
 def load_hendrycks_math_subset(subset: str, split: str = "test") -> List[Dict[str, Any]]:
-    """Load hendrycks/competition_math subset."""
+    """Load a specific subset of MATH dataset.
+
+    Args:
+        subset: Subset name (e.g., "algebra", "geometry")
+        split: "train" or "test"
+
+    Returns:
+        List of problems
+    """
     from datasets import load_dataset
 
-    ds = load_dataset("hendrycks/competition_math", split=split, trust_remote_code=True)
+    logger.info(f"Loading {subset} {split}...")
+    dataset = load_dataset("EleutherAI/hendrycks_math", subset, split=split)
+
     data = []
-    for item in ds:
-        if item.get('type', '').lower().replace(' ', '_') == subset.lower().replace(' ', '_'):
-            data.append({
-                'question': item['problem'],
-                'ground_truth': item['solution'],
-                'subset': subset,
-                'level': item.get('level', ''),
-            })
+    for item in dataset:
+        data.append({
+            'question': item['problem'],
+            'ground_truth': item['solution'],
+            'type': item.get('type', subset),
+            'level': item.get('level', ''),
+            'subset': subset,
+        })
+
+    logger.info(f"  Loaded {len(data)} problems from {subset} {split}")
     return data
 
 
