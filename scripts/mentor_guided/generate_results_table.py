@@ -110,6 +110,8 @@ def load_subset_results(data_dir: str, subset: str, split: str = "test") -> Dict
         results['cascade'] = cascade_data.get('cascade_accuracy', cascade_data.get('best_accuracy'))
         results['thresholds'] = cascade_data.get('best_thresholds')
         results['auc'] = cascade_data.get('auc')
+        results['oracle_length'] = cascade_data.get('oracle_length', {})
+        results['cascade_length'] = cascade_data.get('cascade_length', {})
 
     return results
 
@@ -229,6 +231,48 @@ def print_table(all_results: List[Dict], totals: Dict, split: str):
 
     print(row)
     print("="*130)
+
+    # Print length statistics if available
+    has_length = any(r.get('cascade_length') for r in all_results)
+    if has_length:
+        print(f"\n{'='*90}")
+        print("LENGTH STATISTICS (tokens)")
+        print(f"{'='*90}")
+        print(f"{'Subset':<20} {'Oracle M':<12} {'Oracle I':<12} {'Cascade M':<12} {'Cascade I':<12}")
+        print("-"*90)
+
+        total_oracle_m, total_oracle_i = 0, 0
+        total_cascade_m, total_cascade_i = 0, 0
+        count = 0
+
+        for r in all_results:
+            oracle_len = r.get('oracle_length', {})
+            cascade_len = r.get('cascade_length', {})
+
+            if oracle_len or cascade_len:
+                o_m = oracle_len.get('mentor_mean', 0)
+                o_i = oracle_len.get('intern_mean', 0)
+                c_m = cascade_len.get('mentor_mean', 0)
+                c_i = cascade_len.get('intern_mean', 0)
+
+                row = f"{SUBSET_SHORT.get(r['subset'], r['subset']):<20} "
+                row += f"{o_m:<12.1f} {o_i:<12.1f} {c_m:<12.1f} {c_i:<12.1f}"
+                print(row)
+
+                total_oracle_m += o_m * r['n_samples']
+                total_oracle_i += o_i * r['n_samples']
+                total_cascade_m += c_m * r['n_samples']
+                total_cascade_i += c_i * r['n_samples']
+                count += r['n_samples']
+
+        if count > 0:
+            print("-"*90)
+            row = f"{'AVERAGE':<20} "
+            row += f"{total_oracle_m/count:<12.1f} {total_oracle_i/count:<12.1f} "
+            row += f"{total_cascade_m/count:<12.1f} {total_cascade_i/count:<12.1f}"
+            print(row)
+        print("="*90)
+        print("M = Mentor tokens, I = Intern tokens")
 
 
 def print_latex(all_results: List[Dict], totals: Dict, split: str):
