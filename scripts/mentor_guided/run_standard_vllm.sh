@@ -26,10 +26,52 @@ echo "Data dir: $DATA_DIR"
 echo "GPUs: $GPUS (${NUM_GPUS} GPUs)"
 echo "============================================================"
 
+# Helper function to check if data collection is complete for a subset/split
+check_data_exists() {
+    local subset=$1
+    local split=$2
+    local data_file="$DATA_DIR/$subset/$split/tokens0.json"
+    if [ -f "$data_file" ]; then
+        return 0  # exists
+    else
+        return 1  # not exists
+    fi
+}
+
 echo ""
 echo "========== Step 1: Collect Data (${NUM_GPUS} GPUs parallel) =========="
-python collect_data_vllm_think.py --split train --parallel --gpus $GPUS --no-think
-python collect_data_vllm_think.py --split test --parallel --gpus $GPUS --no-think
+
+# Check if train data already exists
+TRAIN_EXISTS=true
+for subset in "${SUBSETS[@]}"; do
+    if ! check_data_exists "$subset" "train"; then
+        TRAIN_EXISTS=false
+        break
+    fi
+done
+
+if [ "$TRAIN_EXISTS" = true ]; then
+    echo "Train data already exists, skipping collection..."
+else
+    echo "Collecting train data..."
+    python collect_data_vllm_think.py --split train --parallel --gpus $GPUS --no-think
+fi
+
+# Check if test data already exists
+TEST_EXISTS=true
+for subset in "${SUBSETS[@]}"; do
+    if ! check_data_exists "$subset" "test"; then
+        TEST_EXISTS=false
+        break
+    fi
+done
+
+if [ "$TEST_EXISTS" = true ]; then
+    echo "Test data already exists, skipping collection..."
+else
+    echo "Collecting test data..."
+    python collect_data_vllm_think.py --split test --parallel --gpus $GPUS --no-think
+fi
 
 echo ""
 echo "========== Step 2: Data Statistics =========="
