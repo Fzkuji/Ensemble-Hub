@@ -79,6 +79,19 @@ You are also provided with a hint from a mentor model. Use the hint to guide you
 After your reasoning, provide the final answer in \\boxed{}.
 """
 
+# Standard prompt without think framework
+STANDARD_SYSTEM_PROMPT = """You are a mathematical reasoning expert. Solve the problem step by step, showing your work clearly.
+
+After your reasoning, provide the final answer in \\boxed{}.
+"""
+
+STANDARD_SYSTEM_PROMPT_WITH_HINT = """You are a mathematical reasoning expert. Solve the problem step by step, showing your work clearly.
+
+You are also provided with a hint from a mentor model. Use the hint to guide your reasoning.
+
+After your reasoning, provide the final answer in \\boxed{}.
+"""
+
 
 def extract_boxed_answer(text: str) -> str:
     """Extract answer from \\boxed{}."""
@@ -152,21 +165,29 @@ class VLLMInference:
         self,
         question: str,
         hint: Optional[str] = None,
+        use_think: bool = True,
     ) -> str:
         """Build chat prompt with template.
 
         Args:
             question: The math problem
             hint: Optional mentor hint/reasoning
+            use_think: Whether to use structured thinking prompt
 
         Returns:
             Formatted prompt string
         """
         if hint:
-            system_prompt = THINKING_SYSTEM_PROMPT_WITH_HINT
+            if use_think:
+                system_prompt = THINKING_SYSTEM_PROMPT_WITH_HINT
+            else:
+                system_prompt = STANDARD_SYSTEM_PROMPT_WITH_HINT
             user_content = f"Problem: {question}\n\nHint from mentor:\n{hint}"
         else:
-            system_prompt = THINKING_SYSTEM_PROMPT
+            if use_think:
+                system_prompt = THINKING_SYSTEM_PROMPT
+            else:
+                system_prompt = STANDARD_SYSTEM_PROMPT
             user_content = f"Problem: {question}"
 
         messages = [
@@ -338,6 +359,7 @@ def collect_data_for_token_level(
     data: List[Dict[str, Any]],
     token_level: int,
     batch_size: int = 8,
+    use_think: bool = True,
 ) -> List[Dict[str, Any]]:
     """Collect data for a specific token level.
 
@@ -346,6 +368,7 @@ def collect_data_for_token_level(
         data: List of problems
         token_level: 0 for intern only, >0 for mentor tokens
         batch_size: Batch size for inference
+        use_think: Whether to use structured thinking prompt
 
     Returns:
         List of results with responses and correctness
@@ -358,8 +381,8 @@ def collect_data_for_token_level(
         batch = data[batch_start:batch_start + batch_size]
 
         if token_level == 0:
-            # No mentor, just generate with structured thinking
-            prompts = [model.build_chat_prompt(item['question']) for item in batch]
+            # No mentor, just generate
+            prompts = [model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
             responses = model.generate(prompts)
 
             for item, response in zip(batch, responses):
@@ -376,12 +399,12 @@ def collect_data_for_token_level(
                 })
         else:
             # First generate mentor hints
-            mentor_prompts = [model.build_chat_prompt(item['question']) for item in batch]
+            mentor_prompts = [model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
             mentor_hints = model.generate_mentor_tokens(mentor_prompts, max_tokens=token_level)
 
             # Then generate with hints
             prompts_with_hints = [
-                model.build_chat_prompt(item['question'], hint=hint)
+                model.build_chat_prompt(item['question'], hint=hint, use_think=use_think)
                 for item, hint in zip(batch, mentor_hints)
             ]
             responses = model.generate(prompts_with_hints)
@@ -414,6 +437,7 @@ def worker_process(
     token_levels: List[int],
     output_dir: str,
     done_queue: mp.Queue,
+    use_think: bool = True,
 ):
     """Worker process for parallel data collection.
 
@@ -427,7 +451,7 @@ def worker_process(
         done_queue.put((rank, True))
         return
 
-    logger.info(f"[Worker {rank}] GPU {gpu_id}: Processing {len(shard_data)} samples")
+    logger.info(f"[Worker {rank}] GPU {gpu_id}: Processing {len(shard_data)} samples (use_think={use_think})")
 
     # Initialize model on this GPU
     model = VLLMInference(
@@ -439,7 +463,7 @@ def worker_process(
     # Collect data for each token level and save to temp file
     for token_level in token_levels:
         logger.info(f"[Worker {rank}] Collecting tokens={token_level}...")
-        results = collect_data_for_token_level(model, shard_data, token_level, batch_size)
+        results = collect_data_for_token_level(model, shard_data, token_level, batch_size, use_think=use_think)
 
         correct = sum(1 for r in results if r['is_correct'])
         accuracy = correct / len(results) if results else 0
@@ -467,6 +491,7 @@ def collect_parallel(
     token_levels: List[int],
     gpus: List[int],
     output_dir: str,
+    use_think: bool = True,
 ) -> Dict[int, List[Dict[str, Any]]]:
     """Collect data in parallel across multiple GPUs.
 
@@ -478,12 +503,13 @@ def collect_parallel(
         token_levels: List of token levels to collect
         gpus: List of GPU IDs to use
         output_dir: Output directory for temp files
+        use_think: Whether to use structured thinking prompt
 
     Returns:
         Dictionary mapping token_level -> list of results
     """
     world_size = len(gpus)
-    logger.info(f"Starting parallel collection with {world_size} workers on GPUs {gpus}")
+    logger.info(f"Starting parallel collection with {world_size} workers on GPUs {gpus} (use_think={use_think})")
 
     mp.set_start_method('spawn', force=True)
     done_queue = mp.Queue()
@@ -496,7 +522,7 @@ def collect_parallel(
     for rank, gpu_id in enumerate(gpus):
         p = mp.Process(
             target=worker_process,
-            args=(rank, world_size, gpu_id, model_name, max_model_len, batch_size, data, token_levels, output_dir, done_queue)
+            args=(rank, world_size, gpu_id, model_name, max_model_len, batch_size, data, token_levels, output_dir, done_queue, use_think)
         )
         p.start()
         processes.append(p)
@@ -568,8 +594,14 @@ def main():
                         help="Enable parallel data collection with multiple GPUs")
     parser.add_argument("--gpus", type=str, default="0,1,2,3,4,5,6,7",
                         help="Comma-separated list of GPUs for parallel mode")
+    # Think mode control
+    parser.add_argument("--no-think", action="store_true",
+                        help="Disable structured thinking prompt (use standard prompt)")
 
     args = parser.parse_args()
+
+    # Determine if using think mode
+    use_think = not args.no_think
 
     # Parse token levels
     token_levels = [int(x) for x in args.token_levels.split(",")]
@@ -580,13 +612,14 @@ def main():
     # Set output directory (default: server path)
     # Use exp_name if provided, otherwise use model name
     exp_name = args.exp_name if args.exp_name else args.model.split('/')[-1]
+    mode_suffix = "think" if use_think else "standard"
     if args.output_dir is None:
         if args.dataset == "math500":
-            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/math500_think_{exp_name}"
+            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/math500_{mode_suffix}_{exp_name}"
         elif args.dataset == "hendrycks_math_all":
-            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_all_think_{exp_name}"
+            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_all_{mode_suffix}_{exp_name}"
         else:
-            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_{exp_name}"
+            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_{mode_suffix}_{exp_name}"
 
     os.makedirs(args.output_dir, exist_ok=True)
     logger.info(f"Output directory: {args.output_dir}")
@@ -615,6 +648,7 @@ def main():
                 token_levels=token_levels,
                 gpus=gpus,
                 output_dir=output_subdir,
+                use_think=use_think,
             )
         else:
             model = VLLMInference(
@@ -625,7 +659,7 @@ def main():
             all_results = {}
             for token_level in token_levels:
                 logger.info(f"\nCollecting data for tokens={token_level}...")
-                results = collect_data_for_token_level(model, data, token_level, args.batch_size)
+                results = collect_data_for_token_level(model, data, token_level, args.batch_size, use_think=use_think)
                 all_results[token_level] = results
 
         # Save results
@@ -644,6 +678,8 @@ def main():
         logger.info(f"Parallel mode with {len(gpus)} GPUs: {gpus}")
     else:
         logger.info(f"Single GPU mode on GPU {args.gpu}")
+
+    logger.info(f"Prompt mode: {'THINK (structured)' if use_think else 'STANDARD (no think)'}")
 
     if args.dataset == "math500":
         # MATH-500 dataset
