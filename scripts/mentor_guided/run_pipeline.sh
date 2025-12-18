@@ -1,18 +1,65 @@
 #!/bin/bash
-# Standard (No Think) vLLM Pipeline - By Subset
-# Usage: ./run_standard_vllm.sh [GPUS]
-#   GPUS: Comma-separated GPU IDs (default: 0,1,2,3,4,5,6,7)
+# Unified vLLM Pipeline for DeepSeek R1
+# Usage: ./run_pipeline.sh [OPTIONS]
+#
+# Options:
+#   --gpus GPUS       Comma-separated GPU IDs (default: 0,1,2,3,4,5,6,7)
+#   --think           Enable thinking mode (default)
+#   --no-think        Disable thinking mode (standard prompt)
+#   --model MODEL     Model name (default: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B)
 #
 # Examples:
-#   ./run_standard_vllm.sh                    # Default: 8 GPUs
-#   ./run_standard_vllm.sh 1,2,3,4,5,6,7      # Skip GPU 0
+#   ./run_pipeline.sh --think                          # Think mode, 8 GPUs
+#   ./run_pipeline.sh --no-think --gpus 1,2,3,4,5,6,7  # Standard mode, skip GPU 0
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-GPUS="${1:-0,1,2,3,4,5,6,7}"
-DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_standard_DeepSeek-R1-Distill-Qwen-7B"
+# Default values
+GPUS="0,1,2,3,4,5,6,7"
+USE_THINK=true
+MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --gpus)
+            GPUS="$2"
+            shift 2
+            ;;
+        --think)
+            USE_THINK=true
+            shift
+            ;;
+        --no-think)
+            USE_THINK=false
+            shift
+            ;;
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Extract model name for directory
+MODEL_NAME=$(echo $MODEL | sed 's|.*/||')
+
+# Set data directory based on think mode
+if [ "$USE_THINK" = true ]; then
+    MODE="think"
+    THINK_FLAG=""
+else
+    MODE="standard"
+    THINK_FLAG="--no-think"
+fi
+
+DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_${MODE}_${MODEL_NAME}"
 SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
 
 # Parse GPU count
@@ -20,8 +67,10 @@ IFS=',' read -ra GPU_ARRAY <<< "$GPUS"
 NUM_GPUS=${#GPU_ARRAY[@]}
 
 echo "============================================================"
-echo "Standard (No Think) vLLM Pipeline - By Subset"
+echo "DeepSeek R1 vLLM Pipeline"
 echo "============================================================"
+echo "Mode: $MODE"
+echo "Model: $MODEL"
 echo "Data dir: $DATA_DIR"
 echo "GPUs: $GPUS (${NUM_GPUS} GPUs)"
 echo "============================================================"
@@ -54,7 +103,7 @@ if [ "$TRAIN_EXISTS" = true ]; then
     echo "Train data already exists, skipping collection..."
 else
     echo "Collecting train data..."
-    python collect_data_vllm_think.py --split train --parallel --gpus $GPUS --no-think
+    python collect_data_vllm_think.py --split train --parallel --gpus $GPUS $THINK_FLAG
 fi
 
 # Check if test data already exists
@@ -70,7 +119,7 @@ if [ "$TEST_EXISTS" = true ]; then
     echo "Test data already exists, skipping collection..."
 else
     echo "Collecting test data..."
-    python collect_data_vllm_think.py --split test --parallel --gpus $GPUS --no-think
+    python collect_data_vllm_think.py --split test --parallel --gpus $GPUS $THINK_FLAG
 fi
 
 echo ""

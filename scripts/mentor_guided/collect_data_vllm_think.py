@@ -623,11 +623,19 @@ def collect_all_parallel(
             p.join(timeout=5)
 
     # Merge results
+    logger.info(f"\n{'='*60}")
+    logger.info("Starting to merge results from all workers...")
+    logger.info(f"{'='*60}")
+
     all_results = {}
     for subset_name, output_dir, _ in all_tasks:
         all_results[subset_name] = {}
+        logger.info(f"Merging subset: {subset_name}, output_dir: {output_dir}")
+
         for token_level in token_levels:
             all_results[subset_name][token_level] = []
+            files_found = 0
+
             for rank in range(world_size):
                 temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
                 if os.path.exists(temp_file):
@@ -635,6 +643,9 @@ def collect_all_parallel(
                         results = json.load(f)
                     all_results[subset_name][token_level].extend(results)
                     os.remove(temp_file)
+                    files_found += 1
+                else:
+                    logger.warning(f"  Missing temp file: {temp_file}")
 
                 done_file = os.path.join(output_dir, f".done_tokens{token_level}_rank{rank}")
                 if os.path.exists(done_file):
@@ -645,11 +656,18 @@ def collect_all_parallel(
             if total > 0:
                 correct = sum(1 for r in all_results[subset_name][token_level] if r['is_correct'])
                 accuracy = correct / total
-                logger.info(f"{subset_name} tokens={token_level}: {accuracy:.4f} ({correct}/{total})")
+                logger.info(f"  {subset_name} tokens={token_level}: {accuracy:.4f} ({correct}/{total}) [merged {files_found} files]")
 
                 output_file = os.path.join(output_dir, f"tokens{token_level}.json")
                 with open(output_file, 'w', encoding='utf-8') as f:
                     json.dump(all_results[subset_name][token_level], f, indent=2, ensure_ascii=False)
+                logger.info(f"  Saved: {output_file}")
+            else:
+                logger.warning(f"  {subset_name} tokens={token_level}: No results to merge (found {files_found} files)")
+
+    logger.info(f"\n{'='*60}")
+    logger.info("Merge complete!")
+    logger.info(f"{'='*60}")
 
     return all_results
 
