@@ -24,3 +24,6 @@ output/
 .vscode/settings.json
 results/
 saves/
+
+# Submodules
+lm-evaluation-harness/
