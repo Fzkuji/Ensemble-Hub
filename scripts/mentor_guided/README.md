@@ -28,39 +28,45 @@ pip install torch transformers peft datasets scikit-learn tqdm numpy vllm
 
 ## 2. 数据收集
 
-### 2.1 方式一：标准推理（无结构化思考）
+使用 `collect_data_vllm_think.py`，支持 Think 和 Standard 两种模式。
+
+### 2.1 Think 模式（结构化思考）
 
 ```bash
 cd /home/fzkuji/PycharmProjects/Ensemble-Hub/scripts/mentor_guided
 
 # 收集 train split（8 GPU 并行）
-python collect_progressive_data.py \
-    --dataset hendrycks_math \
-    --split train \
-    --parallel \
-    --gpus 0,1,2,3,4,5,6,7
+python collect_data_vllm_think.py --split train --parallel --gpus 0,1,2,3,4,5,6,7
 
 # 收集 test split（8 GPU 并行）
-python collect_progressive_data.py \
-    --dataset hendrycks_math \
-    --split test \
-    --parallel \
-    --gpus 0,1,2,3,4,5,6,7
+python collect_data_vllm_think.py --split test --parallel --gpus 0,1,2,3,4,5,6,7
 ```
 
-**输出目录**: `/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split/`
+**输出目录**: `hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B/`
 
-### 2.2 方式二：结构化思考推理（vLLM + Think Token）
+### 2.2 Standard 模式（无思考）
 
 ```bash
-# 收集 train split
-python collect_data_vllm_think.py --split train --gpu 0
+# 收集 train split（8 GPU 并行）
+python collect_data_vllm_think.py --split train --parallel --gpus 0,1,2,3,4,5,6,7 --no-think
 
-# 收集 test split
-python collect_data_vllm_think.py --split test --gpu 0
+# 收集 test split（8 GPU 并行）
+python collect_data_vllm_think.py --split test --parallel --gpus 0,1,2,3,4,5,6,7 --no-think
 ```
 
-**输出目录**: `/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B/`
+**输出目录**: `hendrycks_math_split_standard_DeepSeek-R1-Distill-Qwen-7B/`
+
+### 2.3 参数说明
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--split` | 数据集划分 | `test` |
+| `--parallel` | 启用多 GPU 并行 | - |
+| `--gpus` | GPU 列表 | `0,1,2,3,4,5,6,7` |
+| `--no-think` | 禁用思考（标准 prompt） | - |
+| `--model` | 模型名称 | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` |
+| `--batch-size` | 批量大小 | `8` |
+| `--token-levels` | Token 级别列表 | `0,100,500,1000` |
 
 ---
 
@@ -246,17 +252,49 @@ TOTAL (weighted)          5000   0.5538  -       278.3   0.5723  81.2    234.6  
 
 ## 7. 一键运行
 
-### 7.1 标准数据完整流程
+使用统一的 `run_pipeline.sh` 脚本，通过参数控制模式：
+
+### 7.1 Think 模式（结构化思考）
 
 ```bash
-./run_standard.sh
+# 默认 8 GPU
+./run_pipeline.sh --think
+
+# 指定 GPU
+./run_pipeline.sh --think --gpus 0,1,2,3,4,5,6,7
 ```
 
-### 7.2 Think 数据完整流程
+**输出目录**: `hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B/`
+
+### 7.2 Standard 模式（无思考）
 
 ```bash
-./run_think.sh
+# 默认 8 GPU
+./run_pipeline.sh --no-think
+
+# 跳过 GPU 0
+./run_pipeline.sh --no-think --gpus 1,2,3,4,5,6,7
 ```
+
+**输出目录**: `hendrycks_math_split_standard_DeepSeek-R1-Distill-Qwen-7B/`
+
+### 7.3 脚本参数说明
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--think` | 启用结构化思考模式 | 默认 |
+| `--no-think` | 禁用思考（标准 prompt） | - |
+| `--gpus` | 指定 GPU 列表 | `0,1,2,3,4,5,6,7` |
+| `--model` | 指定模型 | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` |
+
+### 7.4 Pipeline 流程
+
+脚本自动执行以下步骤：
+1. **数据收集** - 多 GPU 并行收集 train/test 数据
+2. **数据统计** - 计算 Oracle/Baseline 统计
+3. **LoRA 训练** - 训练所有子集的分类器
+4. **Cascade 评估** - 评估 cascade 性能
+5. **结果汇总** - 生成汇总报告
 
 ---
 
@@ -381,8 +419,8 @@ python collect_data_vllm_think.py \
 
 | 文件 | 说明 |
 |------|------|
-| `collect_progressive_data.py` | 标准数据收集（8 GPU 并行） |
-| `collect_data_vllm_think.py` | Think 数据收集（vLLM） |
+| `run_pipeline.sh` | 一键运行脚本（支持 --think/--no-think） |
+| `collect_data_vllm_think.py` | 数据收集（vLLM，支持 Think/Standard 模式） |
 | `compute_stats.py` | 计算 Oracle/Baseline 统计 |
 | `train_lora_classifier.py` | LoRA 分类器训练（8 GPU DDP） |
 | `eval_lora_cascade.py` | Cascade 评估（8 GPU DDP） |
