@@ -47,51 +47,8 @@ logger = logging.getLogger(__name__)
 # Token levels to collect (0 = no mentor, just intern)
 TOKEN_LEVELS = [0, 100, 500, 1000]
 
-# Structured thinking prompt with Goal, Planning, Retrieval, Action framework
-THINKING_SYSTEM_PROMPT = """You are a mathematical reasoning expert. When solving problems, structure your thinking using the following framework:
-
-<think>
-**Goal (I₁)**: Define the ultimate objective or question to be solved. Clarify what you aim to achieve.
-
-**Planning (I₂)**: Outline the high-level reasoning strategy. Decompose subproblems and select solution paths.
-
-**Retrieval (I₃)**: Recall relevant knowledge, facts, formulas, or contextual information necessary for solving.
-
-**Action (I₄)**: Execute concrete reasoning steps, calculations, or logical operations leading to the answer.
-</think>
-
-After your reasoning, provide the final answer in \\boxed{}.
-"""
-
-THINKING_SYSTEM_PROMPT_WITH_HINT = """You are a mathematical reasoning expert. When solving problems, structure your thinking using the following framework:
-
-<think>
-**Goal (I₁)**: Define the ultimate objective or question to be solved. Clarify what you aim to achieve.
-
-**Planning (I₂)**: Outline the high-level reasoning strategy. Decompose subproblems and select solution paths.
-
-**Retrieval (I₃)**: Recall relevant knowledge, facts, formulas, or contextual information necessary for solving.
-
-**Action (I₄)**: Execute concrete reasoning steps, calculations, or logical operations leading to the answer.
-</think>
-
-You are also provided with a hint from a mentor model. Use the hint to guide your reasoning, but still follow the structured thinking framework above.
-
-After your reasoning, provide the final answer in \\boxed{}.
-"""
-
-# Standard prompt without think framework
-STANDARD_SYSTEM_PROMPT = """You are a mathematical reasoning expert. Solve the problem step by step, showing your work clearly.
-
-After your reasoning, provide the final answer in \\boxed{}.
-"""
-
-STANDARD_SYSTEM_PROMPT_WITH_HINT = """You are a mathematical reasoning expert. Solve the problem step by step, showing your work clearly.
-
-You are also provided with a hint from a mentor model. Use the hint to guide your reasoning.
-
-After your reasoning, provide the final answer in \\boxed{}.
-"""
+# Simple system prompt (ACT-E uses simple prompts)
+SYSTEM_PROMPT = """Please reason step by step, and put your final answer within \\boxed{}."""
 
 
 def extract_boxed_answer(text: str) -> str:
@@ -165,45 +122,32 @@ class VLLMInference:
     def build_chat_prompt(
         self,
         question: str,
-        hint: Optional[str] = None,
         use_think: bool = True,
     ) -> str:
-        """Build chat prompt with template.
+        """Build simple chat prompt.
+
+        ACT-E uses simple prompts without complex frameworks.
+        For DeepSeek R1 no-think mode, we pre-fill empty think block.
 
         Args:
             question: The math problem
-            hint: Optional mentor hint/reasoning
-            use_think: Whether to use structured thinking prompt
+            use_think: Whether to allow thinking (True) or skip it (False)
 
         Returns:
             Formatted prompt string
         """
-        if hint:
-            if use_think:
-                system_prompt = THINKING_SYSTEM_PROMPT_WITH_HINT
-            else:
-                system_prompt = STANDARD_SYSTEM_PROMPT_WITH_HINT
-            user_content = f"Problem: {question}\n\nHint from mentor:\n{hint}"
-        else:
-            if use_think:
-                system_prompt = THINKING_SYSTEM_PROMPT
-            else:
-                system_prompt = STANDARD_SYSTEM_PROMPT
-            user_content = f"Problem: {question}"
-
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": question},
         ]
 
-        # Apply chat template
         prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
         )
 
-        # For DeepSeek R1 models: skip thinking by pre-filling empty think block
+        # For DeepSeek R1 no-think mode: pre-fill empty think block
         if not use_think:
             prompt = prompt + "<think>\n</think>\n\n"
 
@@ -368,12 +312,16 @@ def collect_data_for_token_level(
 ) -> List[Dict[str, Any]]:
     """Collect data for a specific token level.
 
+    ACT-E approach:
+    - token_level=0: Intern generates from scratch
+    - token_level>0: Mentor generates first N tokens, then Intern CONTINUES from there
+
     Args:
         model: VLLMInference instance
         data: List of problems
         token_level: 0 for intern only, >0 for mentor tokens
         batch_size: Batch size for inference
-        use_think: Whether to use structured thinking prompt
+        use_think: Whether to use think mode
 
     Returns:
         List of results with responses and correctness
@@ -386,12 +334,14 @@ def collect_data_for_token_level(
         batch = data[batch_start:batch_start + batch_size]
 
         if token_level == 0:
-            # No mentor, just generate
+            # No mentor - intern generates from scratch
             prompts = [model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
             responses = model.generate(prompts)
 
             for item, response in zip(batch, responses):
                 is_correct = check_math_correctness(response, item['ground_truth'])
+                # Calculate token length
+                intern_length = len(model.tokenizer.encode(response)) if response else 0
                 results.append({
                     'question': item['question'],
                     'ground_truth': item['ground_truth'],
@@ -399,31 +349,42 @@ def collect_data_for_token_level(
                     'mentor_response': '',
                     'response': response,
                     'is_correct': is_correct,
+                    'mentor_length': 0,
+                    'intern_length': intern_length,
                     'subset': item.get('subset', ''),
                     'level': item.get('level', ''),
                 })
         else:
-            # First generate mentor hints
-            mentor_prompts = [model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
-            mentor_hints = model.generate_mentor_tokens(mentor_prompts, max_tokens=token_level)
+            # Mentor generates first N tokens
+            prompts = [model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
+            mentor_outputs = model.generate_mentor_tokens(prompts, max_tokens=token_level)
 
-            # Then generate with hints
-            prompts_with_hints = [
-                model.build_chat_prompt(item['question'], hint=hint, use_think=use_think)
-                for item, hint in zip(batch, mentor_hints)
+            # Intern CONTINUES from mentor's output (not starting over)
+            # Concatenate prompt + mentor_output, then continue generating
+            continued_prompts = [
+                prompt + mentor_output
+                for prompt, mentor_output in zip(prompts, mentor_outputs)
             ]
-            responses = model.generate(prompts_with_hints)
+            intern_continuations = model.generate(continued_prompts)
 
-            for item, hint, response in zip(batch, mentor_hints, responses):
-                full_response = hint + response
+            for item, mentor_output, intern_continuation in zip(batch, mentor_outputs, intern_continuations):
+                # Full response = mentor_output + intern_continuation
+                full_response = mentor_output + intern_continuation
                 is_correct = check_math_correctness(full_response, item['ground_truth'])
+
+                # Calculate token lengths
+                mentor_length = len(model.tokenizer.encode(mentor_output)) if mentor_output else 0
+                intern_length = len(model.tokenizer.encode(intern_continuation)) if intern_continuation else 0
+
                 results.append({
                     'question': item['question'],
                     'ground_truth': item['ground_truth'],
                     'mentor_tokens': token_level,
-                    'mentor_response': hint,
-                    'response': response,
+                    'mentor_response': mentor_output,
+                    'response': full_response,
                     'is_correct': is_correct,
+                    'mentor_length': mentor_length,
+                    'intern_length': intern_length,
                     'subset': item.get('subset', ''),
                     'level': item.get('level', ''),
                 })
