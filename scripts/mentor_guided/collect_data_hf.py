@@ -244,6 +244,7 @@ def collect_data_for_token_level(
             # No mentor - intern generates from scratch
             response = model.generate(prompt)
             mentor_output = ""
+            intern_continuation = response
         else:
             # Mentor generates first N tokens
             mentor_output = model.generate_mentor_tokens(prompt, max_tokens=token_level)
@@ -256,6 +257,10 @@ def collect_data_for_token_level(
             # Full response = mentor_output + intern_continuation
             response = mentor_output + intern_continuation
 
+        # Calculate token lengths
+        mentor_length = len(model.tokenizer.encode(mentor_output)) if mentor_output else 0
+        intern_length = len(model.tokenizer.encode(intern_continuation)) if intern_continuation else 0
+
         is_correct = check_math_correctness(response, item['ground_truth'])
 
         results.append({
@@ -265,6 +270,8 @@ def collect_data_for_token_level(
             'mentor_response': mentor_output,
             'response': response,
             'is_correct': is_correct,
+            'mentor_length': mentor_length,
+            'intern_length': intern_length,
             'subset': item.get('subset', ''),
             'level': item.get('level', ''),
         })
