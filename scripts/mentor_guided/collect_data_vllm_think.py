@@ -610,17 +610,23 @@ def collect_all_parallel(
             logger.warning(f"All workers exited early, got {done_count}/{total_done_files} completions")
             break
 
-        logger.info(f"Progress: {done_count}/{total_done_files} tasks done, {alive}/{world_size} workers alive")
         time.sleep(check_interval)
         elapsed += check_interval
 
+    logger.info("Waiting for worker processes to finish...")
+
     # Wait for workers to finish
-    for p in processes:
+    for i, p in enumerate(processes):
+        logger.info(f"  Joining worker {i}...")
         p.join(timeout=60)
         if p.is_alive():
-            logger.warning("Terminating stuck worker...")
+            logger.warning(f"  Worker {i} stuck, terminating...")
             p.terminate()
             p.join(timeout=5)
+        else:
+            logger.info(f"  Worker {i} joined successfully")
+
+    logger.info("All workers finished, starting merge...")
 
     # Merge results
     logger.info(f"\n{'='*60}")
