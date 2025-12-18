@@ -19,7 +19,7 @@ MODEL_PATH="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 EPOCHS=3
 BATCH_SIZE=2
 GRAD_ACCUM=8
-LR="2e-4"
+LR="5e-5"
 MAX_LENGTH=1024
 
 SUBSETS=(
