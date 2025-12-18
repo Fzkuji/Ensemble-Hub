@@ -100,8 +100,10 @@ def load_subset_results(data_dir: str, subset: str, split: str = "test") -> Dict
                             break
             results['oracle'] = oracle_correct / n if n > 0 else 0
 
-    # Load cascade results if available
-    cascade_file = os.path.join(subset_dir, "lora_model", "eval_results.json")
+    # Load cascade results if available (try both filenames)
+    cascade_file = os.path.join(subset_dir, "lora_model", "cascade_eval.json")
+    if not os.path.exists(cascade_file):
+        cascade_file = os.path.join(subset_dir, "lora_model", "eval_results.json")
     if os.path.exists(cascade_file):
         with open(cascade_file, 'r') as f:
             cascade_data = json.load(f)
