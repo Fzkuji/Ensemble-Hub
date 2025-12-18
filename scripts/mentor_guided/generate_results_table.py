@@ -54,7 +54,8 @@ def load_subset_results(data_dir: str, subset: str, split: str = "test") -> Dict
         'cascade': None,
     }
 
-    # Load baseline accuracy for each token level
+    # Load baseline accuracy and length for each token level
+    results['lengths'] = {}
     for tokens in TOKEN_LEVELS:
         filepath = os.path.join(split_dir, f"tokens{tokens}.json")
         if os.path.exists(filepath):
@@ -68,6 +69,15 @@ def load_subset_results(data_dir: str, subset: str, split: str = "test") -> Dict
                 'total': n,
             }
             results['n_samples'] = n
+
+            # Compute average lengths if available
+            mentor_lens = [d.get('mentor_length', 0) for d in data]
+            intern_lens = [d.get('intern_length', 0) for d in data]
+            if any(mentor_lens) or any(intern_lens):
+                results['lengths'][tokens] = {
+                    'mentor_mean': sum(mentor_lens) / n if n > 0 else 0,
+                    'intern_mean': sum(intern_lens) / n if n > 0 else 0,
+                }
 
     # Load mentor_only if exists
     mentor_file = os.path.join(split_dir, "tokensmentor_only.json")
@@ -233,45 +243,73 @@ def print_table(all_results: List[Dict], totals: Dict, split: str):
     print("="*130)
 
     # Print length statistics if available
-    has_length = any(r.get('cascade_length') for r in all_results)
+    has_length = any(r.get('lengths') or r.get('cascade_length') for r in all_results)
     if has_length:
-        print(f"\n{'='*90}")
+        print(f"\n{'='*140}")
         print("LENGTH STATISTICS (tokens)")
-        print(f"{'='*90}")
-        print(f"{'Subset':<20} {'Oracle M':<12} {'Oracle I':<12} {'Cascade M':<12} {'Cascade I':<12}")
-        print("-"*90)
+        print(f"{'='*140}")
 
-        total_oracle_m, total_oracle_i = 0, 0
-        total_cascade_m, total_cascade_i = 0, 0
+        # Header: T=0, T=100, T=500, T=1000, Oracle, Cascade
+        header = f"{'Subset':<15}"
+        for t in TOKEN_LEVELS:
+            header += f"{'T='+str(t)+' M':<10} {'T='+str(t)+' I':<10}"
+        header += f"{'Oracle M':<10} {'Oracle I':<10} {'Casc M':<10} {'Casc I':<10}"
+        print(header)
+        print("-"*140)
+
+        totals = {t: {'m': 0, 'i': 0} for t in TOKEN_LEVELS}
+        totals['oracle'] = {'m': 0, 'i': 0}
+        totals['cascade'] = {'m': 0, 'i': 0}
         count = 0
 
         for r in all_results:
+            lengths = r.get('lengths', {})
             oracle_len = r.get('oracle_length', {})
             cascade_len = r.get('cascade_length', {})
+            n = r['n_samples']
 
-            if oracle_len or cascade_len:
+            row = f"{SUBSET_SHORT.get(r['subset'], r['subset']):<15}"
+
+            for t in TOKEN_LEVELS:
+                if t in lengths:
+                    m = lengths[t].get('mentor_mean', 0)
+                    i = lengths[t].get('intern_mean', 0)
+                    row += f"{m:<10.0f} {i:<10.0f}"
+                    totals[t]['m'] += m * n
+                    totals[t]['i'] += i * n
+                else:
+                    row += f"{'--':<10} {'--':<10}"
+
+            if oracle_len:
                 o_m = oracle_len.get('mentor_mean', 0)
                 o_i = oracle_len.get('intern_mean', 0)
+                row += f"{o_m:<10.0f} {o_i:<10.0f}"
+                totals['oracle']['m'] += o_m * n
+                totals['oracle']['i'] += o_i * n
+            else:
+                row += f"{'--':<10} {'--':<10}"
+
+            if cascade_len:
                 c_m = cascade_len.get('mentor_mean', 0)
                 c_i = cascade_len.get('intern_mean', 0)
+                row += f"{c_m:<10.0f} {c_i:<10.0f}"
+                totals['cascade']['m'] += c_m * n
+                totals['cascade']['i'] += c_i * n
+            else:
+                row += f"{'--':<10} {'--':<10}"
 
-                row = f"{SUBSET_SHORT.get(r['subset'], r['subset']):<20} "
-                row += f"{o_m:<12.1f} {o_i:<12.1f} {c_m:<12.1f} {c_i:<12.1f}"
-                print(row)
-
-                total_oracle_m += o_m * r['n_samples']
-                total_oracle_i += o_i * r['n_samples']
-                total_cascade_m += c_m * r['n_samples']
-                total_cascade_i += c_i * r['n_samples']
-                count += r['n_samples']
+            print(row)
+            count += n
 
         if count > 0:
-            print("-"*90)
-            row = f"{'AVERAGE':<20} "
-            row += f"{total_oracle_m/count:<12.1f} {total_oracle_i/count:<12.1f} "
-            row += f"{total_cascade_m/count:<12.1f} {total_cascade_i/count:<12.1f}"
+            print("-"*140)
+            row = f"{'AVERAGE':<15}"
+            for t in TOKEN_LEVELS:
+                row += f"{totals[t]['m']/count:<10.0f} {totals[t]['i']/count:<10.0f}"
+            row += f"{totals['oracle']['m']/count:<10.0f} {totals['oracle']['i']/count:<10.0f}"
+            row += f"{totals['cascade']['m']/count:<10.0f} {totals['cascade']['i']/count:<10.0f}"
             print(row)
-        print("="*90)
+        print("="*140)
         print("M = Mentor tokens, I = Intern tokens")
 
 
