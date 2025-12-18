@@ -203,6 +203,10 @@ class VLLMInference:
             add_generation_prompt=True,
         )
 
+        # For DeepSeek R1 models: skip thinking by pre-filling empty think block
+        if not use_think:
+            prompt = prompt + "<think>\n</think>\n\n"
+
         return prompt
 
     def generate(
