@@ -10,6 +10,7 @@
 #   --subset SUBSET   Only run on specific subset (default: all subsets)
 #   --lr LR           Learning rate for LoRA training (default: 1e-4)
 #   --epochs EPOCHS   Number of epochs for LoRA training (default: 1)
+#   --no-filter       Don't filter out all-correct/all-wrong samples
 #
 # Examples:
 #   ./run_pipeline.sh --think                          # Think mode, 8 GPUs
@@ -27,6 +28,7 @@ MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 SUBSET=""
 LR="1e-4"
 EPOCHS="1"
+NO_FILTER=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -58,6 +60,10 @@ while [[ $# -gt 0 ]]; do
         --epochs)
             EPOCHS="$2"
             shift 2
+            ;;
+        --no-filter)
+            NO_FILTER=true
+            shift
             ;;
         *)
             echo "Unknown option: $1"
@@ -159,7 +165,11 @@ echo ""
 echo "========== Step 3: Train LoRA Classifiers =========="
 for subset in "${SUBSETS[@]}"; do
     echo "Training: $subset (lr=$LR, epochs=$EPOCHS)"
-    CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_lora_classifier.py --ddp --subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS
+    FILTER_FLAG=""
+    if [ "$NO_FILTER" = true ]; then
+        FILTER_FLAG="--no-filter"
+    fi
+    CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_lora_classifier.py --ddp --subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS $FILTER_FLAG
 done
 
 echo ""
