@@ -397,9 +397,9 @@ def eval_cascade_on_val(
                 correct += gt[best_tokens][i]
         return correct / n_samples
 
-    # Direct fine-grained threshold search (0.05 step)
-    # 19^4 = 130321 combinations, still fast since compute_cascade_acc is O(n_samples)
-    threshold_candidates = [round(0.05 + i * 0.05, 2) for i in range(19)]  # 0.05 to 0.95
+    # Fine-grained threshold search (0.02 step)
+    # 49^4 = 5,764,801 combinations - slower but more precise
+    threshold_candidates = [round(0.02 + i * 0.02, 2) for i in range(49)]  # 0.02 to 0.98, step 0.02
     best_acc = 0
     best_thresholds = None
 
@@ -705,6 +705,28 @@ def main():
                 }
                 logger.info(f"New best cascade acc! Saving...")
 
+    # Final threshold search on train + val combined
+    if is_main_process():
+        logger.info("\nSearching thresholds on train + val combined...")
+
+    # Merge train and val data
+    combined_data = {}
+    for tokens in TOKEN_LEVELS:
+        if tokens in train_data and tokens in val_data:
+            combined_data[tokens] = train_data[tokens] + val_data[tokens]
+
+    final_cascade_acc, final_thresholds, final_detailed = eval_cascade_on_val(
+        model, combined_data, tokenizer, args.max_length, device
+    )
+
+    if is_main_process():
+        logger.info(f"Combined Cascade Acc: {final_cascade_acc:.4f} (Oracle: {final_detailed['oracle']:.4f})")
+        logger.info(f"Final Thresholds (train+val): {final_thresholds}")
+
+    # Update best_state with final thresholds
+    if best_state:
+        best_state['thresholds'] = final_thresholds
+
     # Save best model (only main process)
     if is_main_process() and best_state:
         torch.save(best_state, os.path.join(args.output_dir, "best_model.pt"))
@@ -725,7 +747,7 @@ def main():
     if is_main_process():
         logger.info("\nFinal Evaluation:")
         logger.info(f"Best Val Cascade Accuracy: {best_cascade_acc:.4f}")
-        logger.info(f"Best Thresholds: {best_thresholds}")
+        logger.info(f"Final Thresholds (train+val): {final_thresholds}")
 
         # Save results
         results = {
@@ -734,7 +756,8 @@ def main():
             'n_val': n_val,
             'val_ratio': args.val_ratio,
             'best_cascade_acc': float(best_cascade_acc),
-            'best_thresholds': best_thresholds,
+            'final_cascade_acc': float(final_cascade_acc),
+            'best_thresholds': final_thresholds,  # Use thresholds from train+val
             'world_size': world_size,
             'args': vars(args),
         }
