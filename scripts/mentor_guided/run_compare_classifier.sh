@@ -76,7 +76,7 @@ if [ "$SKIP_LORA" = false ]; then
     for subset in "${SUBSETS[@]}"; do
         echo ""
         echo ">>> LoRA: $subset"
-        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_lora_classifier.py \
+        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
             --ddp --subset $subset --data-dir $DATA_DIR --epochs 3
     done
 else
@@ -91,7 +91,7 @@ if [ "$SKIP_MLP" = false ]; then
     for subset in "${SUBSETS[@]}"; do
         echo ""
         echo ">>> MLP: $subset"
-        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
+        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_mlp_classifier.py \
             --ddp --subset $subset --data-dir $DATA_DIR --epochs 10
     done
 else
