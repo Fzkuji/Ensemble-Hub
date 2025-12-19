@@ -259,7 +259,7 @@ def extract_features(
                     index=shifted_input_ids.unsqueeze(-1)
                 ).squeeze(-1)
 
-                token_logprobs = token_log_probs[0].cpu().numpy().tolist()
+                token_logprobs = token_log_probs[0].float().cpu().numpy().tolist()
 
             stats = compute_stats_from_logprobs(token_logprobs)
 
