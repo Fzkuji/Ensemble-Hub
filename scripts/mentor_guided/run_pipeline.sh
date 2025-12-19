@@ -8,6 +8,8 @@
 #   --no-think        Disable thinking mode (standard prompt)
 #   --model MODEL     Model name (default: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B)
 #   --subset SUBSET   Only run on specific subset (default: all subsets)
+#   --lr LR           Learning rate for LoRA training (default: 1e-4)
+#   --epochs EPOCHS   Number of epochs for LoRA training (default: 1)
 #
 # Examples:
 #   ./run_pipeline.sh --think                          # Think mode, 8 GPUs
@@ -23,6 +25,8 @@ GPUS="0,1,2,3,4,5,6,7"
 USE_THINK=true
 MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 SUBSET=""
+LR="1e-4"
+EPOCHS="1"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -45,6 +49,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --subset)
             SUBSET="$2"
+            shift 2
+            ;;
+        --lr)
+            LR="$2"
+            shift 2
+            ;;
+        --epochs)
+            EPOCHS="$2"
             shift 2
             ;;
         *)
@@ -146,8 +158,8 @@ python compute_stats.py --data-dir $DATA_DIR --split test
 echo ""
 echo "========== Step 3: Train LoRA Classifiers =========="
 for subset in "${SUBSETS[@]}"; do
-    echo "Training: $subset"
-    CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_lora_classifier.py --ddp --subset $subset --data-dir $DATA_DIR
+    echo "Training: $subset (lr=$LR, epochs=$EPOCHS)"
+    CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_lora_classifier.py --ddp --subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS
 done
 
 echo ""
