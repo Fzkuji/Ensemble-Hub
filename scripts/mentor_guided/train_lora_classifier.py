@@ -611,7 +611,7 @@ def main():
     if verbose:
         logger.info(f"Creating datasets (filter_uniform={filter_uniform})...")
     train_dataset = MentorDataset(train_data, tokenizer, args.max_length, filter_uniform=filter_uniform, verbose=verbose)
-    val_dataset = MentorDataset(val_data, tokenizer, args.max_length, filter_uniform=False, verbose=verbose)
+    val_dataset = MentorDataset(val_data, tokenizer, args.max_length, filter_uniform=filter_uniform, verbose=verbose)
 
     if verbose:
         logger.info(f"Training dataset: {len(train_dataset)} samples ({len(train_dataset)//4} questions × 4 stages)")
