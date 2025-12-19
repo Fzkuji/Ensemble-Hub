@@ -7,9 +7,11 @@
 #   --think           Enable thinking mode (default)
 #   --no-think        Disable thinking mode (standard prompt)
 #   --model MODEL     Model name (default: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B)
+#   --subset SUBSET   Only run on specific subset (default: all subsets)
 #
 # Examples:
 #   ./run_pipeline.sh --think                          # Think mode, 8 GPUs
+#   ./run_pipeline.sh --think --subset algebra         # Only algebra subset
 #   ./run_pipeline.sh --no-think --gpus 1,2,3,4,5,6,7  # Standard mode, skip GPU 0
 
 set -e
@@ -20,6 +22,7 @@ cd "$SCRIPT_DIR"
 GPUS="0,1,2,3,4,5,6,7"
 USE_THINK=true
 MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+SUBSET=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -38,6 +41,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --model)
             MODEL="$2"
+            shift 2
+            ;;
+        --subset)
+            SUBSET="$2"
             shift 2
             ;;
         *)
@@ -60,7 +67,13 @@ else
 fi
 
 DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_${MODE}_${MODEL_NAME}"
-SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
+
+# Set subsets based on --subset argument
+if [ -n "$SUBSET" ]; then
+    SUBSETS=("$SUBSET")
+else
+    SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
+fi
 
 # Token levels: -1 = mentor only, 0 = intern only, others = mentor hint + intern
 TOKEN_LEVELS="-1,0,100,500,1000"
