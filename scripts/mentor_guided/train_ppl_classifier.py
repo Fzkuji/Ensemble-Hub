@@ -135,8 +135,8 @@ def compute_trend_stats(values: np.ndarray) -> Dict[str, float]:
     }
 
 
-def compute_stats_from_logprobs(token_logprobs: List[float]) -> Dict[str, float]:
-    """Compute statistics from token log probabilities."""
+def compute_stats(token_logprobs: List[float], token_entropies: List[float]) -> Dict[str, float]:
+    """Compute statistics from token log probabilities and entropies."""
     if not token_logprobs or len(token_logprobs) == 0:
         return {
             'ppl': 1.0,
@@ -165,26 +165,24 @@ def compute_stats_from_logprobs(token_logprobs: List[float]) -> Dict[str, float]
         }
 
     logprobs = np.array(token_logprobs)
+    entropies = np.array(token_entropies)
 
     # PPL from mean log prob
     mean_logprob = np.mean(logprobs)
     ppl = np.exp(-mean_logprob)
 
-    # Use negative log prob as proxy for entropy (higher = more uncertain)
-    neg_logprobs = -logprobs
-
     # Compute trend statistics
     logprob_trend = compute_trend_stats(logprobs)
-    entropy_trend = compute_trend_stats(neg_logprobs)
+    entropy_trend = compute_trend_stats(entropies)
 
     return {
         'ppl': float(ppl),
         'log_ppl': float(np.log(ppl + 1e-10)),
-        # Entropy (neg logprob) basic stats
-        'entropy_mean': float(np.mean(neg_logprobs)),
-        'entropy_std': float(np.std(neg_logprobs)),
-        'entropy_max': float(np.max(neg_logprobs)),
-        'entropy_min': float(np.min(neg_logprobs)),
+        # True entropy stats: H = -sum(p * log(p))
+        'entropy_mean': float(np.mean(entropies)),
+        'entropy_std': float(np.std(entropies)),
+        'entropy_max': float(np.max(entropies)),
+        'entropy_min': float(np.min(entropies)),
         # Entropy trend stats
         'entropy_slope': entropy_trend['slope'],
         'entropy_increase_ratio': entropy_trend['increase_ratio'],
@@ -249,19 +247,28 @@ def extract_features(
                 outputs = model(input_ids=input_ids, labels=input_ids)
                 logits = outputs.logits
 
-                # Get log probs of actual tokens
-                log_probs = torch.log_softmax(logits, dim=-1)
-                shifted_input_ids = input_ids[:, 1:]
-                shifted_log_probs = log_probs[:, :-1, :]
+                # Shift for next token prediction
+                shifted_logits = logits[:, :-1, :]  # [1, seq_len-1, vocab_size]
+                shifted_input_ids = input_ids[:, 1:]  # [1, seq_len-1]
 
-                token_log_probs = shifted_log_probs.gather(
+                # Get log probs
+                log_probs = torch.log_softmax(shifted_logits, dim=-1)
+
+                # Token log probs (for PPL)
+                token_log_probs = log_probs.gather(
                     dim=-1,
                     index=shifted_input_ids.unsqueeze(-1)
                 ).squeeze(-1)
-
                 token_logprobs = token_log_probs[0].float().cpu().numpy().tolist()
 
-            stats = compute_stats_from_logprobs(token_logprobs)
+                # True entropy: H = -sum(p * log(p))
+                probs = torch.softmax(shifted_logits, dim=-1)  # [1, seq_len-1, vocab_size]
+                # Clamp to avoid log(0)
+                log_probs_clamped = torch.log(probs + 1e-10)
+                entropy = -torch.sum(probs * log_probs_clamped, dim=-1)  # [1, seq_len-1]
+                token_entropies = entropy[0].float().cpu().numpy().tolist()
+
+            stats = compute_stats(token_logprobs, token_entropies)
 
             features = [
                 stats['ppl'],
