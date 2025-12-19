@@ -8,11 +8,13 @@ Method:
 3. Train a simple regression model (LogisticRegression/XGBoost) on these features
 
 Usage:
-    # Single GPU
-    python train_ppl_classifier.py --subset algebra --data-dir /path/to/data
+    # Use vLLM with tensor parallelism (recommended)
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python train_ppl_classifier.py \
+        --subset algebra --data-dir /path/to/data --tensor-parallel 8
 
-    # Multi-GPU with torchrun
-    torchrun --nproc_per_node=8 train_ppl_classifier.py --ddp --subset algebra --data-dir /path/to/data
+    # Use HuggingFace (single GPU, slower)
+    CUDA_VISIBLE_DEVICES=0 python train_ppl_classifier.py \
+        --subset algebra --data-dir /path/to/data --use-hf
 """
 
 import argparse
@@ -23,8 +25,6 @@ import pickle
 from typing import Dict, List, Tuple
 
 import numpy as np
-import torch
-import torch.distributed as dist
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import roc_auc_score, accuracy_score
@@ -48,29 +48,6 @@ SUBSETS = [
 ]
 
 
-def setup_distributed():
-    """Initialize distributed training if available."""
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ['RANK'])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
-        torch.cuda.set_device(local_rank)
-        return rank, world_size, local_rank
-    return 0, 1, 0
-
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def is_main_process():
-    if dist.is_initialized():
-        return dist.get_rank() == 0
-    return True
-
-
 def load_json_data(data_dir: str, split: str = "train") -> Dict[int, List[Dict]]:
     """Load JSON data for all token levels."""
     data = {}
@@ -85,11 +62,9 @@ def load_json_data(data_dir: str, split: str = "train") -> Dict[int, List[Dict]]
         if os.path.exists(filepath):
             with open(filepath, 'r') as f:
                 data[tokens] = json.load(f)
-            if is_main_process():
-                logger.info(f"Loaded {len(data[tokens])} samples from {filepath}")
+            logger.info(f"Loaded {len(data[tokens])} samples from {filepath}")
         else:
-            if is_main_process():
-                logger.warning(f"File not found: {filepath}")
+            logger.warning(f"File not found: {filepath}")
 
     return data
 
@@ -210,29 +185,28 @@ def extract_features_vllm(
     model_path: str,
     data: Dict[int, List[Dict]],
     tensor_parallel_size: int = 1,
-    batch_size: int = 32,
+    batch_size: int = 64,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Extract PPL/entropy features using vLLM with prompt_logprobs.
     """
     from vllm import LLM, SamplingParams
 
-    # Initialize vLLM
-    if is_main_process():
-        logger.info(f"Loading vLLM model with tensor_parallel_size={tensor_parallel_size}")
+    logger.info(f"Loading vLLM model with tensor_parallel_size={tensor_parallel_size}")
 
     llm = LLM(
         model=model_path,
         tensor_parallel_size=tensor_parallel_size,
         trust_remote_code=True,
         dtype="bfloat16",
+        max_model_len=2048,
     )
 
     # Prepare all prompts
     all_prompts = []
     all_labels = []
     all_stages = []
-    prompt_to_idx = []
+    all_tokens = []
 
     n_samples = len(data[TOKEN_LEVELS[0]])
 
@@ -250,10 +224,9 @@ def extract_features_vllm(
             all_prompts.append(text)
             all_labels.append(1 if item.get('is_correct', False) else 0)
             all_stages.append(stage_idx)
-            prompt_to_idx.append((i, stage_idx, tokens))
+            all_tokens.append(tokens)
 
-    if is_main_process():
-        logger.info(f"Processing {len(all_prompts)} prompts...")
+    logger.info(f"Processing {len(all_prompts)} prompts...")
 
     # Use prompt_logprobs to get log probabilities of input tokens
     sampling_params = SamplingParams(
@@ -262,73 +235,56 @@ def extract_features_vllm(
         temperature=0,
     )
 
-    # Process in batches
+    # Process all at once (vLLM handles batching internally)
+    outputs = llm.generate(all_prompts, sampling_params)
+
     all_features = []
+    for idx, output in enumerate(tqdm(outputs, desc="Processing outputs")):
+        # Extract prompt logprobs
+        prompt_logprobs = output.prompt_logprobs
+        if prompt_logprobs is None:
+            token_logprobs = []
+        else:
+            token_logprobs = []
+            for lp in prompt_logprobs:
+                if lp is not None:
+                    # lp is a dict {token_id: Logprob}
+                    for token_id, logprob_obj in lp.items():
+                        token_logprobs.append(logprob_obj.logprob)
+                        break
 
-    for batch_start in tqdm(range(0, len(all_prompts), batch_size), desc="Extracting features", disable=not is_main_process()):
-        batch_end = min(batch_start + batch_size, len(all_prompts))
-        batch_prompts = all_prompts[batch_start:batch_end]
+        # Compute statistics
+        stats = compute_stats_from_logprobs(token_logprobs)
 
-        outputs = llm.generate(batch_prompts, sampling_params)
-
-        for output in outputs:
-            # Extract prompt logprobs
-            prompt_logprobs = output.prompt_logprobs
-            if prompt_logprobs is None:
-                token_logprobs = []
-            else:
-                token_logprobs = []
-                for lp in prompt_logprobs:
-                    if lp is not None:
-                        # lp is a dict {token_id: Logprob}
-                        # Get the logprob of the actual token
-                        for token_id, logprob_obj in lp.items():
-                            token_logprobs.append(logprob_obj.logprob)
-                            break
-
-            # Compute statistics
-            stats = compute_stats_from_logprobs(token_logprobs)
-
-            # Get stage info
-            idx = batch_start + len(all_features) - (batch_start // batch_size) * batch_size
-            if idx < len(prompt_to_idx):
-                _, stage_idx, tokens = prompt_to_idx[batch_start + outputs.index(output)]
-            else:
-                stage_idx, tokens = 0, 0
-
-            # Feature vector
-            features = [
-                stats['ppl'],
-                stats['log_ppl'],
-                stats['entropy_mean'],
-                stats['entropy_std'],
-                stats['entropy_max'],
-                stats['entropy_min'],
-                stats['entropy_slope'],
-                stats['entropy_increase_ratio'],
-                stats['entropy_decrease_ratio'],
-                stats['entropy_first_quarter'],
-                stats['entropy_last_quarter'],
-                stats['entropy_trend_change'],
-                stats['log_prob_mean'],
-                stats['log_prob_std'],
-                stats['log_prob_max'],
-                stats['log_prob_min'],
-                stats['log_prob_slope'],
-                stats['log_prob_increase_ratio'],
-                stats['log_prob_decrease_ratio'],
-                stats['log_prob_first_quarter'],
-                stats['log_prob_last_quarter'],
-                stats['log_prob_trend_change'],
-                stats['seq_len'],
-                stage_idx,
-                tokens,
-            ]
-            all_features.append(features)
-
-    # Reorder features to match original order
-    # vLLM may return results in different order, so we need to be careful
-    # Actually vLLM returns in the same order as input, so this should be fine
+        # Feature vector
+        features = [
+            stats['ppl'],
+            stats['log_ppl'],
+            stats['entropy_mean'],
+            stats['entropy_std'],
+            stats['entropy_max'],
+            stats['entropy_min'],
+            stats['entropy_slope'],
+            stats['entropy_increase_ratio'],
+            stats['entropy_decrease_ratio'],
+            stats['entropy_first_quarter'],
+            stats['entropy_last_quarter'],
+            stats['entropy_trend_change'],
+            stats['log_prob_mean'],
+            stats['log_prob_std'],
+            stats['log_prob_max'],
+            stats['log_prob_min'],
+            stats['log_prob_slope'],
+            stats['log_prob_increase_ratio'],
+            stats['log_prob_decrease_ratio'],
+            stats['log_prob_first_quarter'],
+            stats['log_prob_last_quarter'],
+            stats['log_prob_trend_change'],
+            stats['seq_len'],
+            all_stages[idx],
+            all_tokens[idx],
+        ]
+        all_features.append(features)
 
     return np.array(all_features), np.array(all_labels), np.array(all_stages)
 
@@ -342,10 +298,10 @@ def extract_features_hf(
     """
     Extract PPL/entropy features using HuggingFace transformers (fallback).
     """
+    import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    if is_main_process():
-        logger.info(f"Loading HF model from {model_path}...")
+    logger.info(f"Loading HF model from {model_path}...")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     if tokenizer.pad_token is None:
@@ -363,7 +319,7 @@ def extract_features_hf(
 
     n_samples = len(data[TOKEN_LEVELS[0]])
 
-    for i in tqdm(range(n_samples), desc="Extracting features", disable=not is_main_process()):
+    for i in tqdm(range(n_samples), desc="Extracting features"):
         for stage_idx, tokens in enumerate(TOKEN_LEVELS):
             item = data[tokens][i]
             question = item['question']
@@ -561,52 +517,31 @@ def main():
                         choices=["lr", "gb"])
     parser.add_argument("--val-ratio", type=float, default=0.3)
     parser.add_argument("--no-filter", action="store_true")
-    parser.add_argument("--ddp", action="store_true",
-                        help="Use DDP mode (with torchrun)")
     parser.add_argument("--tensor-parallel", type=int, default=1,
                         help="Tensor parallel size for vLLM")
-    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--use-hf", action="store_true",
                         help="Use HuggingFace instead of vLLM")
     parser.add_argument("--device", type=str, default="cuda:0")
 
     args = parser.parse_args()
 
-    # Setup distributed
-    rank, world_size, local_rank = setup_distributed()
-    use_ddp = args.ddp or world_size > 1
-
-    if use_ddp:
-        device = f"cuda:{local_rank}"
-        # For vLLM with DDP, each process handles a shard of data
-        # vLLM itself uses tensor parallelism, not data parallelism
-    else:
-        device = args.device
-
     subset_dir = os.path.join(args.data_dir, args.subset)
     if not os.path.exists(subset_dir):
-        if is_main_process():
-            logger.error(f"Data directory not found: {subset_dir}")
-        cleanup_distributed()
+        logger.error(f"Data directory not found: {subset_dir}")
         return
 
     if args.output_dir is None:
         args.output_dir = os.path.join(subset_dir, "ppl_model")
-    if is_main_process():
-        os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    if is_main_process():
-        logger.info(f"Subset: {args.subset}")
-        logger.info(f"Data dir: {subset_dir}")
-        logger.info(f"Classifier: {args.classifier}")
-        logger.info(f"DDP: {use_ddp}, World size: {world_size}")
+    logger.info(f"Subset: {args.subset}")
+    logger.info(f"Data dir: {subset_dir}")
+    logger.info(f"Classifier: {args.classifier}")
 
     # Load data
     train_data = load_json_data(subset_dir, split="train")
     if not train_data:
-        if is_main_process():
-            logger.error("No training data found!")
-        cleanup_distributed()
+        logger.error("No training data found!")
         return
 
     # Split train/val
@@ -623,9 +558,8 @@ def main():
             actual_train_data[tokens] = [train_data[tokens][i] for i in train_idx]
     train_data = actual_train_data
 
-    if is_main_process():
-        logger.info(f"Train: {len(train_data[TOKEN_LEVELS[0]])} samples")
-        logger.info(f"Val: {len(val_data[TOKEN_LEVELS[0]])} samples")
+    logger.info(f"Train: {len(train_data[TOKEN_LEVELS[0]])} samples")
+    logger.info(f"Val: {len(val_data[TOKEN_LEVELS[0]])} samples")
 
     # Filter uniform samples
     if not args.no_filter:
@@ -644,129 +578,79 @@ def main():
 
         train_data = filter_varied(train_data)
         val_data = filter_varied(val_data)
-        if is_main_process():
-            logger.info(f"After filtering: Train={len(train_data[TOKEN_LEVELS[0]])}, Val={len(val_data[TOKEN_LEVELS[0]])}")
-
-    # For DDP, shard data across processes
-    if use_ddp and not args.use_hf:
-        # Each rank processes its shard, then gather
-        n_train = len(train_data[TOKEN_LEVELS[0]])
-        n_val = len(val_data[TOKEN_LEVELS[0]])
-
-        train_shard_size = (n_train + world_size - 1) // world_size
-        val_shard_size = (n_val + world_size - 1) // world_size
-
-        train_start = rank * train_shard_size
-        train_end = min(train_start + train_shard_size, n_train)
-        val_start = rank * val_shard_size
-        val_end = min(val_start + val_shard_size, n_val)
-
-        train_shard = {}
-        val_shard = {}
-        for tokens in TOKEN_LEVELS:
-            train_shard[tokens] = train_data[tokens][train_start:train_end]
-            val_shard[tokens] = val_data[tokens][val_start:val_end]
-
-        if is_main_process():
-            logger.info(f"Rank {rank}: Train shard [{train_start}:{train_end}], Val shard [{val_start}:{val_end}]")
-    else:
-        train_shard = train_data
-        val_shard = val_data
+        logger.info(f"After filtering: Train={len(train_data[TOKEN_LEVELS[0]])}, Val={len(val_data[TOKEN_LEVELS[0]])}")
 
     # Extract features
     if args.use_hf:
-        if is_main_process():
-            logger.info("Using HuggingFace for feature extraction...")
+        logger.info("Using HuggingFace for feature extraction...")
         X_train, y_train, stages_train = extract_features_hf(
-            args.model_path, train_shard, device
+            args.model_path, train_data, args.device
         )
         X_val, y_val, stages_val = extract_features_hf(
-            args.model_path, val_shard, device
+            args.model_path, val_data, args.device
         )
     else:
-        if is_main_process():
-            logger.info("Using vLLM for feature extraction...")
+        logger.info("Using vLLM for feature extraction...")
         X_train, y_train, stages_train = extract_features_vllm(
-            args.model_path, train_shard, args.tensor_parallel, args.batch_size
+            args.model_path, train_data, args.tensor_parallel
         )
         X_val, y_val, stages_val = extract_features_vllm(
-            args.model_path, val_shard, args.tensor_parallel, args.batch_size
+            args.model_path, val_data, args.tensor_parallel
         )
 
-    # Gather results from all ranks
-    if use_ddp:
-        # Gather all features
-        X_train_list = [None] * world_size
-        y_train_list = [None] * world_size
-        X_val_list = [None] * world_size
-        y_val_list = [None] * world_size
+    logger.info(f"Train features shape: {X_train.shape}")
+    logger.info(f"Val features shape: {X_val.shape}")
 
-        dist.all_gather_object(X_train_list, X_train)
-        dist.all_gather_object(y_train_list, y_train)
-        dist.all_gather_object(X_val_list, X_val)
-        dist.all_gather_object(y_val_list, y_val)
+    # Train classifier
+    logger.info(f"Training {args.classifier} classifier...")
+    clf, scaler, train_results = train_classifier(
+        X_train, y_train, X_val, y_val, args.classifier
+    )
 
-        X_train = np.vstack(X_train_list)
-        y_train = np.concatenate(y_train_list)
-        X_val = np.vstack(X_val_list)
-        y_val = np.concatenate(y_val_list)
+    logger.info(f"Train Acc: {train_results['train_acc']:.4f}, Train AUC: {train_results['train_auc']:.4f}")
+    logger.info(f"Val Acc: {train_results['val_acc']:.4f}, Val AUC: {train_results['val_auc']:.4f}")
 
-    if is_main_process():
-        logger.info(f"Train features shape: {X_train.shape}")
-        logger.info(f"Val features shape: {X_val.shape}")
+    # Cascade evaluation
+    logger.info("Running cascade evaluation...")
+    X_combined = np.vstack([X_train, X_val])
+    y_combined = np.concatenate([y_train, y_val])
 
-        # Train classifier
-        logger.info(f"Training {args.classifier} classifier...")
-        clf, scaler, train_results = train_classifier(
-            X_train, y_train, X_val, y_val, args.classifier
-        )
+    cascade_acc, thresholds, detailed = eval_cascade(clf, scaler, X_combined, y_combined)
 
-        logger.info(f"Train Acc: {train_results['train_acc']:.4f}, Train AUC: {train_results['train_auc']:.4f}")
-        logger.info(f"Val Acc: {train_results['val_acc']:.4f}, Val AUC: {train_results['val_auc']:.4f}")
+    logger.info(f"Cascade Accuracy: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
+    logger.info(f"Thresholds: {thresholds}")
 
-        # Cascade evaluation
-        logger.info("Running cascade evaluation...")
-        X_combined = np.vstack([X_train, X_val])
-        y_combined = np.concatenate([y_train, y_val])
+    auc_str = ", ".join([f"T{t}={detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
+    logger.info(f"Per-stage AUC: {auc_str}")
 
-        cascade_acc, thresholds, detailed = eval_cascade(clf, scaler, X_combined, y_combined)
+    baseline_str = ", ".join([f"T{t}={detailed['baseline'][t]:.4f}" for t in TOKEN_LEVELS])
+    logger.info(f"Per-stage baseline acc: {baseline_str}")
 
-        logger.info(f"Cascade Accuracy: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
-        logger.info(f"Thresholds: {thresholds}")
+    # Save model
+    model_path = os.path.join(args.output_dir, "classifier.pkl")
+    with open(model_path, 'wb') as f:
+        pickle.dump({'classifier': clf, 'scaler': scaler, 'thresholds': thresholds}, f)
+    logger.info(f"Model saved to {model_path}")
 
-        auc_str = ", ".join([f"T{t}={detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
-        logger.info(f"Per-stage AUC: {auc_str}")
+    # Save results
+    results = {
+        'subset': args.subset,
+        'classifier': args.classifier,
+        'train_acc': train_results['train_acc'],
+        'val_acc': train_results['val_acc'],
+        'train_auc': train_results['train_auc'],
+        'val_auc': train_results['val_auc'],
+        'cascade_acc': cascade_acc,
+        'best_thresholds': thresholds,
+        'oracle': detailed['oracle'],
+        'per_stage_auc': detailed['auc'],
+        'per_stage_baseline': detailed['baseline'],
+    }
 
-        baseline_str = ", ".join([f"T{t}={detailed['baseline'][t]:.4f}" for t in TOKEN_LEVELS])
-        logger.info(f"Per-stage baseline acc: {baseline_str}")
-
-        # Save model
-        model_path = os.path.join(args.output_dir, "classifier.pkl")
-        with open(model_path, 'wb') as f:
-            pickle.dump({'classifier': clf, 'scaler': scaler, 'thresholds': thresholds}, f)
-        logger.info(f"Model saved to {model_path}")
-
-        # Save results
-        results = {
-            'subset': args.subset,
-            'classifier': args.classifier,
-            'train_acc': train_results['train_acc'],
-            'val_acc': train_results['val_acc'],
-            'train_auc': train_results['train_auc'],
-            'val_auc': train_results['val_auc'],
-            'cascade_acc': cascade_acc,
-            'best_thresholds': thresholds,
-            'oracle': detailed['oracle'],
-            'per_stage_auc': detailed['auc'],
-            'per_stage_baseline': detailed['baseline'],
-        }
-
-        results_path = os.path.join(args.output_dir, "results.json")
-        with open(results_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        logger.info(f"Results saved to {results_path}")
-
-    cleanup_distributed()
+    results_path = os.path.join(args.output_dir, "results.json")
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    logger.info(f"Results saved to {results_path}")
 
 
 if __name__ == "__main__":
