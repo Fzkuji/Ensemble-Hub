@@ -468,7 +468,7 @@ def main():
                         help="Use DistributedDataParallel (use with torchrun)")
     parser.add_argument("--no-filter", action="store_true",
                         help="Don't filter out all-correct/all-wrong samples")
-    parser.add_argument("--dropout", type=float, default=0.3,
+    parser.add_argument("--dropout", type=float, default=0.05,
                         help="Dropout rate for classifier head")
     parser.add_argument("--val-ratio", type=float, default=0.3,
                         help="Validation split ratio from training data (default: 0.3)")
