@@ -263,7 +263,7 @@ def evaluate_cascade_distributed(
     else:
         if is_main_process():
             logger.info("Searching thresholds...")
-        threshold_candidates = [round(0.02 + i * 0.02, 2) for i in range(49)]  # 0.02 to 0.98, step 0.02
+        threshold_candidates = [round(i * 0.05, 2) for i in range(21)]  # 0.0 to 1.0, step 0.05
         best_acc = 0
         best_thresholds = None
 

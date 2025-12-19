@@ -397,9 +397,8 @@ def eval_cascade_on_val(
                 correct += gt[best_tokens][i]
         return correct / n_samples
 
-    # Fine-grained threshold search (0.02 step)
-    # 49^4 = 5,764,801 combinations - slower but more precise
-    threshold_candidates = [round(0.02 + i * 0.02, 2) for i in range(49)]  # 0.02 to 0.98, step 0.02
+    # Threshold search: 21^4 = 194,481 combinations
+    threshold_candidates = [round(i * 0.05, 2) for i in range(21)]  # 0.0 to 1.0, step 0.05
     best_acc = 0
     best_thresholds = None
 
