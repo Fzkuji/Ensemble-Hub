@@ -559,15 +559,15 @@ def main():
         classifier_head = DDP(classifier_head, device_ids=[local_rank])
         model = FrozenLLMClassifier(base_model, classifier_head)
 
-    # Create datasets
+    # Create datasets (filter train only, keep val unfiltered for consistent evaluation)
     filter_uniform = not args.no_filter
     verbose = is_main_process()
     train_dataset = MentorDataset(train_data, tokenizer, args.max_length, filter_uniform=filter_uniform, verbose=verbose)
     val_dataset = MentorDataset(val_data, tokenizer, args.max_length, filter_uniform=False, verbose=verbose)
 
     if verbose:
-        logger.info(f"Training: {len(train_dataset)} samples")
-        logger.info(f"Validation: {len(val_dataset)} samples")
+        logger.info(f"Training: {len(train_dataset)} samples (filtered={filter_uniform})")
+        logger.info(f"Validation: {len(val_dataset)} samples (unfiltered)")
 
     if use_ddp:
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
@@ -660,48 +660,27 @@ def main():
         classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
         torch.save({'classifier': classifier_state}, os.path.join(args.output_dir, "last_model.pt"))
 
-    # Final cascade evaluation on filtered combined train+val (for consistent oracle)
+    # Final cascade evaluation on val (unfiltered) for consistent comparison
     if is_main_process():
-        logger.info("\nFinal cascade evaluation on combined filtered data...")
-    combined_data = {}
-    for tokens in TOKEN_LEVELS:
-        if tokens in train_data and tokens in val_data:
-            combined_data[tokens] = train_data[tokens] + val_data[tokens]
-
-    # Apply same filtering as training (if filter_uniform was True)
-    if filter_uniform:
-        n = len(combined_data[TOKEN_LEVELS[0]])
-        varied_indices = []
-        for i in range(n):
-            labels = [1 if combined_data[tokens][i].get('is_correct', False) else 0
-                      for tokens in TOKEN_LEVELS if tokens in combined_data]
-            if not (all(l == 1 for l in labels) or all(l == 0 for l in labels)):
-                varied_indices.append(i)
-        filtered_combined = {}
-        for tokens in TOKEN_LEVELS:
-            if tokens in combined_data:
-                filtered_combined[tokens] = [combined_data[tokens][i] for i in varied_indices]
-        combined_data = filtered_combined
-        if is_main_process():
-            logger.info(f"Filtered combined data: {n} -> {len(varied_indices)} samples")
+        logger.info("\nFinal cascade evaluation on val (unfiltered)...")
 
     final_cascade_acc, final_thresholds, final_detailed = eval_cascade_on_val(
-        model, combined_data, tokenizer, args.max_length, device
+        model, val_data, tokenizer, args.max_length, device
     )
     if is_main_process():
-        logger.info(f"Final Cascade Acc: {final_cascade_acc:.4f} (Oracle: {final_detailed['oracle']:.4f})")
+        logger.info(f"Val Cascade Acc: {final_cascade_acc:.4f} (Oracle: {final_detailed['oracle']:.4f})")
 
     if is_main_process():
         logger.info("\n=== Final Results ===")
-        logger.info(f"Best Cascade Accuracy: {best_cascade_acc:.4f}")
-        logger.info(f"Best Thresholds: {best_thresholds}")
+        logger.info(f"Val Cascade Accuracy: {final_cascade_acc:.4f}")
+        logger.info(f"Thresholds: {final_thresholds}")
 
         results = {
             'method': 'mlp_frozen',
             'subset': args.subset,
             'n_train': n_train,
             'n_val': n_val,
-            'best_cascade_acc': float(best_cascade_acc),
+            'best_cascade_acc': float(final_cascade_acc),
             'best_thresholds': final_thresholds,
             'oracle_acc': final_detailed['oracle'],
             'per_stage_auc': final_detailed['auc'],

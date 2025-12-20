@@ -503,7 +503,7 @@ def main():
         logger.info(f"Train: {len(train_data[TOKEN_LEVELS[0]])} samples")
         logger.info(f"Val: {len(val_data[TOKEN_LEVELS[0]])} samples")
 
-    # Filter uniform samples
+    # Filter uniform samples (only filter train_data, keep val_data unfiltered for evaluation)
     if not args.no_filter:
         def filter_varied(data):
             n = len(data[TOKEN_LEVELS[0]])
@@ -519,9 +519,9 @@ def main():
             return filtered
 
         train_data = filter_varied(train_data)
-        val_data = filter_varied(val_data)
+        # val_data stays unfiltered for consistent evaluation
         if is_main_process():
-            logger.info(f"After filtering: Train={len(train_data[TOKEN_LEVELS[0]])}, Val={len(val_data[TOKEN_LEVELS[0]])}")
+            logger.info(f"After filtering train: {len(train_data[TOKEN_LEVELS[0]])} samples (val unfiltered: {len(val_data[TOKEN_LEVELS[0]])})")
 
     # For DDP, shard data across processes
     if use_ddp:
@@ -594,14 +594,12 @@ def main():
         logger.info(f"Train Acc: {train_results['train_acc']:.4f}, Train AUC: {train_results['train_auc']:.4f}")
         logger.info(f"Val Acc: {train_results['val_acc']:.4f}, Val AUC: {train_results['val_auc']:.4f}")
 
-        # Cascade evaluation
-        logger.info("Running cascade evaluation...")
-        X_combined = np.vstack([X_train, X_val])
-        y_combined = np.concatenate([y_train, y_val])
+        # Cascade evaluation on val (unfiltered) for consistent comparison
+        logger.info("Running cascade evaluation on val (unfiltered)...")
 
-        cascade_acc, thresholds, detailed = eval_cascade(clf, scaler, X_combined, y_combined)
+        cascade_acc, thresholds, detailed = eval_cascade(clf, scaler, X_val, y_val)
 
-        logger.info(f"Cascade Accuracy: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
+        logger.info(f"Val Cascade Accuracy: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
         logger.info(f"Thresholds: {thresholds}")
 
         auc_str = ", ".join([f"T{t}={detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
