@@ -37,6 +37,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Global variable to hold memory lock tensors (prevent garbage collection)
+_memory_lock_tensors = {}
+
 TOKEN_LEVELS = [0, 100, 500, 1000]
 
 SUBSETS = [
@@ -450,6 +453,36 @@ def main():
     else:
         device = args.device
 
+    # Lock GPU memory EARLY (before model loading) to prevent other processes from grabbing it
+    # The memory will be reused by model loading and inference (PyTorch's cache allocator)
+    if args.memory_lock > 0:
+        device_id = local_rank if use_ddp else int(device.split(':')[-1]) if ':' in device else 0
+        total_mem = torch.cuda.get_device_properties(device_id).total_memory
+        target_bytes = int(total_mem * args.memory_lock)
+        # Get actual free memory (considers other processes)
+        free_mem = torch.cuda.mem_get_info(device_id)[0]
+        # Leave 2GB buffer for model loading and system
+        buffer = 2 * 1024**3
+        max_allocatable = free_mem - buffer
+        fill_bytes = min(target_bytes, max_allocatable)
+        
+        if fill_bytes > 0:
+            fill_elements = fill_bytes // 4  # float32 = 4 bytes
+            # Allocate tensor and KEEP the reference (don't delete!)
+            # Store in global dict to prevent garbage collection
+            lock_tensor = torch.empty(fill_elements, dtype=torch.float32, device=device)
+            _memory_lock_tensors[device_id] = lock_tensor  # Keep reference alive
+            
+            if is_main_process():
+                allocated_gb = torch.cuda.memory_allocated(device_id) / 1024**3
+                reserved_gb = torch.cuda.memory_reserved(device_id) / 1024**3
+                total_gb = total_mem / 1024**3
+                logger.info(f"[EARLY] Memory locked: {allocated_gb:.1f} GB allocated, {reserved_gb:.1f} GB reserved / {total_gb:.1f} GB total (target: {args.memory_lock*100:.0f}%)")
+                logger.info(f"  Lock tensor size: {fill_bytes/1024**3:.2f} GB (will be reused during model loading and inference)")
+        else:
+            if is_main_process():
+                logger.warning(f"Not enough free memory to lock (free: {free_mem/1024**3:.1f} GB, need at least {buffer/1024**3:.1f} GB buffer)")
+
     # Pre-allocate GPU memory if requested (will be released after model loading)
     _reserved_memory = None
     if args.reserve_memory > 0:
@@ -497,33 +530,17 @@ def main():
         if is_main_process():
             logger.info("Released pre-allocated GPU memory")
 
-    # Lock GPU memory using vLLM-style approach:
-    # Pre-allocate memory to target fraction, then release tensor (but don't empty cache)
-    # This keeps memory in PyTorch's caching allocator, preventing other processes from grabbing it
-    # while allowing our inference to reuse it
-    if args.memory_lock > 0:
+    # Show final memory status after model loading
+    if args.memory_lock > 0 and is_main_process():
         device_id = local_rank if use_ddp else int(device.split(':')[-1]) if ':' in device else 0
+        allocated_gb = torch.cuda.memory_allocated(device_id) / 1024**3
+        reserved_gb = torch.cuda.memory_reserved(device_id) / 1024**3
         total_mem = torch.cuda.get_device_properties(device_id).total_memory
-        target_bytes = int(total_mem * args.memory_lock)
-        current_reserved = torch.cuda.memory_reserved(device_id)
-        # Get actual free memory (considers other processes)
-        free_mem = torch.cuda.mem_get_info(device_id)[0]
-        # Only allocate up to available, leave 1GB buffer
-        buffer = 1 * 1024**3
-        max_allocatable = free_mem - buffer
-        fill_bytes = min(target_bytes - current_reserved, max_allocatable)
-        if fill_bytes > 0:
-            fill_elements = fill_bytes // 4  # float32 = 4 bytes
-            # Allocate and immediately delete - memory stays in PyTorch's cache
-            _temp = torch.empty(fill_elements, dtype=torch.float32, device=device)
-            del _temp  # Don't call empty_cache() - memory stays reserved
-            if is_main_process():
-                reserved_gb = torch.cuda.memory_reserved(device_id) / 1024**3
-                total_gb = total_mem / 1024**3
-                logger.info(f"Memory reserved (vLLM-style): {reserved_gb:.1f} GB / {total_gb:.1f} GB (target: {args.memory_lock*100:.0f}%)")
-        else:
-            if is_main_process():
-                logger.info(f"Not enough free memory to reserve more (free: {free_mem/1024**3:.1f} GB, reserved: {current_reserved/1024**3:.1f} GB)")
+        total_gb = total_mem / 1024**3
+        logger.info(f"[AFTER MODEL LOAD] Memory status: {allocated_gb:.1f} GB allocated, {reserved_gb:.1f} GB reserved / {total_gb:.1f} GB total")
+        if device_id in _memory_lock_tensors:
+            lock_size = _memory_lock_tensors[device_id].numel() * 4 / 1024**3
+            logger.info(f"  Lock tensor still held: {lock_size:.2f} GB (prevents other processes from using this memory)")
 
     # Load data
     train_data = load_json_data(subset_dir, split="train")
