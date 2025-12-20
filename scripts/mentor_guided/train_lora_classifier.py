@@ -757,6 +757,9 @@ def main():
             'best_cascade_acc': float(best_cascade_acc),
             'final_cascade_acc': float(final_cascade_acc),
             'best_thresholds': final_thresholds,  # Use thresholds from train+val
+            'oracle_acc': final_detailed['oracle'],
+            'per_stage_auc': final_detailed['auc'],
+            'per_stage_baseline_acc': final_detailed['baseline'],
             'world_size': world_size,
             'args': vars(args),
         }

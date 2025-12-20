@@ -672,6 +672,9 @@ def main():
             'n_val': n_val,
             'best_cascade_acc': float(best_cascade_acc),
             'best_thresholds': best_thresholds,
+            'oracle_acc': detailed['oracle'],
+            'per_stage_auc': detailed['auc'],
+            'per_stage_baseline_acc': detailed['baseline'],
             'args': vars(args),
         }
         with open(os.path.join(args.output_dir, "results.json"), 'w') as f:

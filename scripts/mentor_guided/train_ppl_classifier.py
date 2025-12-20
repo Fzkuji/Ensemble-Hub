@@ -618,11 +618,11 @@ def main():
             'val_acc': train_results['val_acc'],
             'train_auc': train_results['train_auc'],
             'val_auc': train_results['val_auc'],
-            'cascade_acc': cascade_acc,
+            'best_cascade_acc': cascade_acc,
             'best_thresholds': thresholds,
-            'oracle': detailed['oracle'],
+            'oracle_acc': detailed['oracle'],
             'per_stage_auc': detailed['auc'],
-            'per_stage_baseline': detailed['baseline'],
+            'per_stage_baseline_acc': detailed['baseline'],
         }
 
         results_path = os.path.join(args.output_dir, "results.json")

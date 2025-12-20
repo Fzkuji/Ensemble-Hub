@@ -148,22 +148,22 @@ def get_results(subset, model_type):
     return None
 
 def get_cascade_acc(r):
-    """Get cascade accuracy with fallback field names."""
+    """Get cascade accuracy."""
     if not r:
         return None
-    return r.get('best_cascade_acc', r.get('cascade_acc', r.get('cascade_accuracy')))
+    return r.get('best_cascade_acc')
 
 def get_oracle(r):
-    """Get oracle accuracy with fallback field names."""
+    """Get oracle accuracy."""
     if not r:
         return None
-    return r.get('oracle_acc', r.get('oracle'))
+    return r.get('oracle_acc')
 
 def get_baseline(r):
-    """Get per-stage baseline with fallback field names."""
+    """Get per-stage baseline."""
     if not r:
         return None
-    return r.get('per_stage_baseline_acc', r.get('per_stage_baseline'))
+    return r.get('per_stage_baseline_acc')
 
 print()
 print("=" * 100)
