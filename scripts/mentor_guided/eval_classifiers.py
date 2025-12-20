@@ -22,6 +22,25 @@ SUBSETS = ["algebra", "counting_and_probability", "geometry",
            "intermediate_algebra", "number_theory", "prealgebra", "precalculus"]
 
 
+class MentorClassifierHead(torch.nn.Module):
+    """Classifier head matching train_lora_classifier.py and train_mlp_classifier.py."""
+
+    def __init__(self, hidden_size: int, num_stages: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.stage_embedding = torch.nn.Embedding(num_stages, 64)
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(hidden_size + 64, 256),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(256, 2),
+        )
+
+    def forward(self, hidden_state: torch.Tensor, stage: torch.Tensor) -> torch.Tensor:
+        stage_embed = self.stage_embedding(stage)
+        x = torch.cat([hidden_state, stage_embed], dim=-1)
+        return self.classifier(x)
+
+
 def load_json_data(data_dir: str, split: str = "train") -> Dict[int, List[Dict]]:
     """Load data from JSON files."""
     split_dir = os.path.join(data_dir, split)
@@ -78,14 +97,9 @@ def eval_cascade_lora(
     # Load classifier head
     checkpoint = torch.load(os.path.join(model_dir, "best_model.pt"), map_location=device)
 
-    # Simple classifier head
+    # Use the correct classifier head architecture
     hidden_size = base_model.config.hidden_size
-    classifier_head = torch.nn.Sequential(
-        torch.nn.Linear(hidden_size + 4, 256),
-        torch.nn.ReLU(),
-        torch.nn.Dropout(0.1),
-        torch.nn.Linear(256, 2),
-    ).to(device)
+    classifier_head = MentorClassifierHead(hidden_size, num_stages=4, dropout=0.1).to(device)
     classifier_head.load_state_dict(checkpoint['classifier'])
     classifier_head.eval()
 
@@ -120,12 +134,9 @@ def eval_cascade_lora(
                     output_hidden_states=True,
                 )
                 hidden = outputs.hidden_states[-1][:, -1, :]
+                stage_tensor = torch.tensor([stage_idx], device=device)
 
-                stage_onehot = torch.zeros(1, 4, device=device)
-                stage_onehot[0, stage_idx] = 1.0
-                combined = torch.cat([hidden, stage_onehot], dim=-1)
-
-                logits = classifier_head(combined)
+                logits = classifier_head(hidden, stage_tensor)
                 prob = torch.softmax(logits, dim=1)[0, 1].item()
 
             all_probs[tokens].append(prob)
@@ -158,16 +169,9 @@ def eval_cascade_mlp(
     # Load classifier head
     checkpoint = torch.load(os.path.join(model_dir, "best_model.pt"), map_location=device)
 
+    # Use the correct classifier head architecture (same as LoRA)
     hidden_size = base_model.config.hidden_size
-    classifier_head = torch.nn.Sequential(
-        torch.nn.Linear(hidden_size + 4, 512),
-        torch.nn.ReLU(),
-        torch.nn.Dropout(0.1),
-        torch.nn.Linear(512, 256),
-        torch.nn.ReLU(),
-        torch.nn.Dropout(0.1),
-        torch.nn.Linear(256, 2),
-    ).to(device)
+    classifier_head = MentorClassifierHead(hidden_size, num_stages=4, dropout=0.1).to(device)
     classifier_head.load_state_dict(checkpoint['classifier'])
     classifier_head.eval()
 
@@ -201,12 +205,9 @@ def eval_cascade_mlp(
                     output_hidden_states=True,
                 )
                 hidden = outputs.hidden_states[-1][:, -1, :]
+                stage_tensor = torch.tensor([stage_idx], device=device)
 
-                stage_onehot = torch.zeros(1, 4, device=device)
-                stage_onehot[0, stage_idx] = 1.0
-                combined = torch.cat([hidden, stage_onehot], dim=-1)
-
-                logits = classifier_head(combined)
+                logits = classifier_head(hidden, stage_tensor)
                 prob = torch.softmax(logits, dim=1)[0, 1].item()
 
             all_probs[tokens].append(prob)
