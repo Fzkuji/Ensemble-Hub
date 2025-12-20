@@ -75,15 +75,32 @@ echo "GPUs: $GPUS (${NUM_GPUS} GPUs)"
 echo "Subsets: ${SUBSETS[*]}"
 echo "============================================================"
 
+# Helper function to check if model already trained
+check_model_exists() {
+    local subset=$1
+    local model_type=$2
+    local result_file="$DATA_DIR/$subset/${model_type}_model/results.json"
+    if [ -f "$result_file" ]; then
+        return 0  # exists
+    else
+        return 1  # not exists
+    fi
+}
+
 # Train LoRA classifiers
 if [ "$SKIP_LORA" = false ]; then
     echo ""
     echo "========== Training LoRA Classifiers =========="
     for subset in "${SUBSETS[@]}"; do
-        echo ""
-        echo ">>> LoRA: $subset"
-        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
-            --ddp --subset $subset --data-dir $DATA_DIR --epochs 3
+        if check_model_exists "$subset" "lora"; then
+            echo ""
+            echo ">>> LoRA: $subset [SKIP - already trained]"
+        else
+            echo ""
+            echo ">>> LoRA: $subset"
+            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
+                --ddp --subset $subset --data-dir $DATA_DIR --epochs 3
+        fi
     done
 else
     echo ""
@@ -95,10 +112,15 @@ if [ "$SKIP_MLP" = false ]; then
     echo ""
     echo "========== Training MLP Classifiers (Frozen LLM) =========="
     for subset in "${SUBSETS[@]}"; do
-        echo ""
-        echo ">>> MLP: $subset"
-        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29506 train_mlp_classifier.py \
-            --ddp --subset $subset --data-dir $DATA_DIR --epochs 10
+        if check_model_exists "$subset" "mlp"; then
+            echo ""
+            echo ">>> MLP: $subset [SKIP - already trained]"
+        else
+            echo ""
+            echo ">>> MLP: $subset"
+            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29506 train_mlp_classifier.py \
+                --ddp --subset $subset --data-dir $DATA_DIR --epochs 10
+        fi
     done
 else
     echo ""
@@ -110,10 +132,15 @@ if [ "$SKIP_PPL" = false ]; then
     echo ""
     echo "========== Training PPL Classifiers (Entropy-based) =========="
     for subset in "${SUBSETS[@]}"; do
-        echo ""
-        echo ">>> PPL: $subset"
-        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
-            --ddp --subset $subset --data-dir $DATA_DIR
+        if check_model_exists "$subset" "ppl"; then
+            echo ""
+            echo ">>> PPL: $subset [SKIP - already trained]"
+        else
+            echo ""
+            echo ">>> PPL: $subset"
+            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
+                --ddp --subset $subset --data-dir $DATA_DIR
+        fi
     done
 else
     echo ""
