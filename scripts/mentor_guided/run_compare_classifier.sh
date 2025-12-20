@@ -11,6 +11,7 @@
 #   --skip-ppl        Skip PPL training (if already done)
 #   --check           Only check file status (no training)
 #   --force           Force re-training even if results exist
+#   --batch-size BS   Batch size for LoRA/MLP training (default: 4)
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,6 +26,7 @@ SKIP_MLP=false
 SKIP_PPL=false
 CHECK_ONLY=false
 FORCE=false
+BATCH_SIZE=4
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -61,6 +63,10 @@ while [[ $# -gt 0 ]]; do
             FORCE=true
             shift
             ;;
+        --batch-size)
+            BATCH_SIZE="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -84,6 +90,7 @@ echo "Classifier Comparison: LoRA vs MLP vs PPL"
 echo "============================================================"
 echo "Data dir: $DATA_DIR"
 echo "GPUs: $GPUS (${NUM_GPUS} GPUs)"
+echo "Batch size: $BATCH_SIZE"
 echo "Subsets: ${SUBSETS[*]}"
 echo "============================================================"
 
@@ -171,7 +178,7 @@ if [ "$SKIP_LORA" = false ]; then
             echo ""
             echo ">>> LoRA: $subset"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --epochs 3
+                --ddp --subset $subset --data-dir $DATA_DIR --epochs 3 --batch-size $BATCH_SIZE
         fi
     done
 else
@@ -191,7 +198,7 @@ if [ "$SKIP_MLP" = false ]; then
             echo ""
             echo ">>> MLP: $subset"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29506 train_mlp_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --epochs 10
+                --ddp --subset $subset --data-dir $DATA_DIR --epochs 10 --batch-size $BATCH_SIZE
         fi
     done
 else
