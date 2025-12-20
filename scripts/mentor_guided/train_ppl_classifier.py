@@ -450,38 +450,35 @@ def main():
 
     if use_ddp:
         device = f"cuda:{local_rank}"
+        device_id = local_rank
     else:
         device = args.device
+        device_id = int(device.split(':')[-1]) if ':' in device else 0
 
-    # Lock GPU memory EARLY (before model loading) to prevent other processes from grabbing it
-    # The memory will be reused by model loading and inference (PyTorch's cache allocator)
+    # Lock GPU memory IMMEDIATELY at script startup (right after setup, before any other operations)
+    # This prevents other processes from grabbing memory while we're still initializing
     if args.memory_lock > 0:
-        device_id = local_rank if use_ddp else int(device.split(':')[-1]) if ':' in device else 0
         total_mem = torch.cuda.get_device_properties(device_id).total_memory
         target_bytes = int(total_mem * args.memory_lock)
-        # Get actual free memory (considers other processes)
         free_mem = torch.cuda.mem_get_info(device_id)[0]
-        # Leave 2GB buffer for model loading and system
         buffer = 2 * 1024**3
         max_allocatable = free_mem - buffer
         fill_bytes = min(target_bytes, max_allocatable)
         
         if fill_bytes > 0:
             fill_elements = fill_bytes // 4  # float32 = 4 bytes
-            # Allocate tensor and KEEP the reference (don't delete!)
-            # Store in global dict to prevent garbage collection
             lock_tensor = torch.empty(fill_elements, dtype=torch.float32, device=device)
-            _memory_lock_tensors[device_id] = lock_tensor  # Keep reference alive
+            del lock_tensor  # Keep memory in cache, don't call empty_cache()
+            _memory_lock_tensors[device_id] = True
             
+            total_gb = total_mem / 1024**3
+            reserved_gb = torch.cuda.memory_reserved(device_id) / 1024**3
             if is_main_process():
-                allocated_gb = torch.cuda.memory_allocated(device_id) / 1024**3
-                reserved_gb = torch.cuda.memory_reserved(device_id) / 1024**3
-                total_gb = total_mem / 1024**3
-                logger.info(f"[EARLY] Memory locked: {allocated_gb:.1f} GB allocated, {reserved_gb:.1f} GB reserved / {total_gb:.1f} GB total (target: {args.memory_lock*100:.0f}%)")
-                logger.info(f"  Lock tensor size: {fill_bytes/1024**3:.2f} GB (will be reused during model loading and inference)")
+                logger.info(f"[SCRIPT START] Memory locked immediately: {reserved_gb:.1f} GB reserved / {total_gb:.1f} GB total (target: {args.memory_lock*100:.0f}%)")
+                logger.info(f"  Locked {fill_bytes/1024**3:.2f} GB in PyTorch cache (prevents other processes, reusable by inference)")
         else:
             if is_main_process():
-                logger.warning(f"Not enough free memory to lock (free: {free_mem/1024**3:.1f} GB, need at least {buffer/1024**3:.1f} GB buffer)")
+                logger.warning(f"Not enough free memory to lock at startup (free: {free_mem/1024**3:.1f} GB)")
 
     # Pre-allocate GPU memory if requested (will be released after model loading)
     _reserved_memory = None
@@ -539,8 +536,8 @@ def main():
         total_gb = total_mem / 1024**3
         logger.info(f"[AFTER MODEL LOAD] Memory status: {allocated_gb:.1f} GB allocated, {reserved_gb:.1f} GB reserved / {total_gb:.1f} GB total")
         if device_id in _memory_lock_tensors:
-            lock_size = _memory_lock_tensors[device_id].numel() * 4 / 1024**3
-            logger.info(f"  Lock tensor still held: {lock_size:.2f} GB (prevents other processes from using this memory)")
+            logger.info(f"  Memory lock active: Reserved memory prevents other processes from using it")
+            logger.info(f"  Inference can reuse cached memory blocks via PyTorch's cache allocator")
 
     # Load data
     train_data = load_json_data(subset_dir, split="train")
