@@ -103,7 +103,65 @@ echo "============================================================"
 echo "Data dir: $DATA_DIR"
 echo "GPUs: $GPUS (${NUM_GPUS} GPUs)"
 echo "Batch size: $BATCH_SIZE"
+echo "Memory lock: $MEMORY_LOCK"
 echo "Subsets: ${SUBSETS[*]}"
+echo "============================================================"
+
+# Show GPU memory status
+echo ""
+echo "========== GPU Memory Status =========="
+python3 << GPUEOF
+import torch
+
+gpus = "$GPUS".split(',')
+print(f"{'GPU':<6} {'Name':<25} {'Total':>10} {'Used':>10} {'Free':>10}")
+print("-" * 65)
+
+for gpu_str in gpus:
+    gpu_id = int(gpu_str)
+    if gpu_id >= torch.cuda.device_count():
+        print(f"{gpu_id:<6} {'Not available':<25}")
+        continue
+
+    props = torch.cuda.get_device_properties(gpu_id)
+    total = props.total_memory / 1024**3
+    # Get current usage (from nvidia-smi perspective)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits', '-i', str(gpu_id)],
+            capture_output=True, text=True
+        )
+        used = float(result.stdout.strip()) / 1024  # MB to GB
+    except:
+        used = 0
+    free = total - used
+
+    status = ""
+    # 7B bf16 model needs ~14GB, LoRA training needs ~18GB total
+    if free < 18:
+        status = " <- May OOM for LoRA"
+    elif free < 20:
+        status = " <- Tight for LoRA"
+
+    print(f"{gpu_id:<6} {props.name[:25]:<25} {total:>9.1f}G {used:>9.1f}G {free:>9.1f}G{status}")
+
+print("-" * 65)
+print("Note: 7B bf16 model needs ~14GB, LoRA training needs ~18-20GB total")
+
+# Check memory lock setting
+memory_lock = float("$MEMORY_LOCK") if "$MEMORY_LOCK" else 0
+if memory_lock > 0:
+    print(f"\nMemory lock: {memory_lock*100:.0f}%")
+    for gpu_str in gpus[:1]:  # Just check first GPU
+        gpu_id = int(gpu_str)
+        if gpu_id < torch.cuda.device_count():
+            total = torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3
+            locked = total * memory_lock
+            print(f"  GPU {gpu_id}: Will lock {locked:.1f}GB / {total:.1f}GB")
+            if locked < 18:
+                print(f"  WARNING: {locked:.1f}GB may not be enough for LoRA training (needs ~18-20GB)")
+GPUEOF
 echo "============================================================"
 
 # Helper function to check if model already trained
