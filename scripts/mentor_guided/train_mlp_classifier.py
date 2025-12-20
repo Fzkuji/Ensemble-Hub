@@ -660,6 +660,37 @@ def main():
         classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
         torch.save({'classifier': classifier_state}, os.path.join(args.output_dir, "last_model.pt"))
 
+    # Final cascade evaluation on filtered combined train+val (for consistent oracle)
+    if is_main_process():
+        logger.info("\nFinal cascade evaluation on combined filtered data...")
+    combined_data = {}
+    for tokens in TOKEN_LEVELS:
+        if tokens in train_data and tokens in val_data:
+            combined_data[tokens] = train_data[tokens] + val_data[tokens]
+
+    # Apply same filtering as training (if filter_uniform was True)
+    if filter_uniform:
+        n = len(combined_data[TOKEN_LEVELS[0]])
+        varied_indices = []
+        for i in range(n):
+            labels = [1 if combined_data[tokens][i].get('is_correct', False) else 0
+                      for tokens in TOKEN_LEVELS if tokens in combined_data]
+            if not (all(l == 1 for l in labels) or all(l == 0 for l in labels)):
+                varied_indices.append(i)
+        filtered_combined = {}
+        for tokens in TOKEN_LEVELS:
+            if tokens in combined_data:
+                filtered_combined[tokens] = [combined_data[tokens][i] for i in varied_indices]
+        combined_data = filtered_combined
+        if is_main_process():
+            logger.info(f"Filtered combined data: {n} -> {len(varied_indices)} samples")
+
+    final_cascade_acc, final_thresholds, final_detailed = eval_cascade_on_val(
+        model, combined_data, tokenizer, args.max_length, device
+    )
+    if is_main_process():
+        logger.info(f"Final Cascade Acc: {final_cascade_acc:.4f} (Oracle: {final_detailed['oracle']:.4f})")
+
     if is_main_process():
         logger.info("\n=== Final Results ===")
         logger.info(f"Best Cascade Accuracy: {best_cascade_acc:.4f}")
@@ -671,10 +702,10 @@ def main():
             'n_train': n_train,
             'n_val': n_val,
             'best_cascade_acc': float(best_cascade_acc),
-            'best_thresholds': best_thresholds,
-            'oracle_acc': detailed['oracle'],
-            'per_stage_auc': detailed['auc'],
-            'per_stage_baseline_acc': detailed['baseline'],
+            'best_thresholds': final_thresholds,
+            'oracle_acc': final_detailed['oracle'],
+            'per_stage_auc': final_detailed['auc'],
+            'per_stage_baseline_acc': final_detailed['baseline'],
             'args': vars(args),
         }
         with open(os.path.join(args.output_dir, "results.json"), 'w') as f:

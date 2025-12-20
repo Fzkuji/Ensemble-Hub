@@ -714,6 +714,23 @@ def main():
         if tokens in train_data and tokens in val_data:
             combined_data[tokens] = train_data[tokens] + val_data[tokens]
 
+    # Apply same filtering as training (if filter_uniform was True)
+    if filter_uniform:
+        n = len(combined_data[TOKEN_LEVELS[0]])
+        varied_indices = []
+        for i in range(n):
+            labels = [1 if combined_data[tokens][i].get('is_correct', False) else 0
+                      for tokens in TOKEN_LEVELS if tokens in combined_data]
+            if not (all(l == 1 for l in labels) or all(l == 0 for l in labels)):
+                varied_indices.append(i)
+        filtered_combined = {}
+        for tokens in TOKEN_LEVELS:
+            if tokens in combined_data:
+                filtered_combined[tokens] = [combined_data[tokens][i] for i in varied_indices]
+        combined_data = filtered_combined
+        if is_main_process():
+            logger.info(f"Filtered combined data: {n} -> {len(varied_indices)} samples")
+
     final_cascade_acc, final_thresholds, final_detailed = eval_cascade_on_val(
         model, combined_data, tokenizer, args.max_length, device
     )
