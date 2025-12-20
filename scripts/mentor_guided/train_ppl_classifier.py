@@ -448,14 +448,14 @@ def main():
     else:
         device = args.device
 
-    # Pre-allocate GPU memory if requested
+    # Pre-allocate GPU memory if requested (will be released after model loading)
     _reserved_memory = None
     if args.reserve_memory > 0:
         reserve_bytes = int(args.reserve_memory * 1024**3)
         reserve_elements = reserve_bytes // 4  # float32 = 4 bytes
         _reserved_memory = torch.empty(reserve_elements, dtype=torch.float32, device=device)
         if is_main_process():
-            logger.info(f"Reserved {args.reserve_memory:.1f} GB GPU memory on {device}")
+            logger.info(f"Pre-allocated {args.reserve_memory:.1f} GB GPU memory on {device} (will release after model load)")
 
     subset_dir = os.path.join(args.data_dir, args.subset)
     if not os.path.exists(subset_dir):
@@ -487,6 +487,13 @@ def main():
         torch_dtype=torch.bfloat16,
     ).to(device)
     model.eval()
+
+    # Release pre-allocated memory now that model is loaded
+    if _reserved_memory is not None:
+        del _reserved_memory
+        torch.cuda.empty_cache()
+        if is_main_process():
+            logger.info("Released pre-allocated GPU memory")
 
     # Load data
     train_data = load_json_data(subset_dir, split="train")
