@@ -588,8 +588,12 @@ def main():
         total_mem = torch.cuda.get_device_properties(device_id).total_memory
         target_bytes = int(total_mem * args.memory_lock)
         current_reserved = torch.cuda.memory_reserved(device_id)
-        # Calculate how much more to reserve
-        fill_bytes = target_bytes - current_reserved
+        # Get actual free memory (considers other processes)
+        free_mem = torch.cuda.mem_get_info(device_id)[0]
+        # Only allocate up to available, leave 1GB buffer
+        buffer = 1 * 1024**3
+        max_allocatable = free_mem - buffer
+        fill_bytes = min(target_bytes - current_reserved, max_allocatable)
         if fill_bytes > 0:
             fill_elements = fill_bytes // 4  # float32 = 4 bytes
             # Allocate and immediately delete - memory stays in PyTorch's cache
@@ -598,10 +602,10 @@ def main():
             if is_main_process():
                 reserved_gb = torch.cuda.memory_reserved(device_id) / 1024**3
                 total_gb = total_mem / 1024**3
-                logger.info(f"Memory reserved (vLLM-style): {reserved_gb:.1f} GB / {total_gb:.1f} GB ({args.memory_lock*100:.0f}% target)")
+                logger.info(f"Memory reserved (vLLM-style): {reserved_gb:.1f} GB / {total_gb:.1f} GB (target: {args.memory_lock*100:.0f}%)")
         else:
             if is_main_process():
-                logger.info(f"Already reserved {current_reserved/1024**3:.1f} GB, no additional reservation needed")
+                logger.info(f"Not enough free memory to reserve more (free: {free_mem/1024**3:.1f} GB, reserved: {current_reserved/1024**3:.1f} GB)")
 
     # Create datasets (filter train only, keep val unfiltered for consistent evaluation)
     filter_uniform = not args.no_filter
