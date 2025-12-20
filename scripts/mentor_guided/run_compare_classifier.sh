@@ -9,6 +9,7 @@
 #   --skip-lora       Skip LoRA training (if already done)
 #   --skip-mlp        Skip MLP training (if already done)
 #   --skip-ppl        Skip PPL training (if already done)
+#   --check           Only check file status (no training)
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +22,7 @@ SUBSET=""
 SKIP_LORA=false
 SKIP_MLP=false
 SKIP_PPL=false
+CHECK_ONLY=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -47,6 +49,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-ppl)
             SKIP_PPL=true
+            shift
+            ;;
+        --check)
+            CHECK_ONLY=true
             shift
             ;;
         *)
@@ -86,6 +92,62 @@ check_model_exists() {
         return 1  # not exists
     fi
 }
+
+# Check-only mode: show file status and results
+if [ "$CHECK_ONLY" = true ]; then
+    echo ""
+    echo "========== FILE STATUS =========="
+    printf "%-25s %-10s %-10s %-10s\n" "Subset" "LoRA" "MLP" "PPL"
+    echo "------------------------------------------------------------"
+    for subset in "${SUBSETS[@]}"; do
+        lora_status="-"
+        mlp_status="-"
+        ppl_status="-"
+        [ -f "$DATA_DIR/$subset/lora_model/results.json" ] && lora_status="OK"
+        [ -f "$DATA_DIR/$subset/mlp_model/results.json" ] && mlp_status="OK"
+        [ -f "$DATA_DIR/$subset/ppl_model/results.json" ] && ppl_status="OK"
+        printf "%-25s %-10s %-10s %-10s\n" "$subset" "$lora_status" "$mlp_status" "$ppl_status"
+    done
+    echo "============================================================"
+
+    # Show results comparison
+    echo ""
+    echo "========== CASCADE ACCURACY =========="
+    python3 << PYEOF
+import json
+import os
+
+data_dir = "$DATA_DIR"
+subsets = "${SUBSETS[*]}".split()
+
+print(f"{'Subset':<25} {'LoRA':>10} {'MLP':>10} {'PPL':>10} {'Oracle':>10} {'Best':>10}")
+print("-" * 75)
+
+for subset in subsets:
+    row = {"lora": "-", "mlp": "-", "ppl": "-", "oracle": "-"}
+    best_val, best_name = 0, "-"
+
+    for m in ["lora", "mlp", "ppl"]:
+        path = f"{data_dir}/{subset}/{m}_model/results.json"
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    r = json.load(f)
+                acc = r.get('best_cascade_acc', 0)
+                row[m] = f"{acc:.4f}"
+                if row["oracle"] == "-" and 'oracle_acc' in r:
+                    row["oracle"] = f"{r['oracle_acc']:.4f}"
+                if acc > best_val:
+                    best_val, best_name = acc, m.upper()
+            except:
+                pass
+
+    print(f"{subset:<25} {row['lora']:>10} {row['mlp']:>10} {row['ppl']:>10} {row['oracle']:>10} {best_name:>10}")
+
+print("-" * 75)
+PYEOF
+    exit 0
+fi
 
 # Train LoRA classifiers
 if [ "$SKIP_LORA" = false ]; then
