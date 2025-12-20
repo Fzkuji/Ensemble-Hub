@@ -10,6 +10,7 @@
 #   --skip-mlp        Skip MLP training (if already done)
 #   --skip-ppl        Skip PPL training (if already done)
 #   --check           Only check file status (no training)
+#   --force           Force re-training even if results exist
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +24,7 @@ SKIP_LORA=false
 SKIP_MLP=false
 SKIP_PPL=false
 CHECK_ONLY=false
+FORCE=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -55,6 +57,10 @@ while [[ $# -gt 0 ]]; do
             CHECK_ONLY=true
             shift
             ;;
+        --force)
+            FORCE=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -85,6 +91,10 @@ echo "============================================================"
 check_model_exists() {
     local subset=$1
     local model_type=$2
+    # If --force, always return "not exists" to force retraining
+    if [ "$FORCE" = true ]; then
+        return 1
+    fi
     local result_file="$DATA_DIR/$subset/${model_type}_model/results.json"
     if [ -f "$result_file" ]; then
         return 0  # exists
