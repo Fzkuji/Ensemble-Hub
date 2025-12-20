@@ -435,7 +435,9 @@ def main():
     parser.add_argument("--max-length", type=int, default=1024)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--reserve-memory", type=float, default=0,
-                        help="Pre-allocate GPU memory in GB to prevent others from using it")
+                        help="Pre-allocate GPU memory in GB to prevent others from using it (released after model load)")
+    parser.add_argument("--memory-lock", type=float, default=0,
+                        help="Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%%). Keeps memory occupied throughout training.")
 
     args = parser.parse_args()
 
@@ -494,6 +496,28 @@ def main():
         torch.cuda.empty_cache()
         if is_main_process():
             logger.info("Released pre-allocated GPU memory")
+
+    # Lock GPU memory at target fraction (prevents other processes from using it)
+    # This allocates a filler tensor to occupy remaining memory up to target fraction
+    _memory_lock_tensor = None
+    if args.memory_lock > 0:
+        device_id = local_rank if use_ddp else int(device.split(':')[-1]) if ':' in device else 0
+        total_mem = torch.cuda.get_device_properties(device_id).total_memory
+        target_bytes = int(total_mem * args.memory_lock)
+        current_allocated = torch.cuda.memory_allocated(device_id)
+        # Leave some buffer (500MB) for temporary allocations during inference
+        buffer_bytes = 500 * 1024 * 1024
+        fill_bytes = target_bytes - current_allocated - buffer_bytes
+        if fill_bytes > 0:
+            fill_elements = fill_bytes // 4  # float32 = 4 bytes
+            _memory_lock_tensor = torch.empty(fill_elements, dtype=torch.float32, device=device)
+            if is_main_process():
+                locked_gb = (current_allocated + fill_bytes) / 1024**3
+                total_gb = total_mem / 1024**3
+                logger.info(f"Memory locked: {locked_gb:.1f} GB / {total_gb:.1f} GB ({args.memory_lock*100:.0f}% target) on {device}")
+        else:
+            if is_main_process():
+                logger.info(f"Model already uses {current_allocated/1024**3:.1f} GB, no additional locking needed")
 
     # Load data
     train_data = load_json_data(subset_dir, split="train")

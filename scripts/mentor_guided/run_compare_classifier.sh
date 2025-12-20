@@ -12,7 +12,8 @@
 #   --check           Only check file status (no training)
 #   --force           Force re-training even if results exist
 #   --batch-size BS   Batch size for LoRA/MLP training (default: 4)
-#   --reserve-memory GB  Pre-allocate GPU memory to prevent others from using it
+#   --reserve-memory GB  Pre-allocate GPU memory to prevent others from using it (released after model load)
+#   --memory-lock FRAC   Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%). Keeps memory occupied throughout training.
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,6 +30,7 @@ CHECK_ONLY=false
 FORCE=false
 BATCH_SIZE=4
 RESERVE_MEMORY=0
+MEMORY_LOCK=0
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -71,6 +73,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --reserve-memory)
             RESERVE_MEMORY="$2"
+            shift 2
+            ;;
+        --memory-lock)
+            MEMORY_LOCK="$2"
             shift 2
             ;;
         *)
@@ -184,7 +190,7 @@ if [ "$SKIP_LORA" = false ]; then
             echo ""
             echo ">>> LoRA: $subset"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --epochs 3 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY
+                --ddp --subset $subset --data-dir $DATA_DIR --epochs 3 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
         fi
     done
 else
@@ -204,7 +210,7 @@ if [ "$SKIP_MLP" = false ]; then
             echo ""
             echo ">>> MLP: $subset"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29506 train_mlp_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --epochs 10 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY
+                --ddp --subset $subset --data-dir $DATA_DIR --epochs 10 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
         fi
     done
 else
@@ -224,7 +230,7 @@ if [ "$SKIP_PPL" = false ]; then
             echo ""
             echo ">>> PPL: $subset"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --reserve-memory $RESERVE_MEMORY
+                --ddp --subset $subset --data-dir $DATA_DIR --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
         fi
     done
 else
