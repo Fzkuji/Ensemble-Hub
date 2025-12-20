@@ -654,17 +654,46 @@ def main():
         if is_main_process():
             logger.info("Released pre-allocated GPU memory")
     
-    # Show final memory status after model loading
-    if args.memory_lock > 0 and is_main_process():
+    # After model loading: if training uses more memory than locked, lock the additional memory too
+    # This ensures all memory used by training is locked and won't be released
+    if args.memory_lock > 0:
         device_id = local_rank if use_ddp else int(device.split(':')[-1]) if ':' in device else 0
-        allocated_gb = torch.cuda.memory_allocated(device_id) / 1024**3
-        reserved_gb = torch.cuda.memory_reserved(device_id) / 1024**3
         total_mem = torch.cuda.get_device_properties(device_id).total_memory
-        total_gb = total_mem / 1024**3
-        logger.info(f"[AFTER MODEL LOAD] Memory status: {allocated_gb:.1f} GB allocated, {reserved_gb:.1f} GB reserved / {total_gb:.1f} GB total")
-        if device_id in _memory_lock_tensors:
-            logger.info(f"  Memory lock active: Reserved memory prevents other processes from using it")
-            logger.info(f"  Training can reuse cached memory blocks via PyTorch's cache allocator")
+        initial_target_bytes = int(total_mem * args.memory_lock)
+        
+        # Check actual reserved memory after model loading
+        current_reserved = torch.cuda.memory_reserved(device_id)
+        free_mem = torch.cuda.mem_get_info(device_id)[0]
+        
+        # If training uses more than initial lock, lock the additional memory too
+        if current_reserved > initial_target_bytes:
+            # Calculate how much additional memory to lock
+            additional_needed = current_reserved - initial_target_bytes
+            # Lock up to available free memory (leave 500MB buffer)
+            buffer = 500 * 1024 * 1024
+            max_additional = free_mem - buffer
+            additional_lock_bytes = min(additional_needed, max_additional)
+            
+            if additional_lock_bytes > 0:
+                additional_elements = additional_lock_bytes // 4  # float32 = 4 bytes
+                additional_tensor = torch.empty(additional_elements, dtype=torch.float32, device=device)
+                del additional_tensor  # Keep in cache, don't call empty_cache()
+                
+                if is_main_process():
+                    final_reserved = torch.cuda.memory_reserved(device_id)
+                    total_gb = total_mem / 1024**3
+                    logger.info(f"[AFTER MODEL LOAD] Training uses more memory than initial lock")
+                    logger.info(f"  Initial lock: {initial_target_bytes/1024**3:.2f} GB, Actual used: {current_reserved/1024**3:.2f} GB")
+                    logger.info(f"  Additional {additional_lock_bytes/1024**3:.2f} GB locked to prevent release")
+                    logger.info(f"  Total locked: {final_reserved/1024**3:.2f} GB / {total_gb:.1f} GB (all memory will be kept)")
+        
+        if is_main_process():
+            allocated_gb = torch.cuda.memory_allocated(device_id) / 1024**3
+            reserved_gb = torch.cuda.memory_reserved(device_id) / 1024**3
+            total_gb = total_mem / 1024**3
+            logger.info(f"[AFTER MODEL LOAD] Memory status: {allocated_gb:.1f} GB allocated, {reserved_gb:.1f} GB reserved / {total_gb:.1f} GB total")
+            if device_id in _memory_lock_tensors:
+                logger.info(f"  All used memory is locked and will not be released")
 
     # Create datasets (filter train only, keep val unfiltered for consistent evaluation)
     filter_uniform = not args.no_filter
