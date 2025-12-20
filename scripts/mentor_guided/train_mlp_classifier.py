@@ -442,6 +442,8 @@ def main():
                         help="Don't filter out all-correct/all-wrong samples")
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--val-ratio", type=float, default=0.3)
+    parser.add_argument("--reserve-memory", type=float, default=0,
+                        help="Pre-allocate GPU memory in GB to prevent others from using it")
 
     args = parser.parse_args()
 
@@ -452,6 +454,15 @@ def main():
         device = f"cuda:{local_rank}"
     else:
         device = args.device
+
+    # Pre-allocate GPU memory if requested
+    _reserved_memory = None
+    if args.reserve_memory > 0:
+        reserve_bytes = int(args.reserve_memory * 1024**3)
+        reserve_elements = reserve_bytes // 4  # float32 = 4 bytes
+        _reserved_memory = torch.empty(reserve_elements, dtype=torch.float32, device=device)
+        if is_main_process():
+            logger.info(f"Reserved {args.reserve_memory:.1f} GB GPU memory on {device}")
 
     if args.subset == "all":
         subset_dir = os.path.join(args.data_dir, "all")

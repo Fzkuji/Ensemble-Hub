@@ -12,6 +12,7 @@
 #   --check           Only check file status (no training)
 #   --force           Force re-training even if results exist
 #   --batch-size BS   Batch size for LoRA/MLP training (default: 4)
+#   --reserve-memory GB  Pre-allocate GPU memory to prevent others from using it
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +28,7 @@ SKIP_PPL=false
 CHECK_ONLY=false
 FORCE=false
 BATCH_SIZE=4
+RESERVE_MEMORY=0
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -65,6 +67,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --batch-size)
             BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --reserve-memory)
+            RESERVE_MEMORY="$2"
             shift 2
             ;;
         *)
@@ -178,7 +184,7 @@ if [ "$SKIP_LORA" = false ]; then
             echo ""
             echo ">>> LoRA: $subset"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --epochs 3 --batch-size $BATCH_SIZE
+                --ddp --subset $subset --data-dir $DATA_DIR --epochs 3 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY
         fi
     done
 else
@@ -198,7 +204,7 @@ if [ "$SKIP_MLP" = false ]; then
             echo ""
             echo ">>> MLP: $subset"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29506 train_mlp_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --epochs 10 --batch-size $BATCH_SIZE
+                --ddp --subset $subset --data-dir $DATA_DIR --epochs 10 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY
         fi
     done
 else
@@ -218,7 +224,7 @@ if [ "$SKIP_PPL" = false ]; then
             echo ""
             echo ">>> PPL: $subset"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR
+                --ddp --subset $subset --data-dir $DATA_DIR --reserve-memory $RESERVE_MEMORY
         fi
     done
 else
