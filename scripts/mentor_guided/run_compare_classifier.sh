@@ -147,13 +147,23 @@ def get_results(subset, model_type):
             pass
     return None
 
-def compute_avg_tokens(results):
-    """Compute average tokens used based on thresholds and stage distribution."""
-    if not results or 'best_thresholds' not in results:
+def get_cascade_acc(r):
+    """Get cascade accuracy with fallback field names."""
+    if not r:
         return None
-    # This is an approximation - actual would need per-sample data
-    # Just return the cascade accuracy for now, length needs per-sample data
-    return None
+    return r.get('best_cascade_acc', r.get('cascade_acc', r.get('cascade_accuracy')))
+
+def get_oracle(r):
+    """Get oracle accuracy with fallback field names."""
+    if not r:
+        return None
+    return r.get('oracle_acc', r.get('oracle'))
+
+def get_baseline(r):
+    """Get per-stage baseline with fallback field names."""
+    if not r:
+        return None
+    return r.get('per_stage_baseline_acc', r.get('per_stage_baseline'))
 
 print()
 print("=" * 100)
@@ -168,23 +178,26 @@ for subset in subsets:
     mlp = get_results(subset, "mlp")
     ppl = get_results(subset, "ppl")
 
-    lora_acc = f"{lora['best_cascade_acc']:.4f}" if lora and 'best_cascade_acc' in lora else "-"
-    mlp_acc = f"{mlp['best_cascade_acc']:.4f}" if mlp and 'best_cascade_acc' in mlp else "-"
-    ppl_acc = f"{ppl['best_cascade_acc']:.4f}" if ppl and 'best_cascade_acc' in ppl else "-"
-    oracle = f"{lora['oracle_acc']:.4f}" if lora and 'oracle_acc' in lora else (
-        f"{mlp['oracle_acc']:.4f}" if mlp and 'oracle_acc' in mlp else (
-            f"{ppl['oracle_acc']:.4f}" if ppl and 'oracle_acc' in ppl else "-"
-        )
-    )
+    lora_casc = get_cascade_acc(lora)
+    mlp_casc = get_cascade_acc(mlp)
+    ppl_casc = get_cascade_acc(ppl)
+
+    lora_acc = f"{lora_casc:.4f}" if lora_casc is not None else "-"
+    mlp_acc = f"{mlp_casc:.4f}" if mlp_casc is not None else "-"
+    ppl_acc = f"{ppl_casc:.4f}" if ppl_casc is not None else "-"
+
+    # Get oracle from any available result
+    oracle_val = get_oracle(lora) or get_oracle(mlp) or get_oracle(ppl)
+    oracle = f"{oracle_val:.4f}" if oracle_val is not None else "-"
 
     # Find best
     accs = []
-    if lora and 'best_cascade_acc' in lora:
-        accs.append(('LoRA', lora['best_cascade_acc']))
-    if mlp and 'best_cascade_acc' in mlp:
-        accs.append(('MLP', mlp['best_cascade_acc']))
-    if ppl and 'best_cascade_acc' in ppl:
-        accs.append(('PPL', ppl['best_cascade_acc']))
+    if lora_casc is not None:
+        accs.append(('LoRA', lora_casc))
+    if mlp_casc is not None:
+        accs.append(('MLP', mlp_casc))
+    if ppl_casc is not None:
+        accs.append(('PPL', ppl_casc))
 
     best = max(accs, key=lambda x: x[1])[0] if accs else "-"
 
@@ -195,9 +208,9 @@ for subset in subsets:
 print("-" * 100)
 
 # Compute averages
-lora_accs = [r['lora']['best_cascade_acc'] for r in all_results.values() if r['lora'] and 'best_cascade_acc' in r['lora']]
-mlp_accs = [r['mlp']['best_cascade_acc'] for r in all_results.values() if r['mlp'] and 'best_cascade_acc' in r['mlp']]
-ppl_accs = [r['ppl']['best_cascade_acc'] for r in all_results.values() if r['ppl'] and 'best_cascade_acc' in r['ppl']]
+lora_accs = [get_cascade_acc(r['lora']) for r in all_results.values() if get_cascade_acc(r['lora']) is not None]
+mlp_accs = [get_cascade_acc(r['mlp']) for r in all_results.values() if get_cascade_acc(r['mlp']) is not None]
+ppl_accs = [get_cascade_acc(r['ppl']) for r in all_results.values() if get_cascade_acc(r['ppl']) is not None]
 
 lora_avg = f"{sum(lora_accs)/len(lora_accs):.4f}" if lora_accs else "-"
 mlp_avg = f"{sum(mlp_accs)/len(mlp_accs):.4f}" if mlp_accs else "-"
@@ -259,12 +272,12 @@ for subset in subsets:
     # Try to get from any model's results
     for model_type in ['lora', 'mlp', 'ppl']:
         results = all_results[subset][model_type]
-        if results and 'per_stage_baseline_acc' in results:
-            acc = results['per_stage_baseline_acc']
-            t0 = f"{acc.get('0', acc.get('T0', 0)):.4f}"
-            t100 = f"{acc.get('100', acc.get('T100', 0)):.4f}"
-            t500 = f"{acc.get('500', acc.get('T500', 0)):.4f}"
-            t1000 = f"{acc.get('1000', acc.get('T1000', 0)):.4f}"
+        baseline = get_baseline(results)
+        if baseline:
+            t0 = f"{baseline.get('0', baseline.get('T0', 0)):.4f}"
+            t100 = f"{baseline.get('100', baseline.get('T100', 0)):.4f}"
+            t500 = f"{baseline.get('500', baseline.get('T500', 0)):.4f}"
+            t1000 = f"{baseline.get('1000', baseline.get('T1000', 0)):.4f}"
             print(f"{subset:<25} {t0:>12} {t100:>12} {t500:>12} {t1000:>12}")
             break
     else:
