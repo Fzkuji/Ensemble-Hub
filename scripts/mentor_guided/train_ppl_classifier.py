@@ -570,10 +570,16 @@ def main():
         dist.all_gather_object(X_val_list, X_val)
         dist.all_gather_object(y_val_list, y_val)
 
-        X_train = np.vstack(X_train_list)
-        y_train = np.concatenate(y_train_list)
-        X_val = np.vstack(X_val_list)
-        y_val = np.concatenate(y_val_list)
+        # Filter out empty arrays (some ranks may have no data)
+        X_train_list = [x for x in X_train_list if len(x) > 0]
+        y_train_list = [y for y in y_train_list if len(y) > 0]
+        X_val_list = [x for x in X_val_list if len(x) > 0]
+        y_val_list = [y for y in y_val_list if len(y) > 0]
+
+        X_train = np.vstack(X_train_list) if X_train_list else np.array([])
+        y_train = np.concatenate(y_train_list) if y_train_list else np.array([])
+        X_val = np.vstack(X_val_list) if X_val_list else np.array([])
+        y_val = np.concatenate(y_val_list) if y_val_list else np.array([])
 
     if is_main_process():
         logger.info(f"Train features shape: {X_train.shape}")
