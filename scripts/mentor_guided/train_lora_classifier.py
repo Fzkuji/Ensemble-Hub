@@ -624,27 +624,29 @@ def main():
         if is_main_process():
             logger.info("Released pre-allocated GPU memory")
 
-    # Lock GPU memory at target fraction (prevents other processes from using it)
-    # This allocates a filler tensor to occupy remaining memory up to target fraction
-    _memory_lock_tensor = None
+    # Lock GPU memory using vLLM-style approach:
+    # Pre-allocate memory to target fraction, then release tensor (but don't empty cache)
+    # This keeps memory in PyTorch's caching allocator, preventing other processes from grabbing it
+    # while allowing our training to reuse it
     if args.memory_lock > 0:
         device_id = local_rank if use_ddp else int(device.split(':')[-1]) if ':' in device else 0
         total_mem = torch.cuda.get_device_properties(device_id).total_memory
         target_bytes = int(total_mem * args.memory_lock)
-        current_allocated = torch.cuda.memory_allocated(device_id)
-        # Leave some buffer (500MB) for temporary allocations during training
-        buffer_bytes = 500 * 1024 * 1024
-        fill_bytes = target_bytes - current_allocated - buffer_bytes
+        current_reserved = torch.cuda.memory_reserved(device_id)
+        # Calculate how much more to reserve
+        fill_bytes = target_bytes - current_reserved
         if fill_bytes > 0:
             fill_elements = fill_bytes // 4  # float32 = 4 bytes
-            _memory_lock_tensor = torch.empty(fill_elements, dtype=torch.float32, device=device)
+            # Allocate and immediately delete - memory stays in PyTorch's cache
+            _temp = torch.empty(fill_elements, dtype=torch.float32, device=device)
+            del _temp  # Don't call empty_cache() - memory stays reserved
             if is_main_process():
-                locked_gb = (current_allocated + fill_bytes) / 1024**3
+                reserved_gb = torch.cuda.memory_reserved(device_id) / 1024**3
                 total_gb = total_mem / 1024**3
-                logger.info(f"Memory locked: {locked_gb:.1f} GB / {total_gb:.1f} GB ({args.memory_lock*100:.0f}% target) on {device}")
+                logger.info(f"Memory reserved (vLLM-style): {reserved_gb:.1f} GB / {total_gb:.1f} GB ({args.memory_lock*100:.0f}% target)")
         else:
             if is_main_process():
-                logger.info(f"Model already uses {current_allocated/1024**3:.1f} GB, no additional locking needed")
+                logger.info(f"Already reserved {current_reserved/1024**3:.1f} GB, no additional reservation needed")
 
     # Create datasets (filter train only, keep val unfiltered for consistent evaluation)
     filter_uniform = not args.no_filter
