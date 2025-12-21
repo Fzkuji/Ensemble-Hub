@@ -462,7 +462,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=8,
                         help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--use-4bit", action="store_true",
                         help="Use 4-bit quantization (not compatible with DDP)")
