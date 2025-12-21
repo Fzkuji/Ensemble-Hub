@@ -440,6 +440,97 @@ def eval_cascade_on_val(
     return best_acc, best_thresholds, detailed
 
 
+def eval_cascade_with_thresholds(
+    model,
+    data: Dict[int, List[Dict]],
+    tokenizer,
+    max_length: int,
+    device: str,
+    thresholds: List[float],
+) -> Tuple[float, List[float], Dict]:
+    """
+    Evaluate cascade accuracy with fixed thresholds (no search).
+    Returns accuracy, thresholds (unchanged), detailed_results.
+    """
+    model.eval()
+    n_samples = len(data[TOKEN_LEVELS[0]])
+
+    # Collect predictions for each stage
+    all_probs = {tokens: [] for tokens in TOKEN_LEVELS}
+    gt = {tokens: [] for tokens in TOKEN_LEVELS}
+
+    for i in tqdm(range(n_samples), desc="Test eval", disable=not is_main_process()):
+        for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+            item = data[tokens][i]
+            question = item['question']
+            mentor_response = item.get('mentor_response', '')
+
+            if mentor_response:
+                text = f"Question: {question}\n\nHint: {mentor_response}\n\nAnswer:"
+            else:
+                text = f"Question: {question}\n\nAnswer:"
+
+            encoded = tokenizer(
+                text,
+                truncation=True,
+                max_length=max_length,
+                padding=False,
+                return_tensors="pt",
+            )
+
+            input_ids = encoded['input_ids'].to(device)
+            attention_mask = encoded['attention_mask'].to(device)
+            stages = torch.tensor([stage_idx], device=device)
+
+            with torch.no_grad():
+                logits = model(input_ids, attention_mask, stages)
+                prob = torch.softmax(logits, dim=1)[0, 1].item()
+
+            all_probs[tokens].append(prob)
+            gt[tokens].append(1 if item.get('is_correct', False) else 0)
+
+        if i % 50 == 0:
+            torch.cuda.empty_cache()
+
+    # Compute cascade accuracy with fixed thresholds
+    correct = 0
+    for i in range(n_samples):
+        decided = False
+        stage_probs = []
+        for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+            prob = all_probs[tokens][i]
+            stage_probs.append((tokens, prob))
+            if prob >= thresholds[stage_idx]:
+                correct += gt[tokens][i]
+                decided = True
+                break
+        if not decided:
+            best_tokens, _ = max(stage_probs, key=lambda x: x[1])
+            correct += gt[best_tokens][i]
+    cascade_acc = correct / n_samples
+
+    # Compute oracle
+    oracle_correct = sum(1 for i in range(n_samples)
+                         if any(gt[tokens][i] == 1 for tokens in TOKEN_LEVELS))
+    oracle_acc = oracle_correct / n_samples
+
+    # Compute per-stage AUC
+    stage_auc = {}
+    for tokens in TOKEN_LEVELS:
+        try:
+            stage_auc[tokens] = roc_auc_score(gt[tokens], all_probs[tokens])
+        except ValueError:
+            stage_auc[tokens] = 0.5
+
+    detailed = {
+        'oracle': oracle_acc,
+        'baseline': {tokens: sum(gt[tokens]) / n_samples for tokens in TOKEN_LEVELS},
+        'auc': stage_auc,
+    }
+
+    return cascade_acc, thresholds, detailed
+
+
 def main():
     parser = argparse.ArgumentParser(description="LoRA fine-tuning for mentor classification")
     parser.add_argument("--data-dir", type=str,
@@ -474,6 +565,8 @@ def main():
                         help="Dropout rate for classifier head")
     parser.add_argument("--val-ratio", type=float, default=0.3,
                         help="Validation split ratio from training data (default: 0.3)")
+    parser.add_argument("--no-val", action="store_true",
+                        help="Use entire train set for training, no validation (for final training before test eval)")
     parser.add_argument("--reserve-memory", type=float, default=0,
                         help="Pre-allocate GPU memory in GB to prevent others from using it (released after model load)")
     parser.add_argument("--memory-lock", type=float, default=0,
@@ -567,25 +660,43 @@ def main():
         cleanup_distributed()
         return
 
-    # Split train data into train/val (e.g., 70/30)
-    from sklearn.model_selection import train_test_split as sk_split
+    # Split train data into train/val (e.g., 70/30), or use all for training if --no-val
     n_samples = len(train_data[TOKEN_LEVELS[0]])
-    train_idx, val_idx = sk_split(
-        np.arange(n_samples), test_size=args.val_ratio, random_state=42
-    )
 
-    val_data = {}
-    actual_train_data = {}
-    for tokens in TOKEN_LEVELS:
-        if tokens in train_data:
-            val_data[tokens] = [train_data[tokens][i] for i in val_idx]
-            actual_train_data[tokens] = [train_data[tokens][i] for i in train_idx]
-    train_data = actual_train_data
+    if args.no_val:
+        # Use all train data for training, no validation
+        val_data = None
+        n_train = n_samples
+        n_val = 0
+        if is_main_process():
+            logger.info(f"Using entire train set: {n_train} samples (no validation split)")
+    else:
+        from sklearn.model_selection import train_test_split as sk_split
+        train_idx, val_idx = sk_split(
+            np.arange(n_samples), test_size=args.val_ratio, random_state=42
+        )
 
-    n_train = len(train_data[TOKEN_LEVELS[0]])
-    n_val = len(val_data[TOKEN_LEVELS[0]])
-    if is_main_process():
-        logger.info(f"Train: {n_train} samples, Val: {n_val} samples (split ratio: {1-args.val_ratio:.0%}/{args.val_ratio:.0%})")
+        val_data = {}
+        actual_train_data = {}
+        for tokens in TOKEN_LEVELS:
+            if tokens in train_data:
+                val_data[tokens] = [train_data[tokens][i] for i in val_idx]
+                actual_train_data[tokens] = [train_data[tokens][i] for i in train_idx]
+        train_data = actual_train_data
+
+        n_train = len(train_data[TOKEN_LEVELS[0]])
+        n_val = len(val_data[TOKEN_LEVELS[0]])
+        if is_main_process():
+            logger.info(f"Train: {n_train} samples, Val: {n_val} samples (split ratio: {1-args.val_ratio:.0%}/{args.val_ratio:.0%})")
+
+    # Load test data for --no-val mode (evaluate on test each epoch)
+    test_data = None
+    if args.no_val:
+        if is_main_process():
+            logger.info("Loading test data for evaluation...")
+        test_data = load_json_data(subset_dir, split="test")
+        if test_data and is_main_process():
+            logger.info(f"Test: {len(test_data[TOKEN_LEVELS[0]])} samples")
 
     # Load tokenizer
     if is_main_process():
@@ -699,18 +810,27 @@ def main():
     filter_uniform = not args.no_filter
     verbose = is_main_process()
     if verbose:
-        logger.info(f"Creating datasets (train filter={filter_uniform}, val unfiltered)...")
+        if args.no_val:
+            logger.info(f"Creating datasets (train filter={filter_uniform}, no val)...")
+        else:
+            logger.info(f"Creating datasets (train filter={filter_uniform}, val unfiltered)...")
     train_dataset = MentorDataset(train_data, tokenizer, args.max_length, filter_uniform=filter_uniform, verbose=verbose)
-    val_dataset = MentorDataset(val_data, tokenizer, args.max_length, filter_uniform=False, verbose=verbose)
 
-    if verbose:
-        logger.info(f"Training dataset: {len(train_dataset)} samples ({len(train_dataset)//4} questions × 4 stages)")
-        logger.info(f"Validation dataset: {len(val_dataset)} samples (unfiltered)")
+    if val_data is not None:
+        val_dataset = MentorDataset(val_data, tokenizer, args.max_length, filter_uniform=False, verbose=verbose)
+        if verbose:
+            logger.info(f"Training dataset: {len(train_dataset)} samples ({len(train_dataset)//4} questions × 4 stages)")
+            logger.info(f"Validation dataset: {len(val_dataset)} samples (unfiltered)")
+    else:
+        val_dataset = None
+        if verbose:
+            logger.info(f"Training dataset: {len(train_dataset)} samples ({len(train_dataset)//4} questions × 4 stages)")
+            logger.info(f"No validation dataset (--no-val mode)")
 
     # Use DistributedSampler for DDP
     if use_ddp:
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False) if val_dataset else None
         shuffle = False
     else:
         train_sampler = None
@@ -724,12 +844,14 @@ def main():
         sampler=train_sampler,
         collate_fn=lambda b: collate_fn(b, tokenizer),
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        sampler=val_sampler,
-        collate_fn=lambda b: collate_fn(b, tokenizer),
-    )
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            sampler=val_sampler,
+            collate_fn=lambda b: collate_fn(b, tokenizer),
+        )
 
     # Class weights
     train_labels = torch.tensor([s['label'] for s in train_dataset.samples])
@@ -752,6 +874,9 @@ def main():
     best_cascade_acc = 0
     best_thresholds = None
     best_state = None
+    final_cascade_acc = 0
+    final_thresholds = [0.5, 0.5, 0.5, 0.5]  # Default thresholds if no val
+    final_detailed = {'oracle': 0, 'auc': {t: 0 for t in TOKEN_LEVELS}, 'baseline': {}}
 
     for epoch in range(args.epochs):
         if use_ddp:
@@ -763,60 +888,132 @@ def main():
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device, args.grad_accum
         )
-        val_loss, val_acc, _, _, _ = eval_epoch(model, val_loader, criterion, device)
 
         if is_main_process():
             logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
-            logger.info(f"Val Loss: {val_loss:.4f}, Val Acc (per-sample): {val_acc:.4f}")
 
-        # Cascade evaluation on validation set (the real metric)
+        if val_loader is not None:
+            # With validation: evaluate on val set
+            val_loss, val_acc, _, _, _ = eval_epoch(model, val_loader, criterion, device)
+
+            if is_main_process():
+                logger.info(f"Val Loss: {val_loss:.4f}, Val Acc (per-sample): {val_acc:.4f}")
+
+            # Cascade evaluation on validation set (the real metric)
+            if is_main_process():
+                logger.info("Running cascade evaluation on validation set...")
+            cascade_acc, thresholds, detailed = eval_cascade_on_val(
+                model, val_data, tokenizer, args.max_length, device
+            )
+
+            if is_main_process():
+                logger.info(f"Val Cascade Acc: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
+                logger.info(f"Thresholds: {thresholds}")
+                auc_str = ", ".join([f"T{t}={detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
+                logger.info(f"Per-stage AUC: {auc_str}")
+
+            # Save based on cascade accuracy
+            if cascade_acc > best_cascade_acc:
+                best_cascade_acc = cascade_acc
+                best_thresholds = thresholds
+                if is_main_process():
+                    classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
+                    best_state = {
+                        'lora': base_model.state_dict(),
+                        'classifier': classifier_state,
+                        'thresholds': thresholds,
+                    }
+                    logger.info(f"New best cascade acc! Saving...")
+        else:
+            # No validation mode: search thresholds on train, evaluate on test each epoch
+            if is_main_process():
+                logger.info("Searching thresholds on train...")
+            cascade_acc_train, thresholds, detailed_train = eval_cascade_on_val(
+                model, train_data, tokenizer, args.max_length, device
+            )
+
+            if is_main_process():
+                logger.info(f"Train Cascade Acc: {cascade_acc_train:.4f} (Oracle: {detailed_train['oracle']:.4f})")
+                logger.info(f"Thresholds (from train): {thresholds}")
+
+            # Evaluate on test with thresholds from train
+            if test_data is not None:
+                if is_main_process():
+                    logger.info("Evaluating on test with thresholds from train...")
+                cascade_acc_test, _, detailed_test = eval_cascade_with_thresholds(
+                    model, test_data, tokenizer, args.max_length, device, thresholds
+                )
+                if is_main_process():
+                    logger.info(f"Test Cascade Acc: {cascade_acc_test:.4f} (Oracle: {detailed_test['oracle']:.4f})")
+                    auc_str = ", ".join([f"T{t}={detailed_test['auc'][t]:.4f}" for t in TOKEN_LEVELS])
+                    logger.info(f"Test Per-stage AUC: {auc_str}")
+
+            # Track best based on train cascade acc
+            if cascade_acc_train > best_cascade_acc:
+                best_cascade_acc = cascade_acc_train
+                best_thresholds = thresholds
+                final_thresholds = thresholds
+                final_detailed = detailed_train
+                if is_main_process():
+                    classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
+                    best_state = {
+                        'lora': base_model.state_dict(),
+                        'classifier': classifier_state,
+                        'thresholds': thresholds,
+                    }
+                    logger.info(f"New best train cascade acc!")
+
+    if val_data is not None:
+        # Final threshold search on val (unfiltered) for consistent comparison
         if is_main_process():
-            logger.info("Running cascade evaluation on validation set...")
-        cascade_acc, thresholds, detailed = eval_cascade_on_val(
+            logger.info("\nFinal cascade evaluation on val (unfiltered)...")
+
+        final_cascade_acc, final_thresholds, final_detailed = eval_cascade_on_val(
             model, val_data, tokenizer, args.max_length, device
         )
 
         if is_main_process():
-            logger.info(f"Val Cascade Acc: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
-            logger.info(f"Thresholds: {thresholds}")
-            auc_str = ", ".join([f"T{t}={detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
+            logger.info(f"Val Cascade Acc: {final_cascade_acc:.4f} (Oracle: {final_detailed['oracle']:.4f})")
+            logger.info(f"Final Thresholds: {final_thresholds}")
+
+        # Update best_state with final thresholds
+        if best_state:
+            best_state['thresholds'] = final_thresholds
+
+        # Save best model (only main process)
+        if is_main_process() and best_state:
+            torch.save(best_state, os.path.join(args.output_dir, "best_model.pt"))
+            base_model.save_pretrained(args.output_dir)
+            tokenizer.save_pretrained(args.output_dir)
+            logger.info(f"Best model saved to {args.output_dir}")
+    else:
+        # No validation: search thresholds on entire train set (unfiltered)
+        if is_main_process():
+            logger.info("\nFinal: Searching thresholds on entire train set (unfiltered)...")
+
+        final_cascade_acc, final_thresholds, final_detailed = eval_cascade_on_val(
+            model, train_data, tokenizer, args.max_length, device
+        )
+
+        if is_main_process():
+            logger.info(f"Train Cascade Acc: {final_cascade_acc:.4f} (Oracle: {final_detailed['oracle']:.4f})")
+            logger.info(f"Thresholds (from train): {final_thresholds}")
+            auc_str = ", ".join([f"T{t}={final_detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
             logger.info(f"Per-stage AUC: {auc_str}")
 
-        # Save based on cascade accuracy
-        if cascade_acc > best_cascade_acc:
-            best_cascade_acc = cascade_acc
-            best_thresholds = thresholds
+        # Final test evaluation with thresholds from train
+        test_cascade_acc = None
+        test_detailed = None
+        if test_data is not None:
             if is_main_process():
-                classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
-                best_state = {
-                    'lora': base_model.state_dict(),
-                    'classifier': classifier_state,
-                    'thresholds': thresholds,
-                }
-                logger.info(f"New best cascade acc! Saving...")
-
-    # Final threshold search on val (unfiltered) for consistent comparison
-    if is_main_process():
-        logger.info("\nFinal cascade evaluation on val (unfiltered)...")
-
-    final_cascade_acc, final_thresholds, final_detailed = eval_cascade_on_val(
-        model, val_data, tokenizer, args.max_length, device
-    )
-
-    if is_main_process():
-        logger.info(f"Val Cascade Acc: {final_cascade_acc:.4f} (Oracle: {final_detailed['oracle']:.4f})")
-        logger.info(f"Final Thresholds: {final_thresholds}")
-
-    # Update best_state with final thresholds
-    if best_state:
-        best_state['thresholds'] = final_thresholds
-
-    # Save best model (only main process)
-    if is_main_process() and best_state:
-        torch.save(best_state, os.path.join(args.output_dir, "best_model.pt"))
-        base_model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
-        logger.info(f"Best model saved to {args.output_dir}")
+                logger.info("\nFinal: Evaluating on test with thresholds from train...")
+            test_cascade_acc, _, test_detailed = eval_cascade_with_thresholds(
+                model, test_data, tokenizer, args.max_length, device, final_thresholds
+            )
+            if is_main_process():
+                logger.info(f"Test Cascade Acc: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
+                auc_str = ", ".join([f"T{t}={test_detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
+                logger.info(f"Test Per-stage AUC: {auc_str}")
 
     # Save last epoch model
     if is_main_process():
@@ -824,21 +1021,34 @@ def main():
         last_state = {
             'lora': base_model.state_dict(),
             'classifier': classifier_state,
+            'thresholds': final_thresholds,
         }
         torch.save(last_state, os.path.join(args.output_dir, "last_model.pt"))
         logger.info(f"Last model saved to {args.output_dir}/last_model.pt")
 
+        # In --no-val mode, save as best_model.pt with thresholds from train
+        if args.no_val:
+            torch.save(last_state, os.path.join(args.output_dir, "best_model.pt"))
+            base_model.save_pretrained(args.output_dir)
+            tokenizer.save_pretrained(args.output_dir)
+            logger.info(f"Model saved as best_model.pt (thresholds from train)")
+
     if is_main_process():
-        logger.info("\nFinal Evaluation:")
-        logger.info(f"Best Val Cascade Accuracy: {best_cascade_acc:.4f}")
-        logger.info(f"Final Thresholds: {final_thresholds}")
+        if args.no_val:
+            logger.info("\nTraining complete (--no-val mode)")
+            logger.info(f"Thresholds from train: {final_thresholds}")
+        else:
+            logger.info("\nFinal Evaluation:")
+            logger.info(f"Best Val Cascade Accuracy: {best_cascade_acc:.4f}")
+            logger.info(f"Final Thresholds: {final_thresholds}")
 
         # Save results
         results = {
             'subset': args.subset,
             'n_train': n_train,
             'n_val': n_val,
-            'val_ratio': args.val_ratio,
+            'no_val': args.no_val,
+            'val_ratio': args.val_ratio if not args.no_val else 0.0,
             'best_cascade_acc': float(final_cascade_acc),
             'best_thresholds': final_thresholds,
             'oracle_acc': final_detailed['oracle'],
@@ -847,6 +1057,14 @@ def main():
             'world_size': world_size,
             'args': vars(args),
         }
+
+        # Add test results in --no-val mode
+        if args.no_val and test_cascade_acc is not None:
+            results['test_cascade_acc'] = float(test_cascade_acc)
+            results['test_oracle_acc'] = test_detailed['oracle']
+            results['test_per_stage_auc'] = test_detailed['auc']
+            results['test_per_stage_baseline_acc'] = test_detailed['baseline']
+
         with open(os.path.join(args.output_dir, "results.json"), 'w') as f:
             json.dump(results, f, indent=2)
         logger.info(f"Results saved to {args.output_dir}/results.json")
