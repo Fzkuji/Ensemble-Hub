@@ -336,6 +336,7 @@ def eval_cascade_on_val(
     tokenizer,
     max_length: int,
     device: str,
+    eval_batch_size: int = 16,
 ) -> Tuple[float, List[float], Dict]:
     """
     Evaluate cascade accuracy on validation set with threshold search.
@@ -348,39 +349,53 @@ def eval_cascade_on_val(
     all_probs = {tokens: [] for tokens in TOKEN_LEVELS}
     gt = {tokens: [] for tokens in TOKEN_LEVELS}
 
-    for i in tqdm(range(n_samples), desc="Cascade eval", disable=not is_main_process()):
-        for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+    # Process each stage separately with batching
+    for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+        stage_probs = []
+        stage_labels = []
+
+        # Prepare all texts for this stage
+        texts = []
+        for i in range(n_samples):
             item = val_data[tokens][i]
             question = item['question']
             mentor_response = item.get('mentor_response', '')
 
-            # Build prompt
             if mentor_response:
                 text = f"Question: {question}\n\nHint: {mentor_response}\n\nAnswer:"
             else:
                 text = f"Question: {question}\n\nAnswer:"
+            texts.append(text)
+            stage_labels.append(1 if item.get('is_correct', False) else 0)
+
+        # Process in batches
+        for batch_start in tqdm(range(0, n_samples, eval_batch_size),
+                                desc=f"Cascade eval T{tokens}",
+                                disable=not is_main_process()):
+            batch_end = min(batch_start + eval_batch_size, n_samples)
+            batch_texts = texts[batch_start:batch_end]
 
             encoded = tokenizer(
-                text,
+                batch_texts,
                 truncation=True,
                 max_length=max_length,
-                padding=False,
+                padding=True,
                 return_tensors="pt",
             )
 
             input_ids = encoded['input_ids'].to(device)
             attention_mask = encoded['attention_mask'].to(device)
-            stages = torch.tensor([stage_idx], device=device)
+            stages = torch.full((len(batch_texts),), stage_idx, dtype=torch.long, device=device)
 
             with torch.no_grad():
                 logits = model(input_ids, attention_mask, stages)
-                prob = torch.softmax(logits, dim=1)[0, 1].item()
+                probs = torch.softmax(logits, dim=1)[:, 1].cpu().tolist()
 
-            all_probs[tokens].append(prob)
-            gt[tokens].append(1 if item.get('is_correct', False) else 0)
+            stage_probs.extend(probs)
 
-        if i % 50 == 0:
-            torch.cuda.empty_cache()
+        all_probs[tokens] = stage_probs
+        gt[tokens] = stage_labels
+        torch.cuda.empty_cache()
 
     def compute_cascade_acc(thresholds, all_probs, gt, n_samples):
         """Compute cascade accuracy for given thresholds."""
@@ -447,6 +462,7 @@ def eval_cascade_with_thresholds(
     max_length: int,
     device: str,
     thresholds: List[float],
+    eval_batch_size: int = 16,
 ) -> Tuple[float, List[float], Dict]:
     """
     Evaluate cascade accuracy with fixed thresholds (no search).
@@ -459,8 +475,14 @@ def eval_cascade_with_thresholds(
     all_probs = {tokens: [] for tokens in TOKEN_LEVELS}
     gt = {tokens: [] for tokens in TOKEN_LEVELS}
 
-    for i in tqdm(range(n_samples), desc="Test eval", disable=not is_main_process()):
-        for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+    # Process each stage separately with batching
+    for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+        stage_probs = []
+        stage_labels = []
+
+        # Prepare all texts for this stage
+        texts = []
+        for i in range(n_samples):
             item = data[tokens][i]
             question = item['question']
             mentor_response = item.get('mentor_response', '')
@@ -469,28 +491,37 @@ def eval_cascade_with_thresholds(
                 text = f"Question: {question}\n\nHint: {mentor_response}\n\nAnswer:"
             else:
                 text = f"Question: {question}\n\nAnswer:"
+            texts.append(text)
+            stage_labels.append(1 if item.get('is_correct', False) else 0)
+
+        # Process in batches
+        for batch_start in tqdm(range(0, n_samples, eval_batch_size),
+                                desc=f"Test eval T{tokens}",
+                                disable=not is_main_process()):
+            batch_end = min(batch_start + eval_batch_size, n_samples)
+            batch_texts = texts[batch_start:batch_end]
 
             encoded = tokenizer(
-                text,
+                batch_texts,
                 truncation=True,
                 max_length=max_length,
-                padding=False,
+                padding=True,
                 return_tensors="pt",
             )
 
             input_ids = encoded['input_ids'].to(device)
             attention_mask = encoded['attention_mask'].to(device)
-            stages = torch.tensor([stage_idx], device=device)
+            stages = torch.full((len(batch_texts),), stage_idx, dtype=torch.long, device=device)
 
             with torch.no_grad():
                 logits = model(input_ids, attention_mask, stages)
-                prob = torch.softmax(logits, dim=1)[0, 1].item()
+                probs = torch.softmax(logits, dim=1)[:, 1].cpu().tolist()
 
-            all_probs[tokens].append(prob)
-            gt[tokens].append(1 if item.get('is_correct', False) else 0)
+            stage_probs.extend(probs)
 
-        if i % 50 == 0:
-            torch.cuda.empty_cache()
+        all_probs[tokens] = stage_probs
+        gt[tokens] = stage_labels
+        torch.cuda.empty_cache()
 
     # Compute cascade accuracy with fixed thresholds
     correct = 0
@@ -571,6 +602,8 @@ def main():
                         help="Pre-allocate GPU memory in GB to prevent others from using it (released after model load)")
     parser.add_argument("--memory-lock", type=float, default=0,
                         help="Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%%). Keeps memory occupied throughout training.")
+    parser.add_argument("--eval-batch-size", type=int, default=16,
+                        help="Batch size for cascade evaluation (default: 16)")
 
     args = parser.parse_args()
 
@@ -903,7 +936,7 @@ def main():
             if is_main_process():
                 logger.info("Running cascade evaluation on validation set...")
             cascade_acc, thresholds, detailed = eval_cascade_on_val(
-                model, val_data, tokenizer, args.max_length, device
+                model, val_data, tokenizer, args.max_length, device, args.eval_batch_size
             )
 
             if is_main_process():
@@ -929,7 +962,7 @@ def main():
             if is_main_process():
                 logger.info("Searching thresholds on train...")
             cascade_acc_train, thresholds, detailed_train = eval_cascade_on_val(
-                model, train_data, tokenizer, args.max_length, device
+                model, train_data, tokenizer, args.max_length, device, args.eval_batch_size
             )
 
             if is_main_process():
@@ -941,7 +974,7 @@ def main():
                 if is_main_process():
                     logger.info("Evaluating on test with thresholds from train...")
                 cascade_acc_test, _, detailed_test = eval_cascade_with_thresholds(
-                    model, test_data, tokenizer, args.max_length, device, thresholds
+                    model, test_data, tokenizer, args.max_length, device, thresholds, args.eval_batch_size
                 )
                 if is_main_process():
                     logger.info(f"Test Cascade Acc: {cascade_acc_test:.4f} (Oracle: {detailed_test['oracle']:.4f})")
@@ -969,7 +1002,7 @@ def main():
             logger.info("\nFinal cascade evaluation on val (unfiltered)...")
 
         final_cascade_acc, final_thresholds, final_detailed = eval_cascade_on_val(
-            model, val_data, tokenizer, args.max_length, device
+            model, val_data, tokenizer, args.max_length, device, args.eval_batch_size
         )
 
         if is_main_process():
@@ -992,7 +1025,7 @@ def main():
             logger.info("\nFinal: Searching thresholds on entire train set (unfiltered)...")
 
         final_cascade_acc, final_thresholds, final_detailed = eval_cascade_on_val(
-            model, train_data, tokenizer, args.max_length, device
+            model, train_data, tokenizer, args.max_length, device, args.eval_batch_size
         )
 
         if is_main_process():
@@ -1008,7 +1041,7 @@ def main():
             if is_main_process():
                 logger.info("\nFinal: Evaluating on test with thresholds from train...")
             test_cascade_acc, _, test_detailed = eval_cascade_with_thresholds(
-                model, test_data, tokenizer, args.max_length, device, final_thresholds
+                model, test_data, tokenizer, args.max_length, device, final_thresholds, args.eval_batch_size
             )
             if is_main_process():
                 logger.info(f"Test Cascade Acc: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
