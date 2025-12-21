@@ -9,8 +9,12 @@
 #   --model MODEL     Model name (default: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B)
 #   --subset SUBSET   Only run on specific subset (default: all subsets)
 #   --lr LR           Learning rate for LoRA training (default: 1e-4)
-#   --epochs EPOCHS   Number of epochs for LoRA training (default: 1)
+#   --epochs EPOCHS   Number of epochs for LoRA training (default: 3)
+#   --batch-size BS   Batch size for LoRA training (default: 4)
 #   --no-filter       Don't filter out all-correct/all-wrong samples
+#   --reserve-memory GB  Pre-allocate GPU memory (released after model load)
+#   --memory-lock FRAC   Lock GPU memory at this fraction (0.0-1.0)
+#   --force           Force re-training even if results exist
 #
 # Examples:
 #   ./run_pipeline.sh --think                          # Think mode, 8 GPUs
@@ -27,8 +31,12 @@ USE_THINK=true
 MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 SUBSET=""
 LR="1e-4"
-EPOCHS="1"
+EPOCHS="3"
+BATCH_SIZE=4
 NO_FILTER=false
+RESERVE_MEMORY=0
+MEMORY_LOCK=0
+FORCE=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -61,8 +69,24 @@ while [[ $# -gt 0 ]]; do
             EPOCHS="$2"
             shift 2
             ;;
+        --batch-size)
+            BATCH_SIZE="$2"
+            shift 2
+            ;;
         --no-filter)
             NO_FILTER=true
+            shift
+            ;;
+        --reserve-memory)
+            RESERVE_MEMORY="$2"
+            shift 2
+            ;;
+        --memory-lock)
+            MEMORY_LOCK="$2"
+            shift 2
+            ;;
+        --force)
+            FORCE=true
             shift
             ;;
         *)
@@ -121,6 +145,22 @@ check_data_exists() {
     fi
 }
 
+# Helper function to check if model already trained (from run_compare_classifier.sh)
+check_model_exists() {
+    local subset=$1
+    local model_type=$2
+    # If --force, always return "not exists" to force retraining
+    if [ "$FORCE" = true ]; then
+        return 1
+    fi
+    local result_file="$DATA_DIR/$subset/${model_type}_model/results.json"
+    if [ -f "$result_file" ]; then
+        return 0  # exists
+    else
+        return 1  # not exists
+    fi
+}
+
 echo ""
 echo "========== Step 1: Collect Data (${NUM_GPUS} GPUs parallel) =========="
 
@@ -164,12 +204,18 @@ python compute_stats.py --data-dir $DATA_DIR --split test
 echo ""
 echo "========== Step 3: Train LoRA Classifiers =========="
 for subset in "${SUBSETS[@]}"; do
-    echo "Training: $subset (lr=$LR, epochs=$EPOCHS)"
-    FILTER_FLAG=""
-    if [ "$NO_FILTER" = true ]; then
-        FILTER_FLAG="--no-filter"
+    if check_model_exists "$subset" "lora"; then
+        echo ">>> LoRA: $subset [SKIP - already trained, use --force to retrain]"
+    else
+        echo ">>> Training: $subset (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE)"
+        FILTER_FLAG=""
+        if [ "$NO_FILTER" = true ]; then
+            FILTER_FLAG="--no-filter"
+        fi
+        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_lora_classifier.py \
+            --ddp --subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
+            --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $FILTER_FLAG
     fi
-    CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_lora_classifier.py --ddp --subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS $FILTER_FLAG
 done
 
 echo ""
