@@ -296,10 +296,19 @@ else
     echo "========== Skipping PPL (--skip-ppl) =========="
 fi
 
+# Evaluate all classifiers on test split
+echo ""
+echo "========== Evaluating on Test Split =========="
+for subset in "${SUBSETS[@]}"; do
+    echo ">>> Test eval: $subset"
+    CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python eval_classifiers.py \
+        --data-dir $DATA_DIR --subset $subset --split test
+done
+
 # Compare results using Python for better formatting
 echo ""
 echo "============================================================"
-echo "                    COMPARISON RESULTS"
+echo "                    COMPARISON RESULTS (TEST)"
 echo "============================================================"
 
 python3 << EOF
@@ -324,22 +333,22 @@ def get_results(subset, model_type):
     return None
 
 def get_cascade_acc(r):
-    """Get cascade accuracy."""
+    """Get cascade accuracy (test split)."""
     if not r:
         return None
-    return r.get('best_cascade_acc')
+    return r.get('test_best_cascade_acc', r.get('best_cascade_acc'))
 
 def get_oracle(r):
-    """Get oracle accuracy."""
+    """Get oracle accuracy (test split)."""
     if not r:
         return None
-    return r.get('oracle_acc')
+    return r.get('test_oracle_acc', r.get('oracle_acc'))
 
 def get_baseline(r):
-    """Get per-stage baseline."""
+    """Get per-stage baseline (test split)."""
     if not r:
         return None
-    return r.get('per_stage_baseline_acc')
+    return r.get('test_per_stage_baseline_acc', r.get('per_stage_baseline_acc'))
 
 print()
 print("=" * 100)
@@ -406,8 +415,8 @@ print("-" * 100)
 for subset in subsets:
     for model_type, model_name in [('lora', 'LoRA'), ('mlp', 'MLP'), ('ppl', 'PPL')]:
         results = all_results[subset][model_type]
-        if results and 'per_stage_auc' in results:
-            auc = results['per_stage_auc']
+        auc = results.get('test_per_stage_auc', results.get('per_stage_auc')) if results else None
+        if auc:
             t0 = f"{auc.get('0', auc.get('T0', 0)):.4f}"
             t100 = f"{auc.get('100', auc.get('T100', 0)):.4f}"
             t500 = f"{auc.get('500', auc.get('T500', 0)):.4f}"
@@ -421,7 +430,7 @@ for subset in subsets:
 # Best thresholds comparison
 print()
 print("=" * 100)
-print("                              BEST THRESHOLDS")
+print("                              BEST THRESHOLDS (TEST)")
 print("=" * 100)
 print(f"{'Subset':<20} {'Model':<8} {'T0':>10} {'T100':>10} {'T500':>10} {'T1000':>10}")
 print("-" * 100)
@@ -429,8 +438,8 @@ print("-" * 100)
 for subset in subsets:
     for model_type, model_name in [('lora', 'LoRA'), ('mlp', 'MLP'), ('ppl', 'PPL')]:
         results = all_results[subset][model_type]
-        if results and 'best_thresholds' in results:
-            th = results['best_thresholds']
+        th = results.get('test_best_thresholds', results.get('best_thresholds')) if results else None
+        if th:
             print(f"{subset:<20} {model_name:<8} {th[0]:>10.2f} {th[1]:>10.2f} {th[2]:>10.2f} {th[3]:>10.2f}")
         else:
             print(f"{subset:<20} {model_name:<8} {'-':>10} {'-':>10} {'-':>10} {'-':>10}")

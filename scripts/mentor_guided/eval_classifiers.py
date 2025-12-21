@@ -447,6 +447,8 @@ def main():
                         choices=["lora", "mlp", "ppl", "all"])
     parser.add_argument("--base-model", type=str,
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
+    parser.add_argument("--split", type=str, default="val", choices=["val", "test"],
+                        help="Which split to evaluate on: val (from train) or test")
     args = parser.parse_args()
 
     subsets = SUBSETS if args.subset == "all" else [args.subset]
@@ -455,16 +457,20 @@ def main():
     for subset in subsets:
         subset_dir = os.path.join(args.data_dir, subset)
         print(f"\n{'='*60}")
-        print(f"Evaluating: {subset}")
+        print(f"Evaluating: {subset} (split: {args.split})")
         print(f"{'='*60}")
 
-        # Load val data (unfiltered)
-        val_data = get_val_data(subset_dir)
-        if not val_data:
+        # Load data based on split
+        if args.split == "test":
+            eval_data = load_json_data(subset_dir, split="test")
+        else:
+            eval_data = get_val_data(subset_dir)
+
+        if not eval_data:
             print(f"No data found for {subset}, skipping...")
             continue
 
-        print(f"Val samples: {len(val_data[TOKEN_LEVELS[0]])}")
+        print(f"{args.split.capitalize()} samples: {len(eval_data[TOKEN_LEVELS[0]])}")
 
         for clf_type in classifiers:
             model_dir = os.path.join(subset_dir, f"{clf_type}_model")
@@ -477,21 +483,21 @@ def main():
             try:
                 if clf_type == "lora":
                     cascade_acc, thresholds, detailed = eval_cascade_lora(
-                        model_dir, val_data
+                        model_dir, eval_data
                     )
                 elif clf_type == "mlp":
                     cascade_acc, thresholds, detailed = eval_cascade_mlp(
-                        model_dir, val_data, args.base_model
+                        model_dir, eval_data, args.base_model
                     )
                 else:  # ppl
                     cascade_acc, thresholds, detailed = eval_cascade_ppl(
-                        model_dir, val_data, args.base_model
+                        model_dir, eval_data, args.base_model
                     )
 
                 print(f"  Cascade Acc: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
                 print(f"  Thresholds: {thresholds}")
 
-                # Update results.json
+                # Update results.json with split-specific keys
                 results_path = os.path.join(model_dir, "results.json")
                 if os.path.exists(results_path):
                     with open(results_path) as f:
@@ -499,11 +505,13 @@ def main():
                 else:
                     results = {}
 
-                results['best_cascade_acc'] = cascade_acc
-                results['best_thresholds'] = thresholds
-                results['oracle_acc'] = detailed['oracle']
-                results['per_stage_auc'] = detailed['auc']
-                results['per_stage_baseline_acc'] = detailed['baseline']
+                # Use prefix for test results to distinguish from val
+                prefix = "test_" if args.split == "test" else ""
+                results[f'{prefix}best_cascade_acc'] = cascade_acc
+                results[f'{prefix}best_thresholds'] = thresholds
+                results[f'{prefix}oracle_acc'] = detailed['oracle']
+                results[f'{prefix}per_stage_auc'] = detailed['auc']
+                results[f'{prefix}per_stage_baseline_acc'] = detailed['baseline']
 
                 with open(results_path, 'w') as f:
                     json.dump(results, f, indent=2)
