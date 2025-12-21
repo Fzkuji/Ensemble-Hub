@@ -958,43 +958,8 @@ def main():
                     }
                     logger.info(f"New best cascade acc! Saving...")
         else:
-            # No validation mode: search thresholds on train, evaluate on test each epoch
-            if is_main_process():
-                logger.info("Searching thresholds on train...")
-            cascade_acc_train, thresholds, detailed_train = eval_cascade_on_val(
-                model, train_data, tokenizer, args.max_length, device, args.eval_batch_size
-            )
-
-            if is_main_process():
-                logger.info(f"Train Cascade Acc: {cascade_acc_train:.4f} (Oracle: {detailed_train['oracle']:.4f})")
-                logger.info(f"Thresholds (from train): {thresholds}")
-
-            # Evaluate on test with thresholds from train
-            if test_data is not None:
-                if is_main_process():
-                    logger.info("Evaluating on test with thresholds from train...")
-                cascade_acc_test, _, detailed_test = eval_cascade_with_thresholds(
-                    model, test_data, tokenizer, args.max_length, device, thresholds, args.eval_batch_size
-                )
-                if is_main_process():
-                    logger.info(f"Test Cascade Acc: {cascade_acc_test:.4f} (Oracle: {detailed_test['oracle']:.4f})")
-                    auc_str = ", ".join([f"T{t}={detailed_test['auc'][t]:.4f}" for t in TOKEN_LEVELS])
-                    logger.info(f"Test Per-stage AUC: {auc_str}")
-
-            # Track best based on train cascade acc
-            if cascade_acc_train > best_cascade_acc:
-                best_cascade_acc = cascade_acc_train
-                best_thresholds = thresholds
-                final_thresholds = thresholds
-                final_detailed = detailed_train
-                if is_main_process():
-                    classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
-                    best_state = {
-                        'lora': base_model.state_dict(),
-                        'classifier': classifier_state,
-                        'thresholds': thresholds,
-                    }
-                    logger.info(f"New best train cascade acc!")
+            # No validation mode: just train, eval only at the end
+            pass
 
     if val_data is not None:
         # Final threshold search on val (unfiltered) for consistent comparison
