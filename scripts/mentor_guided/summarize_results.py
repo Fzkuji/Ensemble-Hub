@@ -179,7 +179,7 @@ def summarize(data_dir: str, show_length: bool = True):
             if subset_results:
                 # Convert MLP test_results_per_subset format to expected format
                 r = {
-                    'n_test': subset_results.get('n_samples', 0),
+                    'n_test': subset_results.get('n_test', subset_results.get('n_samples', 0)),
                     'baseline': subset_results.get('per_stage_baseline_acc', {}),
                     'oracle': subset_results.get('oracle_acc', 0),
                     'cascade_accuracy': subset_results.get('cascade_acc', 0),
