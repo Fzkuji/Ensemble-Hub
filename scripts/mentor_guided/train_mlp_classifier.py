@@ -216,6 +216,37 @@ def load_json_data(data_dir: str, split: str = "train") -> Dict[int, List[Dict]]
     return data
 
 
+def load_all_subsets_data(base_dir: str, split: str = "train") -> Dict[int, List[Dict]]:
+    """Load and merge JSON data from all subsets."""
+    merged_data = {tokens: [] for tokens in TOKEN_LEVELS}
+
+    for subset in SUBSETS:
+        subset_dir = os.path.join(base_dir, subset, split)
+        if not os.path.exists(subset_dir):
+            logger.warning(f"Subset dir not found: {subset_dir}")
+            continue
+
+        for tokens in TOKEN_LEVELS:
+            filepath = os.path.join(subset_dir, f"tokens{tokens}.json")
+            if os.path.exists(filepath):
+                with open(filepath, 'r') as f:
+                    subset_data = json.load(f)
+                    # Add subset info for tracking
+                    for item in subset_data:
+                        item['subset'] = subset
+                    merged_data[tokens].extend(subset_data)
+                if is_main_process():
+                    logger.info(f"Loaded {len(subset_data)} samples from {subset}/{split}/tokens{tokens}.json")
+
+    # Log total counts
+    if is_main_process():
+        for tokens in TOKEN_LEVELS:
+            if merged_data[tokens]:
+                logger.info(f"Total tokens{tokens}: {len(merged_data[tokens])} samples (merged from all subsets)")
+
+    return merged_data
+
+
 class FrozenLLMClassifier(nn.Module):
     """Frozen LLM + trainable MLP classifier."""
 
@@ -533,16 +564,19 @@ def main():
         if is_main_process():
             logger.info(f"Pre-allocated {args.reserve_memory:.1f} GB GPU memory on {device} (will release after model load)")
 
-    if args.subset == "all":
+    use_all_subsets = (args.subset == "all")
+
+    if use_all_subsets:
+        # When using all subsets, output goes to data_dir/all/mlp_model
         subset_dir = os.path.join(args.data_dir, "all")
+        os.makedirs(subset_dir, exist_ok=True)
     else:
         subset_dir = os.path.join(args.data_dir, args.subset)
-
-    if not os.path.exists(subset_dir):
-        if is_main_process():
-            logger.error(f"Data directory not found: {subset_dir}")
-        cleanup_distributed()
-        return
+        if not os.path.exists(subset_dir):
+            if is_main_process():
+                logger.error(f"Data directory not found: {subset_dir}")
+            cleanup_distributed()
+            return
 
     if args.output_dir is None:
         args.output_dir = os.path.join(subset_dir, "mlp_model")
@@ -552,14 +586,18 @@ def main():
     if is_main_process():
         logger.info(f"=== MLP Classifier (Frozen LLM) ===")
         logger.info(f"Subset: {args.subset}")
-        logger.info(f"Data dir: {subset_dir}")
+        logger.info(f"Data dir: {args.data_dir if use_all_subsets else subset_dir}")
         logger.info(f"DDP: {use_ddp}, World size: {world_size}")
 
     # Load train data
     if is_main_process():
         logger.info("Loading training data...")
-    train_data = load_json_data(subset_dir, split="train")
-    if not train_data:
+    if use_all_subsets:
+        train_data = load_all_subsets_data(args.data_dir, split="train")
+    else:
+        train_data = load_json_data(subset_dir, split="train")
+
+    if not train_data or not train_data.get(TOKEN_LEVELS[0]):
         if is_main_process():
             logger.error("No training data found!")
         cleanup_distributed()
@@ -574,13 +612,16 @@ def main():
         n_train = n_samples
         n_val = n_samples
 
-        # Load test data for per-epoch evaluation
-        test_data = load_json_data(subset_dir, split="test")
-        n_test = len(test_data[TOKEN_LEVELS[0]]) if test_data else 0
+        # Load test data for evaluation
+        if use_all_subsets:
+            test_data = load_all_subsets_data(args.data_dir, split="test")
+        else:
+            test_data = load_json_data(subset_dir, split="test")
+        n_test = len(test_data[TOKEN_LEVELS[0]]) if test_data and test_data.get(TOKEN_LEVELS[0]) else 0
 
         if is_main_process():
             logger.info(f"No-val mode: Train on all {n_train} samples")
-            logger.info(f"Test split: {n_test} samples (for per-epoch cascade eval)")
+            logger.info(f"Test split: {n_test} samples (for final cascade eval)")
     else:
         test_data = None  # Not used in normal mode
         from sklearn.model_selection import train_test_split as sk_split
@@ -787,18 +828,6 @@ def main():
             logger.info(f"Thresholds: {thresholds}")
             auc_str = ", ".join([f"T{t}={detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
             logger.info(f"Train AUC: {auc_str}")
-
-        # In no-val mode, also evaluate on test split
-        if args.no_val and test_data:
-            if is_main_process():
-                logger.info("Running cascade evaluation on test...")
-            test_cascade_acc, test_thresholds, test_detailed = eval_cascade_on_val(
-                model, test_data, tokenizer, args.max_length, device
-            )
-            if is_main_process():
-                logger.info(f"Test Cascade Acc: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
-                test_auc_str = ", ".join([f"T{t}={test_detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
-                logger.info(f"Test AUC: {test_auc_str}")
 
         if cascade_acc > best_cascade_acc:
             best_cascade_acc = cascade_acc

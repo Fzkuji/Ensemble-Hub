@@ -129,10 +129,17 @@ fi
 DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_${MODE}_${MODEL_NAME}"
 
 # Set subsets based on --subset argument
+ALL_SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
+USE_ALL_SUBSETS=false
 if [ -n "$SUBSET" ]; then
-    SUBSETS=("$SUBSET")
+    if [ "$SUBSET" = "all" ]; then
+        USE_ALL_SUBSETS=true
+        SUBSETS=("${ALL_SUBSETS[@]}")  # Data collection still needs individual subsets
+    else
+        SUBSETS=("$SUBSET")
+    fi
 else
-    SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
+    SUBSETS=("${ALL_SUBSETS[@]}")
 fi
 
 # Token levels: -1 = mentor only, 0 = intern only, others = mentor hint + intern
@@ -221,49 +228,71 @@ python compute_stats.py --data-dir $DATA_DIR --split test
 
 echo ""
 echo "========== Step 3: Train MLP Classifiers =========="
-for subset in "${SUBSETS[@]}"; do
-    if check_model_exists "$subset" "mlp"; then
-        echo ">>> MLP: $subset [SKIP - already trained, use --force to retrain]"
+FILTER_FLAG=""
+if [ "$NO_FILTER" = true ]; then
+    FILTER_FLAG="--no-filter"
+fi
+NO_VAL_FLAG=""
+if [ "$NO_VAL" = true ]; then
+    NO_VAL_FLAG="--no-val"
+fi
+
+if [ "$USE_ALL_SUBSETS" = true ]; then
+    # Train single MLP on all subsets combined
+    if check_model_exists "all" "mlp"; then
+        echo ">>> MLP: all [SKIP - already trained, use --force to retrain]"
     else
-        echo ">>> Training MLP: $subset (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
-        FILTER_FLAG=""
-        if [ "$NO_FILTER" = true ]; then
-            FILTER_FLAG="--no-filter"
-        fi
-        NO_VAL_FLAG=""
-        if [ "$NO_VAL" = true ]; then
-            NO_VAL_FLAG="--no-val"
-        fi
+        echo ">>> Training MLP on ALL subsets combined (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
         CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
-            --ddp --subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
+            --ddp --subset all --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
             --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
             --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG
     fi
-done
+else
+    for subset in "${SUBSETS[@]}"; do
+        if check_model_exists "$subset" "mlp"; then
+            echo ">>> MLP: $subset [SKIP - already trained, use --force to retrain]"
+        else
+            echo ">>> Training MLP: $subset (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
+            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
+                --ddp --subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
+                --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
+                --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG
+        fi
+    done
+fi
 
 echo ""
 echo "========== Step 4: Train PPL Classifiers =========="
-for subset in "${SUBSETS[@]}"; do
-    if check_model_exists "$subset" "ppl"; then
-        echo ">>> PPL: $subset [SKIP - already trained, use --force to retrain]"
-    else
-        echo ">>> Training PPL: $subset"
-        CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python train_ppl_classifier.py \
-            --subset $subset --data-dir $DATA_DIR
-    fi
-done
+if [ "$USE_ALL_SUBSETS" = true ]; then
+    echo ">>> PPL training skipped for --subset all (not supported)"
+else
+    for subset in "${SUBSETS[@]}"; do
+        if check_model_exists "$subset" "ppl"; then
+            echo ">>> PPL: $subset [SKIP - already trained, use --force to retrain]"
+        else
+            echo ">>> Training PPL: $subset"
+            CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python train_ppl_classifier.py \
+                --subset $subset --data-dir $DATA_DIR
+        fi
+    done
+fi
 
 echo ""
 echo "========== Step 5: Train Ensemble (MLP + PPL) =========="
-for subset in "${SUBSETS[@]}"; do
-    if check_model_exists "$subset" "ensemble"; then
-        echo ">>> Ensemble: $subset [SKIP - already trained, use --force to retrain]"
-    else
-        echo ">>> Training Ensemble: $subset"
-        CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python train_ensemble_classifier.py \
-            --subset $subset --data-dir $DATA_DIR --base-model $MODEL --use-mlp
-    fi
-done
+if [ "$USE_ALL_SUBSETS" = true ]; then
+    echo ">>> Ensemble training skipped for --subset all (not supported)"
+else
+    for subset in "${SUBSETS[@]}"; do
+        if check_model_exists "$subset" "ensemble"; then
+            echo ">>> Ensemble: $subset [SKIP - already trained, use --force to retrain]"
+        else
+            echo ">>> Training Ensemble: $subset"
+            CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python train_ensemble_classifier.py \
+                --subset $subset --data-dir $DATA_DIR --base-model $MODEL --use-mlp
+        fi
+    done
+fi
 
 echo ""
 echo "========== Step 6: Summarize Results =========="
