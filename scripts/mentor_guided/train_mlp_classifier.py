@@ -246,16 +246,19 @@ class FrozenLLMClassifier(nn.Module):
             # Per-token classification, then average logits (no for loop)
             batch_size, seq_len, hidden_size = hidden_states.shape
 
+            # Handle DDP wrapper - get underlying module
+            head = self.classifier_head.module if hasattr(self.classifier_head, 'module') else self.classifier_head
+
             # Expand stage embedding to all tokens: [batch] -> [batch, seq]
             stages_expanded = stages.unsqueeze(1).expand(-1, seq_len)
-            stage_embed = self.classifier_head.stage_embedding(stages_expanded)  # [batch, seq, 64]
+            stage_embed = head.stage_embedding(stages_expanded)  # [batch, seq, 64]
 
             # Concatenate hidden states with stage embedding
             combined = torch.cat([hidden_states.detach(), stage_embed], dim=-1)  # [batch, seq, hidden+64]
 
             # Reshape to [batch*seq, hidden+64], pass through classifier
             combined_flat = combined.view(batch_size * seq_len, -1)
-            logits_flat = self.classifier_head.classifier(combined_flat)  # [batch*seq, 2]
+            logits_flat = head.classifier(combined_flat)  # [batch*seq, 2]
             logits_all = logits_flat.view(batch_size, seq_len, -1)  # [batch, seq, 2]
 
             # Masked mean over sequence
