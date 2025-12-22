@@ -611,24 +611,34 @@ def main():
                         help="LoRA alpha")
     parser.add_argument("--max-length", type=int, default=1024,
                         help="Max sequence length")
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--grad-accum", type=int, default=8,
-                        help="Gradient accumulation steps")
+    parser.add_argument("--epochs", type=int, default=2,
+                        help="Number of training epochs (default: 2)")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Batch size (default: 16)")
+    parser.add_argument("--grad-accum", type=int, default=1,
+                        help="Gradient accumulation steps (default: 1)")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--use-4bit", action="store_true",
                         help="Use 4-bit quantization (not compatible with DDP)")
     parser.add_argument("--ddp", action="store_true",
                         help="Use DistributedDataParallel (use with torchrun)")
-    parser.add_argument("--no-filter", action="store_true",
-                        help="Don't filter out all-correct/all-wrong samples")
+    # Filter settings: default is NO filter (keep all samples)
+    parser.add_argument("--filter", dest="filter_data", action="store_true",
+                        help="Filter out all-correct/all-wrong samples")
+    parser.add_argument("--no-filter", dest="filter_data", action="store_false",
+                        help="Don't filter samples (default)")
+    parser.set_defaults(filter_data=False)
     parser.add_argument("--dropout", type=float, default=0.05,
                         help="Dropout rate for classifier head")
     parser.add_argument("--val-ratio", type=float, default=0.3,
                         help="Validation split ratio from training data (default: 0.3)")
-    parser.add_argument("--no-val", action="store_true",
-                        help="Use entire train set for training, no validation (for final training before test eval)")
+    # Validation settings: default is NO validation split
+    parser.add_argument("--val", dest="use_val", action="store_true",
+                        help="Use validation split for threshold search")
+    parser.add_argument("--no-val", dest="use_val", action="store_false",
+                        help="Train on entire train set (default)")
+    parser.set_defaults(use_val=False)
     parser.add_argument("--reserve-memory", type=float, default=0,
                         help="Pre-allocate GPU memory in GB to prevent others from using it (released after model load)")
     parser.add_argument("--memory-lock", type=float, default=0,
@@ -729,7 +739,7 @@ def main():
     # Split train data into train/val (e.g., 70/30), or use all for training if --no-val
     n_samples = len(train_data[TOKEN_LEVELS[0]])
 
-    if args.no_val:
+    if not args.use_val:
         # Use all train data for training, no validation
         val_data = None
         n_train = n_samples
@@ -757,7 +767,7 @@ def main():
 
     # Load test data for --no-val mode (evaluate on test each epoch)
     test_data = None
-    if args.no_val:
+    if not args.use_val:
         if is_main_process():
             logger.info("Loading test data for evaluation...")
         test_data = load_json_data(subset_dir, split="test")
@@ -876,10 +886,10 @@ def main():
                 logger.info(f"  All used memory is locked and will not be released")
 
     # Create datasets (filter train only, keep val unfiltered for consistent evaluation)
-    filter_uniform = not args.no_filter
+    filter_uniform = args.filter_data
     verbose = is_main_process()
     if verbose:
-        if args.no_val:
+        if not args.use_val:
             logger.info(f"Creating datasets (train filter={filter_uniform}, no val)...")
         else:
             logger.info(f"Creating datasets (train filter={filter_uniform}, val unfiltered)...")
@@ -1061,14 +1071,14 @@ def main():
         logger.info(f"Last model saved to {args.output_dir}/last_model.pt")
 
         # In --no-val mode, save as best_model.pt with thresholds from train
-        if args.no_val:
+        if not args.use_val:
             torch.save(last_state, os.path.join(args.output_dir, "best_model.pt"))
             base_model.save_pretrained(args.output_dir)
             tokenizer.save_pretrained(args.output_dir)
             logger.info(f"Model saved as best_model.pt (thresholds from train)")
 
     if is_main_process():
-        if args.no_val:
+        if not args.use_val:
             logger.info("\nTraining complete (--no-val mode)")
             logger.info(f"Thresholds from train: {final_thresholds}")
         else:
@@ -1081,8 +1091,8 @@ def main():
             'subset': args.subset,
             'n_train': n_train,
             'n_val': n_val,
-            'no_val': args.no_val,
-            'val_ratio': args.val_ratio if not args.no_val else 0.0,
+            'no_val': not args.use_val,
+            'val_ratio': args.val_ratio if args.use_val else 0.0,
             'best_cascade_acc': float(final_cascade_acc),
             'best_thresholds': final_thresholds,
             'oracle_acc': final_detailed['oracle'],
@@ -1092,8 +1102,8 @@ def main():
             'args': vars(args),
         }
 
-        # Add test results in --no-val mode
-        if args.no_val and test_cascade_acc is not None:
+        # Add test results in no-val mode
+        if not args.use_val and test_cascade_acc is not None:
             results['test_cascade_acc'] = float(test_cascade_acc)
             results['test_oracle_acc'] = test_detailed['oracle']
             results['test_per_stage_auc'] = test_detailed['auc']

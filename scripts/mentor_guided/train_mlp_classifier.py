@@ -547,10 +547,10 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Directory to save model (default: data_dir/{subset}/mlp_model)")
     parser.add_argument("--max-length", type=int, default=1024)
-    parser.add_argument("--epochs", type=int, default=10,
-                        help="More epochs since only training MLP")
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="Can use larger batch since no gradient for LLM")
+    parser.add_argument("--epochs", type=int, default=2,
+                        help="Number of training epochs (default: 2)")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Batch size (default: 16, larger is better since no gradient for LLM)")
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Higher LR for MLP-only training")
@@ -559,18 +559,30 @@ def main():
                         help="Use 4-bit quantization for memory efficiency")
     parser.add_argument("--ddp", action="store_true",
                         help="Use DistributedDataParallel")
-    parser.add_argument("--no-filter", action="store_true",
-                        help="Don't filter out all-correct/all-wrong samples")
+    # Filter settings: default is NO filter (keep all samples)
+    parser.add_argument("--filter", dest="filter_data", action="store_true",
+                        help="Filter out all-correct/all-wrong samples")
+    parser.add_argument("--no-filter", dest="filter_data", action="store_false",
+                        help="Don't filter samples (default)")
+    parser.set_defaults(filter_data=False)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--val-ratio", type=float, default=0.3)
-    parser.add_argument("--no-val", action="store_true",
-                        help="Train on entire train set, search thresholds on train data")
+    # Validation settings: default is NO validation split
+    parser.add_argument("--val", dest="use_val", action="store_true",
+                        help="Use validation split for threshold search")
+    parser.add_argument("--no-val", dest="use_val", action="store_false",
+                        help="Train on entire train set (default)")
+    parser.set_defaults(use_val=False)
     parser.add_argument("--fixed-threshold", type=float, default=None,
                         help="Use fixed threshold instead of searching (e.g., 0.5)")
     parser.add_argument("--unfiltered-val", action="store_true",
                         help="Use unfiltered data for validation/threshold search")
-    parser.add_argument("--skip-epoch-cascade", action="store_true",
-                        help="Skip cascade evaluation after each epoch (only do final eval)")
+    # Epoch cascade settings: default is SKIP (only final eval)
+    parser.add_argument("--epoch-cascade", dest="skip_epoch_cascade", action="store_false",
+                        help="Run cascade evaluation after each epoch")
+    parser.add_argument("--skip-epoch-cascade", dest="skip_epoch_cascade", action="store_true",
+                        help="Skip cascade evaluation after each epoch (default)")
+    parser.set_defaults(skip_epoch_cascade=True)
     parser.add_argument("--reserve-memory", type=float, default=0,
                         help="Pre-allocate GPU memory in GB to prevent others from using it (released after model load)")
     parser.add_argument("--memory-lock", type=float, default=0,
@@ -681,7 +693,7 @@ def main():
     # Split train/val (or use all data if --no-val)
     n_samples = len(train_data[TOKEN_LEVELS[0]])
 
-    if args.no_val:
+    if not args.use_val:
         # Use all train data for training, load test data for evaluation
         val_data = train_data  # For threshold search (on train)
         n_train = n_samples
@@ -817,7 +829,7 @@ def main():
                 logger.info(f"  All used memory is locked and will not be released")
 
     # Create datasets (filter train, optionally filter val)
-    filter_uniform = not args.no_filter
+    filter_uniform = args.filter_data
     filter_val = filter_uniform and not args.unfiltered_val
     verbose = is_main_process()
     train_dataset = MentorDataset(train_data, tokenizer, args.max_length, filter_uniform=filter_uniform, verbose=verbose)
@@ -891,7 +903,7 @@ def main():
             logger.info(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
 
         # In no-val mode, skip val_loader eval (it's same as train)
-        if not args.no_val:
+        if args.use_val:
             val_loss, val_acc, _, _, _ = eval_epoch(model, val_loader, criterion, device)
             if is_main_process():
                 logger.info(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
@@ -964,7 +976,7 @@ def main():
 
     # Final evaluation on test (in no-val mode)
     test_results_per_subset = {}
-    if args.no_val:
+    if not args.use_val:
         # Determine which subsets to evaluate
         if eval_all_subsets:
             eval_subsets = SUBSETS
