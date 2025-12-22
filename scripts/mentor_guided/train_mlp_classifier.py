@@ -219,10 +219,11 @@ def load_json_data(data_dir: str, split: str = "train") -> Dict[int, List[Dict]]
 class FrozenLLMClassifier(nn.Module):
     """Frozen LLM + trainable MLP classifier."""
 
-    def __init__(self, base_model, classifier_head):
+    def __init__(self, base_model, classifier_head, pooling_mode="last"):
         super().__init__()
         self.base_model = base_model
         self.classifier_head = classifier_head
+        self.pooling_mode = pooling_mode
 
         # Freeze base model
         for param in self.base_model.parameters():
@@ -241,13 +242,20 @@ class FrozenLLMClassifier(nn.Module):
         # Get last layer hidden states
         hidden_states = outputs.hidden_states[-1]  # [batch, seq, hidden]
 
-        # Get last valid token for each sample
-        seq_lens = attention_mask.sum(dim=1) - 1
-        batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
-        last_hidden = hidden_states[batch_indices, seq_lens]  # [batch, hidden]
+        if self.pooling_mode == "mean":
+            # Mean pooling over all valid tokens
+            mask = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
+            sum_hidden = (hidden_states * mask).sum(dim=1)  # [batch, hidden]
+            seq_lens = mask.sum(dim=1)  # [batch, 1]
+            pooled = sum_hidden / seq_lens  # [batch, hidden]
+        else:
+            # Last token pooling (default)
+            seq_lens = attention_mask.sum(dim=1) - 1
+            batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
+            pooled = hidden_states[batch_indices, seq_lens]  # [batch, hidden]
 
         # Classify (this part has gradients)
-        logits = self.classifier_head(last_hidden.detach(), stages)
+        logits = self.classifier_head(pooled.detach(), stages)
         return logits
 
 
@@ -449,6 +457,8 @@ def main():
                         help="Pre-allocate GPU memory in GB to prevent others from using it (released after model load)")
     parser.add_argument("--memory-lock", type=float, default=0,
                         help="Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%%). Keeps memory occupied throughout training.")
+    parser.add_argument("--pooling", type=str, default="last", choices=["last", "mean"],
+                        help="Pooling strategy for hidden states: last (last token) or mean (mean of all tokens)")
 
     args = parser.parse_args()
 
@@ -593,14 +603,15 @@ def main():
     if is_main_process():
         mlp_params = sum(p.numel() for p in classifier_head.parameters())
         logger.info(f"MLP classifier: {mlp_params:,} params (trainable)")
+        logger.info(f"Using pooling mode: {args.pooling}")
 
     # Combine
-    model = FrozenLLMClassifier(base_model, classifier_head)
+    model = FrozenLLMClassifier(base_model, classifier_head, pooling_mode=args.pooling)
 
     # Wrap classifier with DDP if needed
     if use_ddp:
         classifier_head = DDP(classifier_head, device_ids=[local_rank])
-        model = FrozenLLMClassifier(base_model, classifier_head)
+        model = FrozenLLMClassifier(base_model, classifier_head, pooling_mode=args.pooling)
 
     # Release pre-allocated memory now that model is loaded
     if _reserved_memory is not None:

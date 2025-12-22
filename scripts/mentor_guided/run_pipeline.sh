@@ -17,6 +17,7 @@
 #   --force           Force re-training even if results exist
 #   --no-val          Train on entire train set, search thresholds on train, eval on test
 #   --pooling MODE    Pooling strategy: last (last token) or mean (mean of all tokens)
+#   --dropout RATE    Dropout rate for MLP classifier (default: 0.3)
 #
 # Examples:
 #   ./run_pipeline.sh --think                          # Think mode, 8 GPUs
@@ -41,6 +42,7 @@ MEMORY_LOCK=0
 FORCE=false
 NO_VAL=false
 POOLING="last"
+DROPOUT=0.3
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -99,6 +101,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --pooling)
             POOLING="$2"
+            shift 2
+            ;;
+        --dropout)
+            DROPOUT="$2"
             shift 2
             ;;
         *)
@@ -214,24 +220,20 @@ python compute_stats.py --data-dir $DATA_DIR --split train
 python compute_stats.py --data-dir $DATA_DIR --split test
 
 echo ""
-echo "========== Step 3: Train LoRA Classifiers =========="
+echo "========== Step 3: Train MLP Classifiers =========="
 for subset in "${SUBSETS[@]}"; do
-    if check_model_exists "$subset" "lora"; then
-        echo ">>> LoRA: $subset [SKIP - already trained, use --force to retrain]"
+    if check_model_exists "$subset" "mlp"; then
+        echo ">>> MLP: $subset [SKIP - already trained, use --force to retrain]"
     else
-        echo ">>> Training: $subset (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, no_val=$NO_VAL)"
+        echo ">>> Training MLP: $subset (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT)"
         FILTER_FLAG=""
         if [ "$NO_FILTER" = true ]; then
             FILTER_FLAG="--no-filter"
         fi
-        NO_VAL_FLAG=""
-        if [ "$NO_VAL" = true ]; then
-            NO_VAL_FLAG="--no-val"
-        fi
-        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_lora_classifier.py \
+        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
             --ddp --subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
             --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
-            --pooling $POOLING $FILTER_FLAG $NO_VAL_FLAG
+            --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG
     fi
 done
 
@@ -248,14 +250,14 @@ for subset in "${SUBSETS[@]}"; do
 done
 
 echo ""
-echo "========== Step 5: Train Ensemble (LoRA + PPL) =========="
+echo "========== Step 5: Train Ensemble (MLP + PPL) =========="
 for subset in "${SUBSETS[@]}"; do
     if check_model_exists "$subset" "ensemble"; then
         echo ">>> Ensemble: $subset [SKIP - already trained, use --force to retrain]"
     else
         echo ">>> Training Ensemble: $subset"
         CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python train_ensemble_classifier.py \
-            --subset $subset --data-dir $DATA_DIR --base-model $MODEL
+            --subset $subset --data-dir $DATA_DIR --base-model $MODEL --use-mlp
     fi
 done
 
