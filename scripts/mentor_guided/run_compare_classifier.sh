@@ -15,7 +15,7 @@
 #   --reserve-memory GB   Pre-allocate GPU memory
 #   --memory-lock FRAC    Lock GPU memory at this fraction (0.0-1.0)
 #   --no-val              Train on entire train set, eval on test
-#   --pooling MODE        Pooling: last, mean, mean_logits (default: last)
+#   --pooling MODE        Pooling strategy (default: mean_logits, only option)
 #   --dropout RATE        Dropout rate for MLP classifier (default: 0.3)
 #   --fixed-threshold TH  Use fixed threshold instead of searching
 #   --skip-epoch-cascade  Skip cascade evaluation after each epoch
@@ -43,7 +43,7 @@ BATCH_SIZE=4
 RESERVE_MEMORY=0
 MEMORY_LOCK=0
 NO_VAL=false
-POOLING="last"
+POOLING="mean_logits"
 DROPOUT=0.3
 FIXED_THRESHOLD=""
 SKIP_EPOCH_CASCADE=false

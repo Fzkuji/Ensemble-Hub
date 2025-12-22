@@ -4,7 +4,7 @@ MLP classifier using frozen LLM hidden states.
 
 Comparison baseline for LoRA fine-tuning:
 1. Load base model (frozen, no LoRA)
-2. Extract last token's hidden state
+2. Per-token classification with all hidden states, then average logits (mean_logits)
 3. Train only MLP classification head
 
 Usage:
@@ -284,11 +284,10 @@ def filter_varied_data(data: Dict[int, List[Dict]], verbose: bool = True) -> Dic
 class FrozenLLMClassifier(nn.Module):
     """Frozen LLM + trainable MLP classifier."""
 
-    def __init__(self, base_model, classifier_head, pooling_mode="last"):
+    def __init__(self, base_model, classifier_head):
         super().__init__()
         self.base_model = base_model
         self.classifier_head = classifier_head
-        self.pooling_mode = pooling_mode
 
         # Freeze base model
         for param in self.base_model.parameters():
@@ -307,44 +306,29 @@ class FrozenLLMClassifier(nn.Module):
         # Get last layer hidden states
         hidden_states = outputs.hidden_states[-1]  # [batch, seq, hidden]
 
-        if self.pooling_mode == "mean_logits":
-            # Per-token classification, then average logits (no for loop)
-            batch_size, seq_len, hidden_size = hidden_states.shape
+        # mean_logits: Per-token classification, then average logits
+        batch_size, seq_len, hidden_size = hidden_states.shape
 
-            # Handle DDP wrapper - get underlying module
-            head = self.classifier_head.module if hasattr(self.classifier_head, 'module') else self.classifier_head
+        # Handle DDP wrapper - get underlying module
+        head = self.classifier_head.module if hasattr(self.classifier_head, 'module') else self.classifier_head
 
-            # Expand stage embedding to all tokens: [batch] -> [batch, seq]
-            stages_expanded = stages.unsqueeze(1).expand(-1, seq_len)
-            stage_embed = head.stage_embedding(stages_expanded)  # [batch, seq, 64]
+        # Expand stage embedding to all tokens: [batch] -> [batch, seq]
+        stages_expanded = stages.unsqueeze(1).expand(-1, seq_len)
+        stage_embed = head.stage_embedding(stages_expanded)  # [batch, seq, 64]
 
-            # Concatenate hidden states with stage embedding
-            combined = torch.cat([hidden_states.detach(), stage_embed], dim=-1)  # [batch, seq, hidden+64]
+        # Concatenate hidden states with stage embedding
+        combined = torch.cat([hidden_states.detach(), stage_embed], dim=-1)  # [batch, seq, hidden+64]
 
-            # Reshape to [batch*seq, hidden+64], pass through classifier
-            combined_flat = combined.view(batch_size * seq_len, -1)
-            logits_flat = head.classifier(combined_flat)  # [batch*seq, 2]
-            logits_all = logits_flat.view(batch_size, seq_len, -1)  # [batch, seq, 2]
+        # Reshape to [batch*seq, hidden+64], pass through classifier
+        combined_flat = combined.view(batch_size * seq_len, -1)
+        logits_flat = head.classifier(combined_flat)  # [batch*seq, 2]
+        logits_all = logits_flat.view(batch_size, seq_len, -1)  # [batch, seq, 2]
 
-            # Masked mean over sequence
-            mask = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
-            logits_sum = (logits_all * mask).sum(dim=1)  # [batch, 2]
-            seq_lens = mask.sum(dim=1)  # [batch, 1]
-            logits = logits_sum / seq_lens  # [batch, 2]
-
-        elif self.pooling_mode == "mean":
-            # Mean pooling over all valid tokens, then classify once
-            mask = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
-            sum_hidden = (hidden_states * mask).sum(dim=1)  # [batch, hidden]
-            seq_lens = mask.sum(dim=1)  # [batch, 1]
-            pooled = sum_hidden / seq_lens  # [batch, hidden]
-            logits = self.classifier_head(pooled.detach(), stages)
-        else:
-            # Last token pooling (default)
-            seq_lens = attention_mask.sum(dim=1) - 1
-            batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
-            pooled = hidden_states[batch_indices, seq_lens]  # [batch, hidden]
-            logits = self.classifier_head(pooled.detach(), stages)
+        # Masked mean over sequence
+        mask = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
+        logits_sum = (logits_all * mask).sum(dim=1)  # [batch, 2]
+        seq_lens = mask.sum(dim=1)  # [batch, 1]
+        logits = logits_sum / seq_lens  # [batch, 2]
 
         return logits
 
@@ -587,8 +571,8 @@ def main():
                         help="Pre-allocate GPU memory in GB to prevent others from using it (released after model load)")
     parser.add_argument("--memory-lock", type=float, default=0,
                         help="Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%%). Keeps memory occupied throughout training.")
-    parser.add_argument("--pooling", type=str, default="last", choices=["last", "mean", "mean_logits"],
-                        help="Pooling strategy for hidden states: last (last token) or mean (mean of all tokens)")
+    parser.add_argument("--pooling", type=str, default="mean_logits",
+                        help="Pooling strategy: mean_logits (per-token classify then average logits)")
 
     args = parser.parse_args()
 
@@ -770,15 +754,13 @@ def main():
     if is_main_process():
         mlp_params = sum(p.numel() for p in classifier_head.parameters())
         logger.info(f"MLP classifier: {mlp_params:,} params (trainable)")
-        logger.info(f"Using pooling mode: {args.pooling}")
-
     # Combine
-    model = FrozenLLMClassifier(base_model, classifier_head, pooling_mode=args.pooling)
+    model = FrozenLLMClassifier(base_model, classifier_head)
 
     # Wrap classifier with DDP if needed
     if use_ddp:
         classifier_head = DDP(classifier_head, device_ids=[local_rank])
-        model = FrozenLLMClassifier(base_model, classifier_head, pooling_mode=args.pooling)
+        model = FrozenLLMClassifier(base_model, classifier_head)
 
     # Release pre-allocated memory now that model is loaded
     if _reserved_memory is not None:

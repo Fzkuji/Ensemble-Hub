@@ -18,7 +18,7 @@
 #   --memory-lock FRAC    Lock GPU memory at this fraction (0.0-1.0)
 #   --force               Force re-training even if results exist
 #   --no-val              Train on entire train set, search thresholds on train, eval on test
-#   --pooling MODE        Pooling: last, mean (avg hidden states), mean_logits (per-token classify then avg)
+#   --pooling MODE        Pooling strategy (default: mean_logits, only option)
 #   --dropout RATE        Dropout rate for MLP classifier (default: 0.3)
 #   --fixed-threshold TH  Use fixed threshold instead of searching (e.g., 0.5)
 #   --unfiltered-val      Use unfiltered data for validation/threshold search
@@ -49,7 +49,7 @@ RESERVE_MEMORY=0
 MEMORY_LOCK=0
 FORCE=false
 NO_VAL=false
-POOLING="last"
+POOLING="mean_logits"
 DROPOUT=0.3
 FIXED_THRESHOLD=""
 UNFILTERED_VAL=false

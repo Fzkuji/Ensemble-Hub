@@ -5,7 +5,7 @@ LoRA fine-tuning for mentor sufficiency classification.
 Architecture:
 1. Load base model (DeepSeek-R1-Distill-Qwen-7B)
 2. Add LoRA adapters
-3. Add classification head on top of last token's hidden state
+3. Per-token classification with all hidden states, then average logits (mean_logits)
 4. Train to predict is_correct (0/1)
 
 Usage:
@@ -238,11 +238,10 @@ def load_json_data(data_dir: str, split: str = "train") -> Dict[int, List[Dict]]
 class LoRAClassifier(nn.Module):
     """Wrapper combining base model with LoRA and classification head."""
 
-    def __init__(self, base_model, classifier_head, pooling_mode="last"):
+    def __init__(self, base_model, classifier_head):
         super().__init__()
         self.base_model = base_model
         self.classifier_head = classifier_head
-        self.pooling_mode = pooling_mode
 
     def forward(self, input_ids, attention_mask, stages):
         # Get hidden states from base model
@@ -256,44 +255,27 @@ class LoRAClassifier(nn.Module):
         # Get last layer hidden states
         hidden_states = outputs.hidden_states[-1]  # [batch, seq, hidden]
 
-        if self.pooling_mode == "mean_logits":
-            # Per-token classification, then average logits
-            batch_size, seq_len, hidden_size = hidden_states.shape
+        # mean_logits: Per-token classification, then average logits
+        batch_size, seq_len, hidden_size = hidden_states.shape
 
-            # Get classifier head (unwrap DDP if needed)
-            clf_head = self.classifier_head.module if hasattr(self.classifier_head, 'module') else self.classifier_head
+        # Get classifier head (unwrap DDP if needed)
+        clf_head = self.classifier_head.module if hasattr(self.classifier_head, 'module') else self.classifier_head
 
-            # Expand stage embedding to all tokens
-            stages_expanded = stages.unsqueeze(1).expand(-1, seq_len)
-            stage_embed = clf_head.stage_embedding(stages_expanded)  # [batch, seq, 64]
+        # Expand stage embedding to all tokens
+        stages_expanded = stages.unsqueeze(1).expand(-1, seq_len)
+        stage_embed = clf_head.stage_embedding(stages_expanded)  # [batch, seq, 64]
 
-            # Concatenate and classify all tokens at once
-            combined = torch.cat([hidden_states, stage_embed], dim=-1)  # [batch, seq, hidden+64]
-            combined_flat = combined.view(batch_size * seq_len, -1)
-            logits_flat = clf_head.classifier(combined_flat)
-            logits_all = logits_flat.view(batch_size, seq_len, -1)  # [batch, seq, 2]
+        # Concatenate and classify all tokens at once
+        combined = torch.cat([hidden_states, stage_embed], dim=-1)  # [batch, seq, hidden+64]
+        combined_flat = combined.view(batch_size * seq_len, -1)
+        logits_flat = clf_head.classifier(combined_flat)
+        logits_all = logits_flat.view(batch_size, seq_len, -1)  # [batch, seq, 2]
 
-            # Masked mean over sequence
-            mask = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
-            logits_sum = (logits_all * mask).sum(dim=1)  # [batch, 2]
-            seq_lens = mask.sum(dim=1)  # [batch, 1]
-            return logits_sum / seq_lens
-
-        elif self.pooling_mode == "mean":
-            # Mean pooling over all valid tokens
-            mask = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
-            sum_hidden = (hidden_states * mask).sum(dim=1)  # [batch, hidden]
-            seq_lens = mask.sum(dim=1)  # [batch, 1]
-            pooled = sum_hidden / seq_lens  # [batch, hidden]
-        else:
-            # Last token pooling (default)
-            seq_lens = attention_mask.sum(dim=1) - 1  # [batch]
-            batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
-            pooled = hidden_states[batch_indices, seq_lens]  # [batch, hidden]
-
-        # Classify
-        logits = self.classifier_head(pooled, stages)
-        return logits
+        # Masked mean over sequence
+        mask = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
+        logits_sum = (logits_all * mask).sum(dim=1)  # [batch, 2]
+        seq_lens = mask.sum(dim=1)  # [batch, 1]
+        return logits_sum / seq_lens
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, grad_accum_steps=4):
@@ -645,8 +627,8 @@ def main():
                         help="Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%%). Keeps memory occupied throughout training.")
     parser.add_argument("--eval-batch-size", type=int, default=16,
                         help="Batch size for cascade evaluation (default: 16)")
-    parser.add_argument("--pooling", type=str, default="last", choices=["last", "mean", "mean_logits"],
-                        help="Pooling strategy: last (last token), mean (mean hidden), mean_logits (per-token classify then avg)")
+    parser.add_argument("--pooling", type=str, default="mean_logits",
+                        help="Pooling strategy: mean_logits (per-token classify then average logits)")
 
     args = parser.parse_args()
 
@@ -826,16 +808,13 @@ def main():
     classifier_head = MentorClassifierHead(hidden_size, dropout=args.dropout).to(device)
 
     # Combine into single model
-    model = LoRAClassifier(base_model, classifier_head, pooling_mode=args.pooling)
-
-    if is_main_process():
-        logger.info(f"Using pooling mode: {args.pooling}")
+    model = LoRAClassifier(base_model, classifier_head)
 
     # Wrap with DDP if needed
     if use_ddp:
         # Only wrap classifier_head with DDP (base_model has device_map issues)
         classifier_head = DDP(classifier_head, device_ids=[local_rank])
-        model = LoRAClassifier(base_model, classifier_head, pooling_mode=args.pooling)
+        model = LoRAClassifier(base_model, classifier_head)
 
     # Release pre-allocated memory now that model is loaded
     if _reserved_memory is not None:
