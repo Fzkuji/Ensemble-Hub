@@ -256,7 +256,30 @@ class LoRAClassifier(nn.Module):
         # Get last layer hidden states
         hidden_states = outputs.hidden_states[-1]  # [batch, seq, hidden]
 
-        if self.pooling_mode == "mean":
+        if self.pooling_mode == "mean_logits":
+            # Per-token classification, then average logits
+            batch_size, seq_len, hidden_size = hidden_states.shape
+
+            # Get classifier head (unwrap DDP if needed)
+            clf_head = self.classifier_head.module if hasattr(self.classifier_head, 'module') else self.classifier_head
+
+            # Expand stage embedding to all tokens
+            stages_expanded = stages.unsqueeze(1).expand(-1, seq_len)
+            stage_embed = clf_head.stage_embedding(stages_expanded)  # [batch, seq, 64]
+
+            # Concatenate and classify all tokens at once
+            combined = torch.cat([hidden_states, stage_embed], dim=-1)  # [batch, seq, hidden+64]
+            combined_flat = combined.view(batch_size * seq_len, -1)
+            logits_flat = clf_head.classifier(combined_flat)
+            logits_all = logits_flat.view(batch_size, seq_len, -1)  # [batch, seq, 2]
+
+            # Masked mean over sequence
+            mask = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
+            logits_sum = (logits_all * mask).sum(dim=1)  # [batch, 2]
+            seq_lens = mask.sum(dim=1)  # [batch, 1]
+            return logits_sum / seq_lens
+
+        elif self.pooling_mode == "mean":
             # Mean pooling over all valid tokens
             mask = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
             sum_hidden = (hidden_states * mask).sum(dim=1)  # [batch, hidden]
@@ -612,8 +635,8 @@ def main():
                         help="Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%%). Keeps memory occupied throughout training.")
     parser.add_argument("--eval-batch-size", type=int, default=16,
                         help="Batch size for cascade evaluation (default: 16)")
-    parser.add_argument("--pooling", type=str, default="last", choices=["last", "mean"],
-                        help="Pooling strategy for hidden states: last (last token) or mean (mean of all tokens)")
+    parser.add_argument("--pooling", type=str, default="last", choices=["last", "mean", "mean_logits"],
+                        help="Pooling strategy: last (last token), mean (mean hidden), mean_logits (per-token classify then avg)")
 
     args = parser.parse_args()
 
