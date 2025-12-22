@@ -238,10 +238,11 @@ def load_json_data(data_dir: str, split: str = "train") -> Dict[int, List[Dict]]
 class LoRAClassifier(nn.Module):
     """Wrapper combining base model with LoRA and classification head."""
 
-    def __init__(self, base_model, classifier_head):
+    def __init__(self, base_model, classifier_head, pooling_mode="last"):
         super().__init__()
         self.base_model = base_model
         self.classifier_head = classifier_head
+        self.pooling_mode = pooling_mode
 
     def forward(self, input_ids, attention_mask, stages):
         # Get hidden states from base model
@@ -255,13 +256,20 @@ class LoRAClassifier(nn.Module):
         # Get last layer hidden states
         hidden_states = outputs.hidden_states[-1]  # [batch, seq, hidden]
 
-        # Get last valid token for each sample
-        seq_lens = attention_mask.sum(dim=1) - 1  # [batch]
-        batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
-        last_hidden = hidden_states[batch_indices, seq_lens]  # [batch, hidden]
+        if self.pooling_mode == "mean":
+            # Mean pooling over all valid tokens
+            mask = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
+            sum_hidden = (hidden_states * mask).sum(dim=1)  # [batch, hidden]
+            seq_lens = mask.sum(dim=1)  # [batch, 1]
+            pooled = sum_hidden / seq_lens  # [batch, hidden]
+        else:
+            # Last token pooling (default)
+            seq_lens = attention_mask.sum(dim=1) - 1  # [batch]
+            batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
+            pooled = hidden_states[batch_indices, seq_lens]  # [batch, hidden]
 
         # Classify
-        logits = self.classifier_head(last_hidden, stages)
+        logits = self.classifier_head(pooled, stages)
         return logits
 
 
@@ -604,6 +612,8 @@ def main():
                         help="Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%%). Keeps memory occupied throughout training.")
     parser.add_argument("--eval-batch-size", type=int, default=16,
                         help="Batch size for cascade evaluation (default: 16)")
+    parser.add_argument("--pooling", type=str, default="last", choices=["last", "mean"],
+                        help="Pooling strategy for hidden states: last (last token) or mean (mean of all tokens)")
 
     args = parser.parse_args()
 
@@ -783,13 +793,16 @@ def main():
     classifier_head = MentorClassifierHead(hidden_size, dropout=args.dropout).to(device)
 
     # Combine into single model
-    model = LoRAClassifier(base_model, classifier_head)
+    model = LoRAClassifier(base_model, classifier_head, pooling_mode=args.pooling)
+
+    if is_main_process():
+        logger.info(f"Using pooling mode: {args.pooling}")
 
     # Wrap with DDP if needed
     if use_ddp:
         # Only wrap classifier_head with DDP (base_model has device_map issues)
         classifier_head = DDP(classifier_head, device_ids=[local_rank])
-        model = LoRAClassifier(base_model, classifier_head)
+        model = LoRAClassifier(base_model, classifier_head, pooling_mode=args.pooling)
 
     # Release pre-allocated memory now that model is loaded
     if _reserved_memory is not None:

@@ -77,10 +77,11 @@ class StageAwareClassifier(nn.Module):
 
 class LoRAClassifierModel(nn.Module):
     """Combined model with LoRA base + classifier head."""
-    def __init__(self, base_model, classifier_head):
+    def __init__(self, base_model, classifier_head, pooling_mode="last"):
         super().__init__()
         self.base_model = base_model
         self.classifier_head = classifier_head
+        self.pooling_mode = pooling_mode
 
     def forward(self, input_ids, attention_mask, stage_ids):
         outputs = self.base_model(
@@ -88,11 +89,20 @@ class LoRAClassifierModel(nn.Module):
             attention_mask=attention_mask,
             output_hidden_states=True,
         )
-        last_hidden = outputs.hidden_states[-1]
-        # Get last token's hidden state (before padding)
-        seq_lengths = attention_mask.sum(dim=1) - 1
-        batch_size = input_ids.size(0)
-        pooled = last_hidden[torch.arange(batch_size), seq_lengths]
+        hidden_states = outputs.hidden_states[-1]
+
+        if self.pooling_mode == "mean":
+            # Mean pooling over all valid tokens
+            mask = attention_mask.unsqueeze(-1).float()
+            sum_hidden = (hidden_states * mask).sum(dim=1)
+            seq_lens = mask.sum(dim=1)
+            pooled = sum_hidden / seq_lens
+        else:
+            # Last token pooling (default)
+            seq_lengths = attention_mask.sum(dim=1) - 1
+            batch_size = input_ids.size(0)
+            pooled = hidden_states[torch.arange(batch_size, device=hidden_states.device), seq_lengths]
+
         return self.classifier_head(pooled, stage_ids)
 
 
@@ -100,9 +110,17 @@ def load_lora_model(model_dir: str, base_model_name: str, device: str):
     """Load LoRA model and classifier head."""
     lora_path = os.path.join(model_dir, "lora_adapter")
     head_path = os.path.join(model_dir, "classifier_head.pt")
+    results_path = os.path.join(model_dir, "results.json")
 
     if not os.path.exists(lora_path) or not os.path.exists(head_path):
         return None, None
+
+    # Load pooling mode from saved results
+    pooling_mode = "last"
+    if os.path.exists(results_path):
+        with open(results_path) as f:
+            results = json.load(f)
+        pooling_mode = results.get('args', {}).get('pooling', 'last')
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
@@ -125,7 +143,8 @@ def load_lora_model(model_dir: str, base_model_name: str, device: str):
     classifier_head = classifier_head.to(device)
     classifier_head.eval()
 
-    model = LoRAClassifierModel(base_model, classifier_head)
+    model = LoRAClassifierModel(base_model, classifier_head, pooling_mode=pooling_mode)
+    print(f"  Loaded LoRA model with pooling mode: {pooling_mode}")
     return model, tokenizer
 
 

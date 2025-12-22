@@ -16,6 +16,7 @@
 #   --memory-lock FRAC   Lock GPU memory at this fraction (0.0-1.0)
 #   --force           Force re-training even if results exist
 #   --no-val          Train on entire train set, search thresholds on train, eval on test
+#   --pooling MODE    Pooling strategy: last (last token) or mean (mean of all tokens)
 #
 # Examples:
 #   ./run_pipeline.sh --think                          # Think mode, 8 GPUs
@@ -39,6 +40,7 @@ RESERVE_MEMORY=0
 MEMORY_LOCK=0
 FORCE=false
 NO_VAL=false
+POOLING="last"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -94,6 +96,10 @@ while [[ $# -gt 0 ]]; do
         --no-val)
             NO_VAL=true
             shift
+            ;;
+        --pooling)
+            POOLING="$2"
+            shift 2
             ;;
         *)
             echo "Unknown option: $1"
@@ -213,7 +219,7 @@ for subset in "${SUBSETS[@]}"; do
     if check_model_exists "$subset" "lora"; then
         echo ">>> LoRA: $subset [SKIP - already trained, use --force to retrain]"
     else
-        echo ">>> Training: $subset (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, no_val=$NO_VAL)"
+        echo ">>> Training: $subset (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, no_val=$NO_VAL)"
         FILTER_FLAG=""
         if [ "$NO_FILTER" = true ]; then
             FILTER_FLAG="--no-filter"
@@ -224,7 +230,8 @@ for subset in "${SUBSETS[@]}"; do
         fi
         CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_lora_classifier.py \
             --ddp --subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
-            --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $FILTER_FLAG $NO_VAL_FLAG
+            --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
+            --pooling $POOLING $FILTER_FLAG $NO_VAL_FLAG
     fi
 done
 
