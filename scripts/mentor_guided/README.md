@@ -11,8 +11,12 @@
 1. [环境准备](#1-环境准备)
 2. [数据收集](#2-数据收集)
 3. [数据统计](#3-数据统计)
-4. [LoRA 分类器训练](#4-lora-分类器训练)
-5. [Cascade 评估](#5-cascade-评估)
+4. [分类器训练](#4-分类器训练)
+   - [4.1 MLP 分类器](#41-mlp-分类器推荐)
+   - [4.2 LoRA 分类器](#42-lora-分类器)
+   - [4.3 PPL 分类器](#43-ppl-分类器)
+   - [4.4 Ensemble 分类器](#44-ensemble-分类器)
+5. [分类器比较](#5-分类器比较)
 6. [结果汇总](#6-结果汇总)
 7. [一键运行](#7-一键运行)
 
@@ -85,131 +89,133 @@ python compute_stats.py \
 
 ---
 
-## 4. LoRA 分类器训练
+## 4. 分类器训练
 
-### 4.1 标准数据训练（所有子集）
+本项目提供多种分类器方法，推荐使用 MLP 分类器（效果好、训练快）。
+
+### 4.1 MLP 分类器（推荐）
+
+MLP 分类器冻结 LLM backbone，只训练一个轻量 MLP head，训练速度快。
 
 ```bash
-# algebra
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset algebra
+# 单个子集训练
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 train_mlp_classifier.py \
+    --ddp --train-subset algebra --eval-subset algebra \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
 
-# counting_and_probability
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset counting_and_probability
-
-# geometry
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset geometry
-
-# intermediate_algebra
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset intermediate_algebra
-
-# number_theory
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset number_theory
-
-# prealgebra
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset prealgebra
-
-# precalculus
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset precalculus
-
-# 所有子集合并训练
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset all
+# 所有子集合并训练，分别测试
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 train_mlp_classifier.py \
+    --ddp --train-subset all --eval-subset all \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
 ```
 
-### 4.2 Think 数据训练（所有子集）
+**MLP 参数说明**:
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--train-subset` | 训练子集，`all` 合并所有子集 | - |
+| `--eval-subset` | 评估子集，`all` 分别测试每个子集 | 同 train |
+| `--pooling` | 池化方式: `last`, `mean`, `mean_logits` | `last` |
+| `--dropout` | Dropout 率 | `0.3` |
+| `--no-val` | 不划分验证集，全量训练 | - |
+| `--fixed-threshold TH` | 使用固定阈值，跳过搜索 | - |
+| `--skip-epoch-cascade` | 训练时跳过每 epoch 的 cascade 评估 | - |
+
+### 4.2 LoRA 分类器
+
+LoRA 分类器微调 LLM，效果可能更好但训练更慢。
 
 ```bash
-# algebra
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset algebra \
+# 单个子集训练
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 train_lora_classifier.py \
+    --ddp --subset algebra \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+```
+
+### 4.3 PPL 分类器
+
+PPL 分类器基于 perplexity/entropy 特征，不需要训练神经网络。
+
+```bash
+# 单个子集训练
+CUDA_VISIBLE_DEVICES=0 python train_ppl_classifier.py \
+    --subset algebra \
+    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+```
+
+### 4.4 Ensemble 分类器
+
+Ensemble 分类器组合多个分类器的预测，使用 meta-classifier 学习最优组合。
+
+```bash
+# MLP + PPL 组合
+python train_ensemble_classifier.py \
+    --subset algebra --use-mlp \
     --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
 
-# counting_and_probability
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset counting_and_probability \
+# LoRA + PPL 组合
+python train_ensemble_classifier.py \
+    --subset algebra \
     --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+```
 
-# geometry
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset geometry \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+**Ensemble 参数说明**:
 
-# intermediate_algebra
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset intermediate_algebra \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--use-mlp` | 使用 MLP 模型（否则用 LoRA） | - |
+| `--no-ppl` | 不使用 PPL 预测 | - |
+| `--method` | Meta-classifier: `rf`, `gb`, `lr` | `rf` |
 
-# number_theory
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset number_theory \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
-
-# prealgebra
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset prealgebra \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
-
-# precalculus
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset precalculus \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
-
-# 所有子集合并训练
-torchrun --nproc_per_node=8 train_lora_classifier.py --ddp --subset all \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+**组合原理**:
+```
+MLP/LoRA 预测概率 ──┐
+                   ├──→ [RandomForest/GradientBoosting/LogisticRegression] ──→ 最终预测
+PPL 预测概率 ──────┘
 ```
 
 ---
 
-## 5. Cascade 评估
+## 5. 分类器比较
 
-### 5.1 标准数据评估（所有子集）
+使用 `run_compare_classifier.sh` 一键比较多种分类器。
+
+### 5.1 基本用法
 
 ```bash
-# algebra
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset algebra
+# 比较所有方法（LoRA、MLP、PPL）
+./run_compare_classifier.sh
 
-# counting_and_probability
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset counting_and_probability
+# 只测试 MLP
+./run_compare_classifier.sh --methods mlp
 
-# geometry
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset geometry
+# 测试 MLP 和 PPL
+./run_compare_classifier.sh --methods mlp,ppl
 
-# intermediate_algebra
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset intermediate_algebra
+# 在所有子集合并训练，分别测试
+./run_compare_classifier.sh --train-subset all --eval-subset all --methods mlp
 
-# number_theory
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset number_theory
-
-# prealgebra
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset prealgebra
-
-# precalculus
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset precalculus
+# 只在特定子集测试
+./run_compare_classifier.sh --subset algebra --methods lora,mlp
 ```
 
-### 5.2 Think 数据评估（所有子集）
+### 5.2 参数说明
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--methods` | 要测试的方法: `lora,mlp,ppl` | `lora,mlp,ppl` |
+| `--train-subset` | 训练子集，`all` 合并所有 | 每个子集单独 |
+| `--eval-subset` | 评估子集，`all` 分别测试 | 同 train |
+| `--subset` | 同时设置 train 和 eval subset | - |
+| `--check` | 只查看状态，不训练 | - |
+| `--force` | 强制重新训练 | - |
+| `--gpus` | GPU 列表 | `0,1,2,3,4,5,6,7` |
+
+### 5.3 查看现有结果
 
 ```bash
-# algebra
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset algebra \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
-
-# counting_and_probability
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset counting_and_probability \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
-
-# geometry
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset geometry \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
-
-# intermediate_algebra
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset intermediate_algebra \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
-
-# number_theory
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset number_theory \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
-
-# prealgebra
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset prealgebra \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
-
-# precalculus
-torchrun --nproc_per_node=8 eval_lora_cascade.py --subset precalculus \
-    --data-dir /mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B
+# 只查看文件状态和已有结果
+./run_compare_classifier.sh --check
 ```
 
 ---
@@ -420,10 +426,13 @@ python collect_data_vllm_think.py \
 | 文件 | 说明 |
 |------|------|
 | `run_pipeline.sh` | 一键运行脚本（支持 --think/--no-think） |
+| `run_compare_classifier.sh` | 分类器比较脚本（支持 --methods 选择方法） |
 | `collect_data_vllm_think.py` | 数据收集（vLLM，支持 Think/Standard 模式） |
 | `compute_stats.py` | 计算 Oracle/Baseline 统计 |
-| `train_lora_classifier.py` | LoRA 分类器训练（8 GPU DDP） |
-| `eval_lora_cascade.py` | Cascade 评估（8 GPU DDP） |
+| `train_mlp_classifier.py` | MLP 分类器训练（推荐，冻结 LLM） |
+| `train_lora_classifier.py` | LoRA 分类器训练（微调 LLM） |
+| `train_ppl_classifier.py` | PPL 分类器训练（基于 perplexity/entropy） |
+| `train_ensemble_classifier.py` | Ensemble 分类器训练（组合多个分类器） |
 | `summarize_results.py` | 汇总所有子集结果 |
 | `eval_model.py` | 单独评测模型性能 |
 
