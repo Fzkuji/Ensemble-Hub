@@ -3,26 +3,29 @@
 # Usage: ./run_pipeline.sh [OPTIONS]
 #
 # Options:
-#   --gpus GPUS       Comma-separated GPU IDs (default: 0,1,2,3,4,5,6,7)
-#   --think           Enable thinking mode (default)
-#   --no-think        Disable thinking mode (standard prompt)
-#   --model MODEL     Model name (default: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B)
-#   --subset SUBSET   Only run on specific subset (default: all subsets)
-#   --lr LR           Learning rate for LoRA training (default: 1e-4)
-#   --epochs EPOCHS   Number of epochs for LoRA training (default: 3)
-#   --batch-size BS   Batch size for LoRA training (default: 4)
-#   --no-filter       Don't filter out all-correct/all-wrong samples
-#   --reserve-memory GB  Pre-allocate GPU memory (released after model load)
-#   --memory-lock FRAC   Lock GPU memory at this fraction (0.0-1.0)
-#   --force           Force re-training even if results exist
-#   --no-val          Train on entire train set, search thresholds on train, eval on test
-#   --pooling MODE    Pooling: last, mean (avg hidden states), mean_logits (per-token classify then avg)
-#   --dropout RATE    Dropout rate for MLP classifier (default: 0.3)
+#   --gpus GPUS           Comma-separated GPU IDs (default: 0,1,2,3,4,5,6,7)
+#   --think               Enable thinking mode (default)
+#   --no-think            Disable thinking mode (standard prompt)
+#   --model MODEL         Model name (default: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B)
+#   --subset SUBSET       (Legacy) Sets both train and eval subset
+#   --train-subset SUBSET Which subset(s) for training. 'all' merges all subsets.
+#   --eval-subset SUBSET  Which subset(s) for eval. 'all' tests each subset separately.
+#   --lr LR               Learning rate for LoRA training (default: 1e-4)
+#   --epochs EPOCHS       Number of epochs for LoRA training (default: 3)
+#   --batch-size BS       Batch size for LoRA training (default: 4)
+#   --no-filter           Don't filter out all-correct/all-wrong samples
+#   --reserve-memory GB   Pre-allocate GPU memory (released after model load)
+#   --memory-lock FRAC    Lock GPU memory at this fraction (0.0-1.0)
+#   --force               Force re-training even if results exist
+#   --no-val              Train on entire train set, search thresholds on train, eval on test
+#   --pooling MODE        Pooling: last, mean (avg hidden states), mean_logits (per-token classify then avg)
+#   --dropout RATE        Dropout rate for MLP classifier (default: 0.3)
 #
 # Examples:
-#   ./run_pipeline.sh --think                          # Think mode, 8 GPUs
-#   ./run_pipeline.sh --think --subset algebra         # Only algebra subset
-#   ./run_pipeline.sh --no-think --gpus 1,2,3,4,5,6,7  # Standard mode, skip GPU 0
+#   ./run_pipeline.sh --think                                    # Think mode, 8 GPUs, all subsets
+#   ./run_pipeline.sh --train-subset all --eval-subset algebra   # Train on all, test on algebra
+#   ./run_pipeline.sh --train-subset all --eval-subset all       # Train on all, test each separately
+#   ./run_pipeline.sh --subset algebra                           # Train & test on algebra only
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,6 +36,8 @@ GPUS="0,1,2,3,4,5,6,7"
 USE_THINK=true
 MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 SUBSET=""
+TRAIN_SUBSET=""
+EVAL_SUBSET=""
 LR="1e-4"
 EPOCHS="3"
 BATCH_SIZE=4
@@ -65,6 +70,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --subset)
             SUBSET="$2"
+            shift 2
+            ;;
+        --train-subset)
+            TRAIN_SUBSET="$2"
+            shift 2
+            ;;
+        --eval-subset)
+            EVAL_SUBSET="$2"
             shift 2
             ;;
         --lr)
@@ -128,18 +141,32 @@ fi
 
 DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_${MODE}_${MODEL_NAME}"
 
-# Set subsets based on --subset argument
+# Handle subset arguments: --subset sets both, individual args override
 ALL_SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
-USE_ALL_SUBSETS=false
+
+# If --subset is set, use it as default for both train and eval
 if [ -n "$SUBSET" ]; then
-    if [ "$SUBSET" = "all" ]; then
-        USE_ALL_SUBSETS=true
-        SUBSETS=("${ALL_SUBSETS[@]}")  # Data collection still needs individual subsets
-    else
-        SUBSETS=("$SUBSET")
+    if [ -z "$TRAIN_SUBSET" ]; then
+        TRAIN_SUBSET="$SUBSET"
     fi
+    if [ -z "$EVAL_SUBSET" ]; then
+        EVAL_SUBSET="$SUBSET"
+    fi
+fi
+
+# Default: if nothing specified, run each subset individually
+if [ -z "$TRAIN_SUBSET" ]; then
+    TRAIN_SUBSET=""  # Will loop through all subsets individually
+fi
+if [ -z "$EVAL_SUBSET" ]; then
+    EVAL_SUBSET="$TRAIN_SUBSET"  # Default eval to same as train
+fi
+
+# Determine which subsets need data collection (always all individual subsets)
+if [ -n "$TRAIN_SUBSET" ] && [ "$TRAIN_SUBSET" != "all" ]; then
+    DATA_SUBSETS=("$TRAIN_SUBSET")
 else
-    SUBSETS=("${ALL_SUBSETS[@]}")
+    DATA_SUBSETS=("${ALL_SUBSETS[@]}")
 fi
 
 # Token levels: -1 = mentor only, 0 = intern only, others = mentor hint + intern
@@ -156,6 +183,8 @@ echo "Mode: $MODE"
 echo "Model: $MODEL"
 echo "Data dir: $DATA_DIR"
 echo "GPUs: $GPUS (${NUM_GPUS} GPUs)"
+echo "Train subset: ${TRAIN_SUBSET:-all (individual)}"
+echo "Eval subset: ${EVAL_SUBSET:-same as train}"
 echo "============================================================"
 
 # Helper function to check if data collection is complete for a subset/split
@@ -191,7 +220,7 @@ echo "========== Step 1: Collect Data (${NUM_GPUS} GPUs parallel) =========="
 
 # Check if train data already exists
 TRAIN_EXISTS=true
-for subset in "${SUBSETS[@]}"; do
+for subset in "${DATA_SUBSETS[@]}"; do
     if ! check_data_exists "$subset" "train"; then
         TRAIN_EXISTS=false
         break
@@ -207,7 +236,7 @@ fi
 
 # Check if test data already exists
 TEST_EXISTS=true
-for subset in "${SUBSETS[@]}"; do
+for subset in "${DATA_SUBSETS[@]}"; do
     if ! check_data_exists "$subset" "test"; then
         TEST_EXISTS=false
         break
@@ -237,20 +266,27 @@ if [ "$NO_VAL" = true ]; then
     NO_VAL_FLAG="--no-val"
 fi
 
-if [ "$USE_ALL_SUBSETS" = true ]; then
-    # Train single MLP on all subsets combined, evaluate on all subsets separately
-    if check_model_exists "all" "mlp"; then
-        echo ">>> MLP: all [SKIP - already trained, use --force to retrain]"
+if [ -n "$TRAIN_SUBSET" ]; then
+    # Specific train subset specified
+    if [ "$TRAIN_SUBSET" = "all" ]; then
+        MODEL_DIR="all"
     else
-        echo ">>> Training MLP on ALL subsets combined, evaluating each separately"
+        MODEL_DIR="$TRAIN_SUBSET"
+    fi
+
+    if check_model_exists "$MODEL_DIR" "mlp"; then
+        echo ">>> MLP: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET [SKIP - already trained, use --force to retrain]"
+    else
+        echo ">>> Training MLP: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET"
         echo ">>> (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
         CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
-            --ddp --train-subset all --eval-subset all --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
+            --ddp --train-subset $TRAIN_SUBSET --eval-subset $EVAL_SUBSET --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
             --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
             --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG
     fi
 else
-    for subset in "${SUBSETS[@]}"; do
+    # No train subset specified - train each subset individually
+    for subset in "${ALL_SUBSETS[@]}"; do
         if check_model_exists "$subset" "mlp"; then
             echo ">>> MLP: $subset [SKIP - already trained, use --force to retrain]"
         else
@@ -265,10 +301,16 @@ fi
 
 echo ""
 echo "========== Step 4: Train PPL Classifiers =========="
-if [ "$USE_ALL_SUBSETS" = true ]; then
-    echo ">>> PPL training skipped for --subset all (not supported)"
+if [ "$TRAIN_SUBSET" = "all" ]; then
+    echo ">>> PPL training skipped for --train-subset all (not supported)"
 else
-    for subset in "${SUBSETS[@]}"; do
+    # Determine subsets for PPL training
+    if [ -n "$TRAIN_SUBSET" ]; then
+        PPL_SUBSETS=("$TRAIN_SUBSET")
+    else
+        PPL_SUBSETS=("${ALL_SUBSETS[@]}")
+    fi
+    for subset in "${PPL_SUBSETS[@]}"; do
         if check_model_exists "$subset" "ppl"; then
             echo ">>> PPL: $subset [SKIP - already trained, use --force to retrain]"
         else
@@ -281,10 +323,16 @@ fi
 
 echo ""
 echo "========== Step 5: Train Ensemble (MLP + PPL) =========="
-if [ "$USE_ALL_SUBSETS" = true ]; then
-    echo ">>> Ensemble training skipped for --subset all (not supported)"
+if [ "$TRAIN_SUBSET" = "all" ]; then
+    echo ">>> Ensemble training skipped for --train-subset all (not supported)"
 else
-    for subset in "${SUBSETS[@]}"; do
+    # Determine subsets for Ensemble training
+    if [ -n "$TRAIN_SUBSET" ]; then
+        ENS_SUBSETS=("$TRAIN_SUBSET")
+    else
+        ENS_SUBSETS=("${ALL_SUBSETS[@]}")
+    fi
+    for subset in "${ENS_SUBSETS[@]}"; do
         if check_model_exists "$subset" "ensemble"; then
             echo ">>> Ensemble: $subset [SKIP - already trained, use --force to retrain]"
         else
