@@ -956,52 +956,51 @@ def main():
         if is_main_process():
             logger.info(f"Train Cascade Acc: {final_cascade_acc:.4f} (Oracle: {final_detailed['oracle']:.4f})")
 
-    # Final evaluation on test (in no-val mode)
+    # Final evaluation on test (always do this for consistent Oracle)
     test_results_per_subset = {}
-    if not args.use_val:
-        # Determine which subsets to evaluate
-        if eval_all_subsets:
-            eval_subsets = SUBSETS
-        else:
-            eval_subsets = [args.eval_subset]
+    # Determine which subsets to evaluate
+    if eval_all_subsets:
+        eval_subsets = SUBSETS
+    else:
+        eval_subsets = [args.eval_subset]
+
+    if is_main_process():
+        logger.info(f"\n=== Final Test Evaluation on {len(eval_subsets)} subset(s) ===")
+
+    for eval_subset in eval_subsets:
+        eval_subset_dir = os.path.join(args.data_dir, eval_subset)
+        if is_main_process():
+            logger.info(f"\nEvaluating on: {eval_subset}")
+
+        # Load test data for this subset
+        subset_test_data = load_json_data(eval_subset_dir, split="test")
+        if not subset_test_data or not subset_test_data.get(TOKEN_LEVELS[0]):
+            if is_main_process():
+                logger.warning(f"  No test data found for {eval_subset}, skipping...")
+            continue
+
+        n_test = len(subset_test_data[TOKEN_LEVELS[0]])
+        if is_main_process():
+            logger.info(f"  Test samples: {n_test}")
+
+        # Evaluate (use fixed_threshold if set, otherwise search)
+        test_cascade_acc, _, test_detailed = eval_cascade_on_val(
+            model, subset_test_data, tokenizer, args.max_length, device,
+            fixed_threshold=args.fixed_threshold
+        )
+
+        test_results_per_subset[eval_subset] = {
+            'cascade_acc': float(test_cascade_acc),
+            'oracle_acc': test_detailed['oracle'],
+            'per_stage_auc': test_detailed['auc'],
+            'per_stage_baseline_acc': test_detailed['baseline'],
+            'n_test': n_test,
+        }
 
         if is_main_process():
-            logger.info(f"\n=== Final Test Evaluation on {len(eval_subsets)} subset(s) ===")
-
-        for eval_subset in eval_subsets:
-            eval_subset_dir = os.path.join(args.data_dir, eval_subset)
-            if is_main_process():
-                logger.info(f"\nEvaluating on: {eval_subset}")
-
-            # Load test data for this subset
-            subset_test_data = load_json_data(eval_subset_dir, split="test")
-            if not subset_test_data or not subset_test_data.get(TOKEN_LEVELS[0]):
-                if is_main_process():
-                    logger.warning(f"  No test data found for {eval_subset}, skipping...")
-                continue
-
-            n_test = len(subset_test_data[TOKEN_LEVELS[0]])
-            if is_main_process():
-                logger.info(f"  Test samples: {n_test}")
-
-            # Evaluate (use fixed_threshold if set, otherwise search)
-            test_cascade_acc, _, test_detailed = eval_cascade_on_val(
-                model, subset_test_data, tokenizer, args.max_length, device,
-                fixed_threshold=args.fixed_threshold
-            )
-
-            test_results_per_subset[eval_subset] = {
-                'cascade_acc': float(test_cascade_acc),
-                'oracle_acc': test_detailed['oracle'],
-                'per_stage_auc': test_detailed['auc'],
-                'per_stage_baseline_acc': test_detailed['baseline'],
-                'n_test': n_test,
-            }
-
-            if is_main_process():
-                logger.info(f"  Cascade Acc: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
-                auc_str = ", ".join([f"T{t}={test_detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
-                logger.info(f"  AUC: {auc_str}")
+            logger.info(f"  Cascade Acc: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
+            auc_str = ", ".join([f"T{t}={test_detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
+            logger.info(f"  AUC: {auc_str}")
 
     if is_main_process():
         logger.info("\n=== Final Results ===")

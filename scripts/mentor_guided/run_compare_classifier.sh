@@ -20,6 +20,7 @@
 #   --dropout RATE        Dropout rate for MLP classifier (default: 0.3)
 #   --fixed-threshold TH  Use fixed threshold instead of searching
 #   --skip-epoch-cascade  Skip cascade evaluation after each epoch
+#   --classifier TYPE     PPL classifier type: gb (GradientBoosting), lr (LogisticRegression)
 #
 # Examples:
 #   ./run_compare_classifier.sh --methods mlp                    # Only test MLP
@@ -50,6 +51,7 @@ POOLING="mean_logits"
 DROPOUT=0.3
 FIXED_THRESHOLD=""
 SKIP_EPOCH_CASCADE=false
+CLASSIFIER="gb"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -121,6 +123,10 @@ while [[ $# -gt 0 ]]; do
         --skip-epoch-cascade)
             SKIP_EPOCH_CASCADE=true
             shift
+            ;;
+        --classifier)
+            CLASSIFIER="$2"
+            shift 2
             ;;
         *)
             echo "Unknown option: $1"
@@ -322,8 +328,10 @@ all_subsets = "algebra counting_and_probability geometry intermediate_algebra nu
 print(f"{'Subset':<25} {'LoRA':>10} {'MLP':>10} {'PPL':>10} {'Ensemble':>10} {'Oracle':>10} {'Best':>10}")
 print("-" * 90)
 
-# Check for unified "all" model first
+# Check for unified "all" model results (MLP and PPL)
 all_mlp_dir = os.path.join(data_dir, "all", "mlp_model")
+all_ppl_dir = os.path.join(data_dir, "all", "ppl_model")
+
 all_mlp_results = None
 for fname in ["results_all.json", "results.json"]:
     fpath = os.path.join(all_mlp_dir, fname)
@@ -332,17 +340,56 @@ for fname in ["results_all.json", "results.json"]:
             all_mlp_results = json.load(f)
         break
 
-if all_mlp_results:
-    acc = all_mlp_results.get('test_best_cascade_acc', all_mlp_results.get('best_cascade_acc', 0))
-    oracle = all_mlp_results.get('test_oracle_acc', all_mlp_results.get('oracle_acc', 0))
-    print(f"{'all (unified)':<25} {'-':>10} {acc:>10.4f} {'-':>10} {'-':>10} {oracle:>10.4f} {'MLP':>10}")
+all_ppl_results = None
+ppl_path = os.path.join(all_ppl_dir, "results.json")
+if os.path.exists(ppl_path):
+    with open(ppl_path) as f:
+        all_ppl_results = json.load(f)
+
+if all_mlp_results or all_ppl_results:
+    mlp_acc = all_mlp_results.get('test_best_cascade_acc', all_mlp_results.get('best_cascade_acc', 0)) if all_mlp_results else 0
+    ppl_acc = all_ppl_results.get('test_best_cascade_acc', all_ppl_results.get('best_cascade_acc', 0)) if all_ppl_results else 0
+    oracle = (all_ppl_results or all_mlp_results).get('test_oracle_acc', (all_ppl_results or all_mlp_results).get('oracle_acc', 0))
+    mlp_str = f"{mlp_acc:.4f}" if mlp_acc else "-"
+    ppl_str = f"{ppl_acc:.4f}" if ppl_acc else "-"
+    best = "MLP" if mlp_acc >= ppl_acc else "PPL"
+    print(f"{'all (unified)':<25} {'-':>10} {mlp_str:>10} {ppl_str:>10} {'-':>10} {oracle:>10.4f} {best:>10}")
     print("-" * 90)
 
 for subset in all_subsets:
     row = {"lora": "-", "mlp": "-", "ppl": "-", "ensemble": "-", "oracle": "-"}
     best_val, best_name = 0, "-"
 
+    oracles = []
     for m in ["lora", "mlp", "ppl", "ensemble"]:
+        # First check unified "all" model's per-subset results
+        if m == "mlp" and all_mlp_results and 'test_results_per_subset' in all_mlp_results:
+            if subset in all_mlp_results['test_results_per_subset']:
+                sub_r = all_mlp_results['test_results_per_subset'][subset]
+                acc = sub_r.get('cascade_acc', 0)
+                row[m] = f"{acc:.4f}"
+                oracle_val = sub_r.get('oracle_acc')
+                if oracle_val is not None:
+                    oracles.append(oracle_val)
+                    if row["oracle"] == "-":
+                        row["oracle"] = f"{oracle_val:.4f}"
+                if acc > best_val:
+                    best_val, best_name = acc, "MLP"
+                continue
+        if m == "ppl" and all_ppl_results and 'test_results' in all_ppl_results:
+            if subset in all_ppl_results['test_results']:
+                sub_r = all_ppl_results['test_results'][subset]
+                acc = sub_r.get('cascade_acc', 0)
+                row[m] = f"{acc:.4f}"
+                oracle_val = sub_r.get('oracle_acc')
+                if oracle_val is not None:
+                    oracles.append(oracle_val)
+                    # Prefer PPL's Oracle
+                    row["oracle"] = f"{oracle_val:.4f}"
+                if acc > best_val:
+                    best_val, best_name = acc, "PPL"
+                continue
+        # Fall back to per-subset results file
         path = f"{data_dir}/{subset}/{m}_model/results.json"
         if os.path.exists(path):
             try:
@@ -350,12 +397,20 @@ for subset in all_subsets:
                     r = json.load(f)
                 acc = r.get('test_best_cascade_acc', r.get('best_cascade_acc', 0))
                 row[m] = f"{acc:.4f}"
-                if row["oracle"] == "-" and 'oracle_acc' in r:
-                    row["oracle"] = f"{r.get('test_oracle_acc', r.get('oracle_acc')):.4f}"
+                oracle_val = r.get('test_oracle_acc', r.get('oracle_acc'))
+                if oracle_val is not None:
+                    oracles.append(oracle_val)
+                    # Prefer PPL's Oracle (evaluated on raw test data)
+                    if m == "ppl" or row["oracle"] == "-":
+                        row["oracle"] = f"{oracle_val:.4f}"
                 if acc > best_val:
                     best_val, best_name = acc, m.upper()[:3]
             except:
                 pass
+
+    # Check Oracle consistency
+    if len(set(f"{o:.4f}" for o in oracles)) > 1:
+        row["oracle"] = "MISMATCH"
 
     print(f"{subset:<25} {row['lora']:>10} {row['mlp']:>10} {row['ppl']:>10} {row['ensemble']:>10} {row['oracle']:>10} {best_name:>10}")
 
@@ -458,10 +513,10 @@ if [ "$RUN_PPL" = true ]; then
         if check_model_exists "all" "ppl"; then
             echo ">>> PPL: train=all, eval=$EVAL_SUBSET [SKIP - already trained]"
         else
-            echo ">>> PPL: train=all, eval=$EVAL_SUBSET (no_val=$NO_VAL)"
+            echo ">>> PPL: train=all, eval=$EVAL_SUBSET (no_val=$NO_VAL, classifier=$CLASSIFIER)"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
                 --ddp --train-subset all --eval-subset "$EVAL_SUBSET" --data-dir $DATA_DIR \
-                --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+                --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK --classifier $CLASSIFIER $NO_VAL_FLAG
         fi
     else
         # Individual subset training
@@ -477,10 +532,10 @@ if [ "$RUN_PPL" = true ]; then
                 echo ">>> PPL: $subset [SKIP - already trained]"
             else
                 echo ""
-                echo ">>> PPL: $subset (no_val=$NO_VAL)"
+                echo ">>> PPL: $subset (no_val=$NO_VAL, classifier=$CLASSIFIER)"
                 CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
                     --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR \
-                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK --classifier $CLASSIFIER $NO_VAL_FLAG
             fi
         done
     fi
@@ -583,8 +638,10 @@ print("=" * 115)
 print(f"{'Subset':<25} {'LoRA':>12} {'MLP':>12} {'PPL':>12} {'Ensemble':>12} {'Oracle':>12} {'Best':>12}")
 print("-" * 115)
 
-# Check for unified "all" MLP model
+# Check for unified "all" model results (MLP and PPL)
 all_mlp_dir = os.path.join(data_dir, "all", "mlp_model")
+all_ppl_dir = os.path.join(data_dir, "all", "ppl_model")
+
 all_mlp_results = None
 for fname in ["results_all.json", "results.json"]:
     fpath = os.path.join(all_mlp_dir, fname)
@@ -593,12 +650,21 @@ for fname in ["results_all.json", "results.json"]:
             all_mlp_results = json.load(f)
         break
 
-if all_mlp_results and train_subset == "all":
-    mlp_casc = get_cascade_acc(all_mlp_results)
-    oracle_val = get_oracle(all_mlp_results)
+all_ppl_results = None
+ppl_path = os.path.join(all_ppl_dir, "results.json")
+if os.path.exists(ppl_path):
+    with open(ppl_path) as f:
+        all_ppl_results = json.load(f)
+
+if (all_mlp_results or all_ppl_results) and train_subset == "all":
+    mlp_casc = get_cascade_acc(all_mlp_results) if all_mlp_results else None
+    ppl_casc = get_cascade_acc(all_ppl_results) if all_ppl_results else None
+    oracle_val = get_oracle(all_ppl_results) or get_oracle(all_mlp_results)
     mlp_acc = f"{mlp_casc:.4f}" if mlp_casc is not None else "-"
+    ppl_acc = f"{ppl_casc:.4f}" if ppl_casc is not None else "-"
     oracle = f"{oracle_val:.4f}" if oracle_val is not None else "-"
-    print(f"{'all (unified)':<25} {'-':>12} {mlp_acc:>12} {'-':>12} {'-':>12} {oracle:>12} {'MLP':>12}")
+    best = "MLP" if (mlp_casc or 0) >= (ppl_casc or 0) else "PPL"
+    print(f"{'all (unified)':<25} {'-':>12} {mlp_acc:>12} {ppl_acc:>12} {'-':>12} {oracle:>12} {best:>12}")
     print("-" * 115)
 
 all_results = {}
@@ -607,6 +673,14 @@ for subset in all_subsets:
     mlp = get_results(subset, "mlp")
     ppl = get_results(subset, "ppl")
     ensemble = get_results(subset, "ensemble")
+
+    # Override with unified "all" model per-subset results if available
+    if all_mlp_results and 'test_results_per_subset' in all_mlp_results:
+        if subset in all_mlp_results['test_results_per_subset']:
+            mlp = all_mlp_results['test_results_per_subset'][subset]
+    if all_ppl_results and 'test_results' in all_ppl_results:
+        if subset in all_ppl_results['test_results']:
+            ppl = all_ppl_results['test_results'][subset]
 
     lora_casc = get_cascade_acc(lora)
     mlp_casc = get_cascade_acc(mlp)
@@ -618,18 +692,29 @@ for subset in all_subsets:
     ppl_acc = f"{ppl_casc:.4f}" if ppl_casc is not None else "-"
     ensemble_acc = f"{ensemble_casc:.4f}" if ensemble_casc is not None else "-"
 
-    oracle_val = get_oracle(lora) or get_oracle(mlp) or get_oracle(ppl) or get_oracle(ensemble)
+    # Use each classifier's own Oracle for fair comparison
+    # Priority: PPL > MLP > LoRA > Ensemble (PPL evaluated on raw test data)
+    oracle_val = get_oracle(ppl) or get_oracle(mlp) or get_oracle(lora) or get_oracle(ensemble)
     oracle = f"{oracle_val:.4f}" if oracle_val is not None else "-"
 
     accs = []
     if lora_casc is not None:
-        accs.append(('LoRA', lora_casc))
+        lora_oracle = get_oracle(lora)
+        accs.append(('LoRA', lora_casc, lora_oracle))
     if mlp_casc is not None:
-        accs.append(('MLP', mlp_casc))
+        mlp_oracle = get_oracle(mlp)
+        accs.append(('MLP', mlp_casc, mlp_oracle))
     if ppl_casc is not None:
-        accs.append(('PPL', ppl_casc))
+        ppl_oracle = get_oracle(ppl)
+        accs.append(('PPL', ppl_casc, ppl_oracle))
     if ensemble_casc is not None:
-        accs.append(('Ens', ensemble_casc))
+        ens_oracle = get_oracle(ensemble)
+        accs.append(('Ens', ensemble_casc, ens_oracle))
+
+    # Check for Oracle inconsistency (bug detection)
+    oracles = [o for _, _, o in accs if o is not None]
+    if len(set(f"{o:.4f}" for o in oracles)) > 1:
+        oracle = "MISMATCH"  # Flag Oracle inconsistency
 
     best = max(accs, key=lambda x: x[1])[0] if accs else "-"
 

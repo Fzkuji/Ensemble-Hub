@@ -747,14 +747,13 @@ def main():
         if is_main_process():
             logger.info(f"Train: {n_train} samples, Val: {n_val} samples (split ratio: {1-args.val_ratio:.0%}/{args.val_ratio:.0%})")
 
-    # Load test data for --no-val mode (evaluate on test each epoch)
+    # Always load test data for final evaluation (ensures consistent Oracle)
     test_data = None
-    if not args.use_val:
-        if is_main_process():
-            logger.info("Loading test data for evaluation...")
-        test_data = load_json_data(subset_dir, split="test")
-        if test_data and is_main_process():
-            logger.info(f"Test: {len(test_data[TOKEN_LEVELS[0]])} samples")
+    if is_main_process():
+        logger.info("Loading test data for evaluation...")
+    test_data = load_json_data(subset_dir, split="test")
+    if test_data and is_main_process():
+        logger.info(f"Test: {len(test_data[TOKEN_LEVELS[0]])} samples")
 
     # Load tokenizer
     if is_main_process():
@@ -1009,6 +1008,20 @@ def main():
             base_model.save_pretrained(args.output_dir)
             tokenizer.save_pretrained(args.output_dir)
             logger.info(f"Best model saved to {args.output_dir}")
+
+        # Also evaluate on test to get consistent Oracle (same as --no-val mode)
+        test_cascade_acc = None
+        test_detailed = None
+        if test_data is not None:
+            if is_main_process():
+                logger.info("\nEvaluating on test with thresholds from val...")
+            test_cascade_acc, _, test_detailed = eval_cascade_with_thresholds(
+                model, test_data, tokenizer, args.max_length, device, final_thresholds, args.eval_batch_size
+            )
+            if is_main_process():
+                logger.info(f"Test Cascade Acc: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
+                auc_str = ", ".join([f"T{t}={test_detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
+                logger.info(f"Test Per-stage AUC: {auc_str}")
     else:
         # No validation: search thresholds on entire train set (unfiltered)
         if is_main_process():
@@ -1081,8 +1094,8 @@ def main():
             'args': vars(args),
         }
 
-        # Add test results in no-val mode
-        if not args.use_val and test_cascade_acc is not None:
+        # Always add test results (ensures consistent Oracle across all classifiers)
+        if test_cascade_acc is not None:
             results['test_cascade_acc'] = float(test_cascade_acc)
             results['test_oracle_acc'] = test_detailed['oracle']
             results['test_per_stage_auc'] = test_detailed['auc']
