@@ -22,6 +22,7 @@
 #   --dropout RATE        Dropout rate for MLP classifier (default: 0.3)
 #   --fixed-threshold TH  Use fixed threshold instead of searching (e.g., 0.5)
 #   --unfiltered-val      Use unfiltered data for validation/threshold search
+#   --skip-epoch-cascade  Skip cascade evaluation after each epoch (faster training)
 #
 # Examples:
 #   ./run_pipeline.sh --think                                    # Think mode, 8 GPUs, all subsets
@@ -52,6 +53,7 @@ POOLING="last"
 DROPOUT=0.3
 FIXED_THRESHOLD=""
 UNFILTERED_VAL=false
+SKIP_EPOCH_CASCADE=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -130,6 +132,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --unfiltered-val)
             UNFILTERED_VAL=true
+            shift
+            ;;
+        --skip-epoch-cascade)
+            SKIP_EPOCH_CASCADE=true
             shift
             ;;
         *)
@@ -285,6 +291,10 @@ UNFILTERED_VAL_FLAG=""
 if [ "$UNFILTERED_VAL" = true ]; then
     UNFILTERED_VAL_FLAG="--unfiltered-val"
 fi
+SKIP_EPOCH_CASCADE_FLAG=""
+if [ "$SKIP_EPOCH_CASCADE" = true ]; then
+    SKIP_EPOCH_CASCADE_FLAG="--skip-epoch-cascade"
+fi
 
 if [ -n "$TRAIN_SUBSET" ]; then
     # Specific train subset specified
@@ -302,7 +312,7 @@ if [ -n "$TRAIN_SUBSET" ]; then
         CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
             --ddp --train-subset $TRAIN_SUBSET --eval-subset $EVAL_SUBSET --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
             --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
-            --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG
+            --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG $SKIP_EPOCH_CASCADE_FLAG
     fi
 else
     # No train subset specified - train each subset individually
@@ -314,7 +324,7 @@ else
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
                 --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
                 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
-                --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG
+                --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG $SKIP_EPOCH_CASCADE_FLAG
         fi
     done
 fi
