@@ -1054,9 +1054,16 @@ def main():
                 results['test_best_cascade_acc'] = sum(r['cascade_acc'] for r in test_results_per_subset.values()) / len(test_results_per_subset)
                 results['test_oracle_acc'] = sum(r['oracle_acc'] for r in test_results_per_subset.values()) / len(test_results_per_subset)
 
-        with open(os.path.join(args.output_dir, "results.json"), 'w') as f:
+        # When train_subset is "all", include eval_subset in filename to avoid overwriting
+        if args.train_subset == "all":
+            results_filename = f"results_{args.eval_subset}.json"
+        else:
+            results_filename = "results.json"
+
+        results_path = os.path.join(args.output_dir, results_filename)
+        with open(results_path, 'w') as f:
             json.dump(results, f, indent=2)
-        logger.info(f"Results saved to {args.output_dir}/results.json")
+        logger.info(f"Results saved to {results_path}")
 
     cleanup_distributed()
 

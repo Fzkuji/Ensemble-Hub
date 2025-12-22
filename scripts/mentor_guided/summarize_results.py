@@ -163,18 +163,47 @@ def summarize(data_dir: str, show_length: bool = True):
     total_intern_len = {0: 0, 100: 0, 500: 0, 1000: 0}
     total_len_count = {0: 0, 100: 0, 500: 0, 1000: 0}
 
-    # Check if there's a unified "all" model with per-subset test results
+    # Check for unified "all" model results with per-subset test results
+    # Try: results_all.json (new), results.json (legacy), or per-subset results_{subset}.json
     all_mlp_results = None
-    all_mlp_file = os.path.join(data_dir, "all", "mlp_model", "results.json")
-    if os.path.exists(all_mlp_file):
-        with open(all_mlp_file, 'r') as f:
-            all_mlp_results = json.load(f)
+    all_mlp_dir = os.path.join(data_dir, "all", "mlp_model")
+
+    # Try results_all.json first (new format), then results.json (legacy)
+    for fname in ["results_all.json", "results.json"]:
+        fpath = os.path.join(all_mlp_dir, fname)
+        if os.path.exists(fpath):
+            with open(fpath, 'r') as f:
+                all_mlp_results = json.load(f)
+            break
 
     for subset in SUBSETS:
         r = None
 
-        # Priority: 1) all/mlp_model results, 2) subset/mlp_model, 3) subset/lora_model
-        if all_mlp_results and 'test_results_per_subset' in all_mlp_results:
+        # Priority: 1) per-subset results file, 2) all/mlp_model with test_results_per_subset, 3) subset/mlp_model, 4) subset/lora_model
+        # Check for per-subset result file (e.g., results_algebra.json)
+        subset_result_file = os.path.join(all_mlp_dir, f"results_{subset}.json")
+        if os.path.exists(subset_result_file):
+            with open(subset_result_file, 'r') as f:
+                subset_mlp = json.load(f)
+            # Get from test_results_per_subset if available
+            if 'test_results_per_subset' in subset_mlp and subset in subset_mlp['test_results_per_subset']:
+                subset_results = subset_mlp['test_results_per_subset'][subset]
+                r = {
+                    'n_test': subset_results.get('n_test', subset_results.get('n_samples', 0)),
+                    'baseline': subset_results.get('per_stage_baseline_acc', {}),
+                    'oracle': subset_results.get('oracle_acc', 0),
+                    'cascade_accuracy': subset_results.get('cascade_acc', 0),
+                }
+            else:
+                # Fallback to top-level results
+                r = {
+                    'n_test': subset_mlp.get('n_val', 0),
+                    'baseline': subset_mlp.get('test_per_stage_baseline_acc', subset_mlp.get('per_stage_baseline_acc', {})),
+                    'oracle': subset_mlp.get('test_oracle_acc', subset_mlp.get('oracle_acc', 0)),
+                    'cascade_accuracy': subset_mlp.get('test_best_cascade_acc', subset_mlp.get('best_cascade_acc', 0)),
+                }
+
+        if r is None and all_mlp_results and 'test_results_per_subset' in all_mlp_results:
             subset_results = all_mlp_results['test_results_per_subset'].get(subset)
             if subset_results:
                 # Convert MLP test_results_per_subset format to expected format
