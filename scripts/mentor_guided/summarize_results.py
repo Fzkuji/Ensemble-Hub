@@ -163,6 +163,9 @@ def summarize(data_dir: str, show_length: bool = True):
     total_intern_len = {0: 0, 100: 0, 500: 0, 1000: 0}
     total_len_count = {0: 0, 100: 0, 500: 0, 1000: 0}
 
+    # Collect gap data for later analysis
+    collected_gaps = []  # [(subset, gap, n, oracle, cascade)]
+
     # Check for unified "all" model results with per-subset test results
     # Try: results_all.json (new), results.json (legacy), or per-subset results_{subset}.json
     all_mlp_results = None
@@ -297,6 +300,9 @@ def summarize(data_dir: str, show_length: bool = True):
         total_t500 += t500 * n
         total_t1000 += t1000 * n
 
+        # Collect for gap analysis
+        collected_gaps.append((subset, gap, n, oracle, cascade))
+
     print("-" * line_width)
     if total_n > 0:
         avg_t0 = total_t0 / total_n
@@ -331,23 +337,15 @@ def summarize(data_dir: str, show_length: bool = True):
 
     print("=" * line_width)
 
-    # Additional analysis
+    # Additional analysis (using collected data from main loop)
     print("\n" + "=" * 60)
     print("Gap Analysis (Cascade - Best Baseline)")
     print("=" * 60)
 
-    gaps = []
-    for subset in SUBSETS:
-        result_file = os.path.join(data_dir, subset, "lora_model", "cascade_eval.json")
-        if os.path.exists(result_file):
-            with open(result_file, 'r') as f:
-                r = json.load(f)
-            gap = r['cascade_accuracy'] - max(r['baseline'].values())
-            gaps.append((subset, gap, r['n_test']))
-
-    if gaps:
-        gaps.sort(key=lambda x: x[1], reverse=True)
-        for subset, gap, n in gaps:
+    if collected_gaps:
+        # Sort by gap descending
+        sorted_gaps = sorted(collected_gaps, key=lambda x: x[1], reverse=True)
+        for subset, gap, n, oracle, cascade in sorted_gaps:
             status = "+" if gap > 0 else ""
             print(f"  {subset:<{W_SUBSET}}: {status}{gap:.4f} ({status}{gap*100:.2f}%)")
 
@@ -356,16 +354,9 @@ def summarize(data_dir: str, show_length: bool = True):
     print("Oracle Gap Analysis (Oracle - Cascade)")
     print("=" * 60)
 
-    oracle_gaps = []
-    for subset in SUBSETS:
-        result_file = os.path.join(data_dir, subset, "lora_model", "cascade_eval.json")
-        if os.path.exists(result_file):
-            with open(result_file, 'r') as f:
-                r = json.load(f)
-            oracle_gap = r['oracle'] - r['cascade_accuracy']
-            oracle_gaps.append((subset, oracle_gap, r['n_test']))
-
-    if oracle_gaps:
+    if collected_gaps:
+        # Sort by oracle gap descending
+        oracle_gaps = [(s, o - c, n) for s, g, n, o, c in collected_gaps]
         oracle_gaps.sort(key=lambda x: x[1], reverse=True)
         for subset, gap, n in oracle_gaps:
             print(f"  {subset:<{W_SUBSET}}: {gap:.4f} ({gap*100:.2f}%)")
