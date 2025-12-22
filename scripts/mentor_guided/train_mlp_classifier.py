@@ -478,6 +478,8 @@ def main():
                         help="Don't filter out all-correct/all-wrong samples")
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--val-ratio", type=float, default=0.3)
+    parser.add_argument("--no-val", action="store_true",
+                        help="Train on entire train set, search thresholds on train data")
     parser.add_argument("--reserve-memory", type=float, default=0,
                         help="Pre-allocate GPU memory in GB to prevent others from using it (released after model load)")
     parser.add_argument("--memory-lock", type=float, default=0,
@@ -563,25 +565,34 @@ def main():
         cleanup_distributed()
         return
 
-    # Split train/val
-    from sklearn.model_selection import train_test_split as sk_split
+    # Split train/val (or use all data if --no-val)
     n_samples = len(train_data[TOKEN_LEVELS[0]])
-    train_idx, val_idx = sk_split(
-        np.arange(n_samples), test_size=args.val_ratio, random_state=42
-    )
 
-    val_data = {}
-    actual_train_data = {}
-    for tokens in TOKEN_LEVELS:
-        if tokens in train_data:
-            val_data[tokens] = [train_data[tokens][i] for i in val_idx]
-            actual_train_data[tokens] = [train_data[tokens][i] for i in train_idx]
-    train_data = actual_train_data
+    if args.no_val:
+        # Use all data for both training and threshold search
+        val_data = train_data  # Same data for threshold search
+        n_train = n_samples
+        n_val = n_samples
+        if is_main_process():
+            logger.info(f"No-val mode: Train on all {n_train} samples, search thresholds on same data")
+    else:
+        from sklearn.model_selection import train_test_split as sk_split
+        train_idx, val_idx = sk_split(
+            np.arange(n_samples), test_size=args.val_ratio, random_state=42
+        )
 
-    n_train = len(train_data[TOKEN_LEVELS[0]])
-    n_val = len(val_data[TOKEN_LEVELS[0]])
-    if is_main_process():
-        logger.info(f"Train: {n_train}, Val: {n_val}")
+        val_data = {}
+        actual_train_data = {}
+        for tokens in TOKEN_LEVELS:
+            if tokens in train_data:
+                val_data[tokens] = [train_data[tokens][i] for i in val_idx]
+                actual_train_data[tokens] = [train_data[tokens][i] for i in train_idx]
+        train_data = actual_train_data
+
+        n_train = len(train_data[TOKEN_LEVELS[0]])
+        n_val = len(val_data[TOKEN_LEVELS[0]])
+        if is_main_process():
+            logger.info(f"Train: {n_train}, Val: {n_val}")
 
     # Load tokenizer
     if is_main_process():
