@@ -163,14 +163,51 @@ def summarize(data_dir: str, show_length: bool = True):
     total_intern_len = {0: 0, 100: 0, 500: 0, 1000: 0}
     total_len_count = {0: 0, 100: 0, 500: 0, 1000: 0}
 
+    # Check if there's a unified "all" model with per-subset test results
+    all_mlp_results = None
+    all_mlp_file = os.path.join(data_dir, "all", "mlp_model", "results.json")
+    if os.path.exists(all_mlp_file):
+        with open(all_mlp_file, 'r') as f:
+            all_mlp_results = json.load(f)
+
     for subset in SUBSETS:
-        result_file = os.path.join(data_dir, subset, "lora_model", "cascade_eval.json")
-        if not os.path.exists(result_file):
+        r = None
+
+        # Priority: 1) all/mlp_model results, 2) subset/mlp_model, 3) subset/lora_model
+        if all_mlp_results and 'test_results_per_subset' in all_mlp_results:
+            subset_results = all_mlp_results['test_results_per_subset'].get(subset)
+            if subset_results:
+                # Convert MLP test_results_per_subset format to expected format
+                r = {
+                    'n_test': subset_results.get('n_samples', 0),
+                    'baseline': subset_results.get('per_stage_baseline_acc', {}),
+                    'oracle': subset_results.get('oracle_acc', 0),
+                    'cascade_accuracy': subset_results.get('cascade_acc', 0),
+                }
+
+        if r is None:
+            # Try subset-specific MLP results
+            mlp_file = os.path.join(data_dir, subset, "mlp_model", "results.json")
+            if os.path.exists(mlp_file):
+                with open(mlp_file, 'r') as f:
+                    mlp_r = json.load(f)
+                r = {
+                    'n_test': mlp_r.get('n_val', 0),
+                    'baseline': mlp_r.get('test_per_stage_baseline_acc', mlp_r.get('per_stage_baseline_acc', {})),
+                    'oracle': mlp_r.get('test_oracle_acc', mlp_r.get('oracle_acc', 0)),
+                    'cascade_accuracy': mlp_r.get('test_best_cascade_acc', mlp_r.get('best_cascade_acc', 0)),
+                }
+
+        if r is None:
+            # Fall back to LoRA cascade_eval.json
+            result_file = os.path.join(data_dir, subset, "lora_model", "cascade_eval.json")
+            if os.path.exists(result_file):
+                with open(result_file, 'r') as f:
+                    r = json.load(f)
+
+        if r is None:
             print(f"{subset:<{W_SUBSET}} (not evaluated)")
             continue
-
-        with open(result_file, 'r') as f:
-            r = json.load(f)
 
         n = r['n_test']
         b = r['baseline']
