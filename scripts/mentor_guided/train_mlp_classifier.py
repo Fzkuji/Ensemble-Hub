@@ -896,13 +896,10 @@ def main():
             if is_main_process():
                 logger.info(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
 
-        # Cascade evaluation on train (for threshold search) - skip if --skip-epoch-cascade
-        if not args.skip_epoch_cascade:
+        # Cascade evaluation on train (for threshold search) - skip if --skip-epoch-cascade or --fixed-threshold
+        if not args.skip_epoch_cascade and args.fixed_threshold is None:
             if is_main_process():
-                if args.fixed_threshold is not None:
-                    logger.info(f"Running cascade evaluation with fixed threshold={args.fixed_threshold}...")
-                else:
-                    logger.info("Running cascade evaluation on train (for threshold search)...")
+                logger.info("Running cascade evaluation on train (for threshold search)...")
             cascade_acc, thresholds, detailed = eval_cascade_on_val(
                 model, val_data_for_cascade, tokenizer, args.max_length, device,
                 fixed_threshold=args.fixed_threshold
