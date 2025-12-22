@@ -229,14 +229,31 @@ for subset in "${SUBSETS[@]}"; do
 done
 
 echo ""
-echo "========== Step 4: Evaluate Cascade =========="
+echo "========== Step 4: Train PPL Classifiers =========="
 for subset in "${SUBSETS[@]}"; do
-    echo "Evaluating: $subset"
-    CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS eval_lora_cascade.py --subset $subset --data-dir $DATA_DIR
+    if check_model_exists "$subset" "ppl"; then
+        echo ">>> PPL: $subset [SKIP - already trained, use --force to retrain]"
+    else
+        echo ">>> Training PPL: $subset"
+        CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python train_ppl_classifier.py \
+            --subset $subset --data-dir $DATA_DIR
+    fi
 done
 
 echo ""
-echo "========== Step 5: Summarize Results =========="
+echo "========== Step 5: Train Ensemble (LoRA + PPL) =========="
+for subset in "${SUBSETS[@]}"; do
+    if check_model_exists "$subset" "ensemble"; then
+        echo ">>> Ensemble: $subset [SKIP - already trained, use --force to retrain]"
+    else
+        echo ">>> Training Ensemble: $subset"
+        CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python train_ensemble_classifier.py \
+            --subset $subset --data-dir $DATA_DIR --base-model $MODEL
+    fi
+done
+
+echo ""
+echo "========== Step 6: Summarize Results =========="
 python summarize_results.py --data-dir $DATA_DIR
 
 echo ""
