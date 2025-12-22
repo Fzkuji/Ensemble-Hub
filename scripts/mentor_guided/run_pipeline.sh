@@ -16,7 +16,7 @@
 #   --memory-lock FRAC   Lock GPU memory at this fraction (0.0-1.0)
 #   --force           Force re-training even if results exist
 #   --no-val          Train on entire train set, search thresholds on train, eval on test
-#   --pooling MODE    Pooling strategy: last (last token) or mean (mean of all tokens)
+#   --pooling MODE    Pooling: last, mean (avg hidden states), mean_logits (per-token classify then avg)
 #   --dropout RATE    Dropout rate for MLP classifier (default: 0.3)
 #
 # Examples:

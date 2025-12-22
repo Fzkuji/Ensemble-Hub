@@ -242,7 +242,27 @@ class MLPClassifierModel(nn.Module):
             )
         hidden_states = outputs.hidden_states[-1]
 
-        if self.pooling_mode == "mean":
+        if self.pooling_mode == "mean_logits":
+            # Per-token classification, then average logits (no for loop)
+            batch_size, seq_len, hidden_size = hidden_states.shape
+
+            # Expand stage embedding to all tokens
+            stages_expanded = stage_ids.unsqueeze(1).expand(-1, seq_len)
+            stage_embed = self.classifier_head.stage_embedding(stages_expanded)
+
+            # Concatenate and classify all tokens at once
+            combined = torch.cat([hidden_states, stage_embed], dim=-1)
+            combined_flat = combined.view(batch_size * seq_len, -1)
+            logits_flat = self.classifier_head.classifier(combined_flat)
+            logits_all = logits_flat.view(batch_size, seq_len, -1)
+
+            # Masked mean over sequence
+            mask = attention_mask.unsqueeze(-1).float()
+            logits_sum = (logits_all * mask).sum(dim=1)
+            seq_lens = mask.sum(dim=1)
+            return logits_sum / seq_lens
+
+        elif self.pooling_mode == "mean":
             mask = attention_mask.unsqueeze(-1).float()
             sum_hidden = (hidden_states * mask).sum(dim=1)
             seq_lens = mask.sum(dim=1)

@@ -242,20 +242,42 @@ class FrozenLLMClassifier(nn.Module):
         # Get last layer hidden states
         hidden_states = outputs.hidden_states[-1]  # [batch, seq, hidden]
 
-        if self.pooling_mode == "mean":
-            # Mean pooling over all valid tokens
+        if self.pooling_mode == "mean_logits":
+            # Per-token classification, then average logits (no for loop)
+            batch_size, seq_len, hidden_size = hidden_states.shape
+
+            # Expand stage embedding to all tokens: [batch] -> [batch, seq]
+            stages_expanded = stages.unsqueeze(1).expand(-1, seq_len)
+            stage_embed = self.classifier_head.stage_embedding(stages_expanded)  # [batch, seq, 64]
+
+            # Concatenate hidden states with stage embedding
+            combined = torch.cat([hidden_states.detach(), stage_embed], dim=-1)  # [batch, seq, hidden+64]
+
+            # Reshape to [batch*seq, hidden+64], pass through classifier
+            combined_flat = combined.view(batch_size * seq_len, -1)
+            logits_flat = self.classifier_head.classifier(combined_flat)  # [batch*seq, 2]
+            logits_all = logits_flat.view(batch_size, seq_len, -1)  # [batch, seq, 2]
+
+            # Masked mean over sequence
+            mask = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
+            logits_sum = (logits_all * mask).sum(dim=1)  # [batch, 2]
+            seq_lens = mask.sum(dim=1)  # [batch, 1]
+            logits = logits_sum / seq_lens  # [batch, 2]
+
+        elif self.pooling_mode == "mean":
+            # Mean pooling over all valid tokens, then classify once
             mask = attention_mask.unsqueeze(-1).float()  # [batch, seq, 1]
             sum_hidden = (hidden_states * mask).sum(dim=1)  # [batch, hidden]
             seq_lens = mask.sum(dim=1)  # [batch, 1]
             pooled = sum_hidden / seq_lens  # [batch, hidden]
+            logits = self.classifier_head(pooled.detach(), stages)
         else:
             # Last token pooling (default)
             seq_lens = attention_mask.sum(dim=1) - 1
             batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
             pooled = hidden_states[batch_indices, seq_lens]  # [batch, hidden]
+            logits = self.classifier_head(pooled.detach(), stages)
 
-        # Classify (this part has gradients)
-        logits = self.classifier_head(pooled.detach(), stages)
         return logits
 
 
@@ -457,7 +479,7 @@ def main():
                         help="Pre-allocate GPU memory in GB to prevent others from using it (released after model load)")
     parser.add_argument("--memory-lock", type=float, default=0,
                         help="Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%%). Keeps memory occupied throughout training.")
-    parser.add_argument("--pooling", type=str, default="last", choices=["last", "mean"],
+    parser.add_argument("--pooling", type=str, default="last", choices=["last", "mean", "mean_logits"],
                         help="Pooling strategy for hidden states: last (last token) or mean (mean of all tokens)")
 
     args = parser.parse_args()
