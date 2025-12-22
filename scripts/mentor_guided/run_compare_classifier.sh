@@ -12,6 +12,7 @@
 #   --check               Only check file status (no training)
 #   --force               Force re-training even if results exist
 #   --batch-size BS       Batch size for LoRA/MLP training (default: 4)
+#   --epochs EPOCHS       Number of training epochs (default: 2)
 #   --reserve-memory GB   Pre-allocate GPU memory
 #   --memory-lock FRAC    Lock GPU memory at this fraction (0.0-1.0)
 #   --no-val              Train on entire train set, eval on test
@@ -40,6 +41,7 @@ METHODS="lora,mlp,ppl"  # Default: all methods
 CHECK_ONLY=false
 FORCE=false
 BATCH_SIZE=4
+EPOCHS=2
 RESERVE_MEMORY=0
 MEMORY_LOCK=0
 NO_VAL=false
@@ -85,6 +87,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --batch-size)
             BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --epochs)
+            EPOCHS="$2"
             shift 2
             ;;
         --reserve-memory)
@@ -380,7 +386,7 @@ if [ "$RUN_LORA" = true ]; then
                 echo ""
                 echo ">>> LoRA: $subset"
                 CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
-                    --ddp --subset $subset --data-dir $DATA_DIR --epochs 3 --batch-size $BATCH_SIZE \
+                    --ddp --subset $subset --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
                     --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
             fi
         done
@@ -403,7 +409,7 @@ if [ "$RUN_MLP" = true ]; then
             echo ">>> MLP: train=all, eval=$EVAL_SUBSET"
             echo "    (pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29506 train_mlp_classifier.py \
-                --ddp --train-subset all --eval-subset "$EVAL_SUBSET" --data-dir $DATA_DIR --epochs 10 --batch-size $BATCH_SIZE \
+                --ddp --train-subset all --eval-subset "$EVAL_SUBSET" --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
                 --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
                 --pooling $POOLING --dropout $DROPOUT $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $SKIP_EPOCH_CASCADE_FLAG
         fi
@@ -423,7 +429,7 @@ if [ "$RUN_MLP" = true ]; then
                 echo ""
                 echo ">>> MLP: $subset"
                 CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29506 train_mlp_classifier.py \
-                    --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR --epochs 10 --batch-size $BATCH_SIZE \
+                    --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
                     --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
                     --pooling $POOLING --dropout $DROPOUT $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $SKIP_EPOCH_CASCADE_FLAG
             fi
