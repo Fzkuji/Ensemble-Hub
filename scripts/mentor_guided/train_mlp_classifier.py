@@ -543,12 +543,12 @@ def main():
                         help="Use 4-bit quantization for memory efficiency")
     parser.add_argument("--ddp", action="store_true",
                         help="Use DistributedDataParallel")
-    # Filter settings: default is NO filter (keep all samples)
+    # Filter settings: default is FILTER (remove all-correct/all-wrong samples)
     parser.add_argument("--filter", dest="filter_data", action="store_true",
-                        help="Filter out all-correct/all-wrong samples")
+                        help="Filter out all-correct/all-wrong samples (default)")
     parser.add_argument("--no-filter", dest="filter_data", action="store_false",
-                        help="Don't filter samples (default)")
-    parser.set_defaults(filter_data=False)
+                        help="Don't filter samples")
+    parser.set_defaults(filter_data=True)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--val-ratio", type=float, default=0.3)
     # Validation settings: default is NO validation split
