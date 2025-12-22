@@ -225,15 +225,19 @@ for subset in "${SUBSETS[@]}"; do
     if check_model_exists "$subset" "mlp"; then
         echo ">>> MLP: $subset [SKIP - already trained, use --force to retrain]"
     else
-        echo ">>> Training MLP: $subset (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT)"
+        echo ">>> Training MLP: $subset (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
         FILTER_FLAG=""
         if [ "$NO_FILTER" = true ]; then
             FILTER_FLAG="--no-filter"
         fi
+        NO_VAL_FLAG=""
+        if [ "$NO_VAL" = true ]; then
+            NO_VAL_FLAG="--no-val"
+        fi
         CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
             --ddp --subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
             --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
-            --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG
+            --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG
     fi
 done
 
