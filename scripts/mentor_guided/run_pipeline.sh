@@ -238,13 +238,14 @@ if [ "$NO_VAL" = true ]; then
 fi
 
 if [ "$USE_ALL_SUBSETS" = true ]; then
-    # Train single MLP on all subsets combined
+    # Train single MLP on all subsets combined, evaluate on all subsets separately
     if check_model_exists "all" "mlp"; then
         echo ">>> MLP: all [SKIP - already trained, use --force to retrain]"
     else
-        echo ">>> Training MLP on ALL subsets combined (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
+        echo ">>> Training MLP on ALL subsets combined, evaluating each separately"
+        echo ">>> (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
         CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
-            --ddp --subset all --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
+            --ddp --train-subset all --eval-subset all --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
             --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
             --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG
     fi
@@ -255,7 +256,7 @@ else
         else
             echo ">>> Training MLP: $subset (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
+                --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
                 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
                 --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG
         fi

@@ -485,9 +485,15 @@ def main():
     parser.add_argument("--data-dir", type=str,
                         default="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split",
                         help="Base directory with subset folders")
-    parser.add_argument("--subset", type=str, default="algebra",
+    parser.add_argument("--subset", type=str, default=None,
                         choices=SUBSETS + ["all"],
-                        help="Which subset to train on")
+                        help="(Legacy) Sets both train and eval subset. Use --train-subset and --eval-subset for finer control.")
+    parser.add_argument("--train-subset", type=str, default=None,
+                        choices=SUBSETS + ["all"],
+                        help="Which subset(s) for training. 'all' merges all subsets.")
+    parser.add_argument("--eval-subset", type=str, default=None,
+                        choices=SUBSETS + ["all"],
+                        help="Which subset(s) for evaluation. 'all' evaluates each subset separately.")
     parser.add_argument("--model-path", type=str,
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
     parser.add_argument("--output-dir", type=str, default=None,
@@ -519,6 +525,19 @@ def main():
                         help="Pooling strategy for hidden states: last (last token) or mean (mean of all tokens)")
 
     args = parser.parse_args()
+
+    # Handle subset arguments: --subset sets both, individual args override
+    if args.subset is not None:
+        if args.train_subset is None:
+            args.train_subset = args.subset
+        if args.eval_subset is None:
+            args.eval_subset = args.subset
+    else:
+        # Default to algebra if nothing specified
+        if args.train_subset is None:
+            args.train_subset = "algebra"
+        if args.eval_subset is None:
+            args.eval_subset = args.train_subset  # Default eval to same as train
 
     rank, world_size, local_rank = setup_distributed()
     use_ddp = args.ddp or world_size > 1
@@ -564,38 +583,40 @@ def main():
         if is_main_process():
             logger.info(f"Pre-allocated {args.reserve_memory:.1f} GB GPU memory on {device} (will release after model load)")
 
-    use_all_subsets = (args.subset == "all")
+    train_all_subsets = (args.train_subset == "all")
+    eval_all_subsets = (args.eval_subset == "all")
 
-    if use_all_subsets:
-        # When using all subsets, output goes to data_dir/all/mlp_model
-        subset_dir = os.path.join(args.data_dir, "all")
-        os.makedirs(subset_dir, exist_ok=True)
+    if train_all_subsets:
+        # When training on all subsets, output goes to data_dir/all/mlp_model
+        train_subset_dir = os.path.join(args.data_dir, "all")
+        os.makedirs(train_subset_dir, exist_ok=True)
     else:
-        subset_dir = os.path.join(args.data_dir, args.subset)
-        if not os.path.exists(subset_dir):
+        train_subset_dir = os.path.join(args.data_dir, args.train_subset)
+        if not os.path.exists(train_subset_dir):
             if is_main_process():
-                logger.error(f"Data directory not found: {subset_dir}")
+                logger.error(f"Data directory not found: {train_subset_dir}")
             cleanup_distributed()
             return
 
     if args.output_dir is None:
-        args.output_dir = os.path.join(subset_dir, "mlp_model")
+        args.output_dir = os.path.join(train_subset_dir, "mlp_model")
     if is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)
 
     if is_main_process():
         logger.info(f"=== MLP Classifier (Frozen LLM) ===")
-        logger.info(f"Subset: {args.subset}")
-        logger.info(f"Data dir: {args.data_dir if use_all_subsets else subset_dir}")
+        logger.info(f"Train subset: {args.train_subset}")
+        logger.info(f"Eval subset: {args.eval_subset}")
+        logger.info(f"Data dir: {args.data_dir}")
         logger.info(f"DDP: {use_ddp}, World size: {world_size}")
 
     # Load train data
     if is_main_process():
         logger.info("Loading training data...")
-    if use_all_subsets:
+    if train_all_subsets:
         train_data = load_all_subsets_data(args.data_dir, split="train")
     else:
-        train_data = load_json_data(subset_dir, split="train")
+        train_data = load_json_data(train_subset_dir, split="train")
 
     if not train_data or not train_data.get(TOKEN_LEVELS[0]):
         if is_main_process():
@@ -612,16 +633,12 @@ def main():
         n_train = n_samples
         n_val = n_samples
 
-        # Load test data for evaluation
-        if use_all_subsets:
-            test_data = load_all_subsets_data(args.data_dir, split="test")
-        else:
-            test_data = load_json_data(subset_dir, split="test")
-        n_test = len(test_data[TOKEN_LEVELS[0]]) if test_data and test_data.get(TOKEN_LEVELS[0]) else 0
+        # test_data will be loaded later based on eval_subset (can be per-subset evaluation)
+        test_data = None  # Placeholder, actual loading happens after training
 
         if is_main_process():
             logger.info(f"No-val mode: Train on all {n_train} samples")
-            logger.info(f"Test split: {n_test} samples (for final cascade eval)")
+            logger.info(f"Eval subset: {args.eval_subset} (will evaluate after training)")
     else:
         test_data = None  # Not used in normal mode
         from sklearn.model_selection import train_test_split as sk_split
@@ -843,6 +860,8 @@ def main():
     # Save best model
     if is_main_process() and best_state:
         torch.save(best_state, os.path.join(args.output_dir, "best_model.pt"))
+        # Also save as classifier_head.pt for compatibility with ensemble training
+        torch.save(best_state['classifier'], os.path.join(args.output_dir, "classifier_head.pt"))
         logger.info(f"Best model saved to {args.output_dir}")
 
     # Save last model
@@ -861,27 +880,71 @@ def main():
         logger.info(f"Train Cascade Acc: {final_cascade_acc:.4f} (Oracle: {final_detailed['oracle']:.4f})")
 
     # Final evaluation on test (in no-val mode)
-    final_test_cascade_acc = None
-    final_test_detailed = None
-    if args.no_val and test_data:
+    test_results_per_subset = {}
+    if args.no_val:
+        # Determine which subsets to evaluate
+        if eval_all_subsets:
+            eval_subsets = SUBSETS
+        else:
+            eval_subsets = [args.eval_subset]
+
         if is_main_process():
-            logger.info("\nFinal cascade evaluation on test...")
-        final_test_cascade_acc, _, final_test_detailed = eval_cascade_on_val(
-            model, test_data, tokenizer, args.max_length, device
-        )
-        if is_main_process():
-            logger.info(f"Test Cascade Acc: {final_test_cascade_acc:.4f} (Oracle: {final_test_detailed['oracle']:.4f})")
+            logger.info(f"\n=== Final Test Evaluation on {len(eval_subsets)} subset(s) ===")
+
+        for eval_subset in eval_subsets:
+            eval_subset_dir = os.path.join(args.data_dir, eval_subset)
+            if is_main_process():
+                logger.info(f"\nEvaluating on: {eval_subset}")
+
+            # Load test data for this subset
+            subset_test_data = load_json_data(eval_subset_dir, split="test")
+            if not subset_test_data or not subset_test_data.get(TOKEN_LEVELS[0]):
+                if is_main_process():
+                    logger.warning(f"  No test data found for {eval_subset}, skipping...")
+                continue
+
+            n_test = len(subset_test_data[TOKEN_LEVELS[0]])
+            if is_main_process():
+                logger.info(f"  Test samples: {n_test}")
+
+            # Evaluate
+            test_cascade_acc, _, test_detailed = eval_cascade_on_val(
+                model, subset_test_data, tokenizer, args.max_length, device
+            )
+
+            test_results_per_subset[eval_subset] = {
+                'cascade_acc': float(test_cascade_acc),
+                'oracle_acc': test_detailed['oracle'],
+                'per_stage_auc': test_detailed['auc'],
+                'per_stage_baseline_acc': test_detailed['baseline'],
+                'n_test': n_test,
+            }
+
+            if is_main_process():
+                logger.info(f"  Cascade Acc: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
+                auc_str = ", ".join([f"T{t}={test_detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
+                logger.info(f"  AUC: {auc_str}")
 
     if is_main_process():
         logger.info("\n=== Final Results ===")
         logger.info(f"Train Cascade Accuracy: {final_cascade_acc:.4f}")
-        if final_test_cascade_acc is not None:
-            logger.info(f"Test Cascade Accuracy: {final_test_cascade_acc:.4f}")
         logger.info(f"Thresholds: {final_thresholds}")
+
+        if test_results_per_subset:
+            logger.info("\nTest Results by Subset:")
+            for subset_name, subset_result in test_results_per_subset.items():
+                logger.info(f"  {subset_name}: {subset_result['cascade_acc']:.4f} (Oracle: {subset_result['oracle_acc']:.4f})")
+
+            # Compute overall average if multiple subsets
+            if len(test_results_per_subset) > 1:
+                avg_cascade = sum(r['cascade_acc'] for r in test_results_per_subset.values()) / len(test_results_per_subset)
+                avg_oracle = sum(r['oracle_acc'] for r in test_results_per_subset.values()) / len(test_results_per_subset)
+                logger.info(f"  Average: {avg_cascade:.4f} (Oracle: {avg_oracle:.4f})")
 
         results = {
             'method': 'mlp_frozen',
-            'subset': args.subset,
+            'train_subset': args.train_subset,
+            'eval_subset': args.eval_subset,
             'n_train': n_train,
             'n_val': n_val,
             'best_cascade_acc': float(final_cascade_acc),
@@ -892,12 +955,20 @@ def main():
             'args': vars(args),
         }
 
-        # Add test results if available
-        if final_test_cascade_acc is not None:
-            results['test_best_cascade_acc'] = float(final_test_cascade_acc)
-            results['test_oracle_acc'] = final_test_detailed['oracle']
-            results['test_per_stage_auc'] = final_test_detailed['auc']
-            results['test_per_stage_baseline_acc'] = final_test_detailed['baseline']
+        # Add test results
+        if test_results_per_subset:
+            results['test_results_per_subset'] = test_results_per_subset
+            # For backward compatibility, also add overall test results
+            if len(test_results_per_subset) == 1:
+                single_result = list(test_results_per_subset.values())[0]
+                results['test_best_cascade_acc'] = single_result['cascade_acc']
+                results['test_oracle_acc'] = single_result['oracle_acc']
+                results['test_per_stage_auc'] = single_result['per_stage_auc']
+                results['test_per_stage_baseline_acc'] = single_result['per_stage_baseline_acc']
+            else:
+                # Multiple subsets: compute averages
+                results['test_best_cascade_acc'] = sum(r['cascade_acc'] for r in test_results_per_subset.values()) / len(test_results_per_subset)
+                results['test_oracle_acc'] = sum(r['oracle_acc'] for r in test_results_per_subset.values()) / len(test_results_per_subset)
 
         with open(os.path.join(args.output_dir, "results.json"), 'w') as f:
             json.dump(results, f, indent=2)
