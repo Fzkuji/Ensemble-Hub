@@ -8,7 +8,7 @@
 #   --train-subset SUBSET Which subset(s) for training. 'all' merges all subsets.
 #   --eval-subset SUBSET  Which subset(s) for eval. 'all' tests each subset separately.
 #   --data-dir DIR        Data directory
-#   --methods METHODS     Comma-separated methods to run: lora,mlp,ppl (default: all)
+#   --methods METHODS     Comma-separated methods: lora,mlp,ppl,ensemble,all (default: lora,mlp,ppl)
 #   --check               Only check file status (no training)
 #   --force               Force re-training even if results exist
 #   --batch-size BS       Batch size for LoRA/MLP training (default: 4)
@@ -24,6 +24,7 @@
 # Examples:
 #   ./run_compare_classifier.sh --methods mlp                    # Only test MLP
 #   ./run_compare_classifier.sh --methods mlp,ppl                # Test MLP and PPL
+#   ./run_compare_classifier.sh --methods mlp,ppl,ensemble       # MLP, PPL, then ensemble (MLP+PPL)
 #   ./run_compare_classifier.sh --train-subset all --eval-subset all  # Train on all, test each
 #   ./run_compare_classifier.sh --subset algebra --methods lora  # LoRA on algebra only
 
@@ -136,13 +137,16 @@ NUM_GPUS=${#GPU_ARRAY[@]}
 RUN_LORA=false
 RUN_MLP=false
 RUN_PPL=false
+RUN_ENSEMBLE=false
 IFS=',' read -ra METHOD_ARRAY <<< "$METHODS"
 for method in "${METHOD_ARRAY[@]}"; do
     case $method in
         lora) RUN_LORA=true ;;
         mlp) RUN_MLP=true ;;
         ppl) RUN_PPL=true ;;
-        *) echo "Unknown method: $method (valid: lora, mlp, ppl)"; exit 1 ;;
+        ensemble) RUN_ENSEMBLE=true ;;
+        all) RUN_LORA=true; RUN_MLP=true; RUN_PPL=true; RUN_ENSEMBLE=true ;;
+        *) echo "Unknown method: $method (valid: lora, mlp, ppl, ensemble, all)"; exit 1 ;;
     esac
 done
 
@@ -273,33 +277,37 @@ fi
 if [ "$CHECK_ONLY" = true ]; then
     echo ""
     echo "========== FILE STATUS =========="
-    printf "%-25s %-10s %-10s %-10s\n" "Subset" "LoRA" "MLP" "PPL"
-    echo "------------------------------------------------------------"
+    printf "%-25s %-10s %-10s %-10s %-10s\n" "Subset" "LoRA" "MLP" "PPL" "Ensemble"
+    echo "--------------------------------------------------------------------"
 
     # Check for unified "all" model
     if [ -d "$DATA_DIR/all/mlp_model" ] || [ -d "$DATA_DIR/all/lora_model" ]; then
         lora_status="-"
         mlp_status="-"
         ppl_status="-"
+        ens_status="-"
         [ -f "$DATA_DIR/all/lora_model/results.json" ] && lora_status="OK"
         # Check for results_all.json or results.json
         [ -f "$DATA_DIR/all/mlp_model/results_all.json" ] && mlp_status="OK"
         [ -f "$DATA_DIR/all/mlp_model/results.json" ] && mlp_status="OK"
         [ -f "$DATA_DIR/all/ppl_model/results.json" ] && ppl_status="OK"
-        printf "%-25s %-10s %-10s %-10s\n" "all (unified)" "$lora_status" "$mlp_status" "$ppl_status"
-        echo "------------------------------------------------------------"
+        [ -f "$DATA_DIR/all/ensemble_model/results.json" ] && ens_status="OK"
+        printf "%-25s %-10s %-10s %-10s %-10s\n" "all (unified)" "$lora_status" "$mlp_status" "$ppl_status" "$ens_status"
+        echo "--------------------------------------------------------------------"
     fi
 
     for subset in "${ALL_SUBSETS[@]}"; do
         lora_status="-"
         mlp_status="-"
         ppl_status="-"
+        ens_status="-"
         [ -f "$DATA_DIR/$subset/lora_model/results.json" ] && lora_status="OK"
         [ -f "$DATA_DIR/$subset/mlp_model/results.json" ] && mlp_status="OK"
         [ -f "$DATA_DIR/$subset/ppl_model/results.json" ] && ppl_status="OK"
-        printf "%-25s %-10s %-10s %-10s\n" "$subset" "$lora_status" "$mlp_status" "$ppl_status"
+        [ -f "$DATA_DIR/$subset/ensemble_model/results.json" ] && ens_status="OK"
+        printf "%-25s %-10s %-10s %-10s %-10s\n" "$subset" "$lora_status" "$mlp_status" "$ppl_status" "$ens_status"
     done
-    echo "============================================================"
+    echo "======================================================================"
 
     # Show results comparison
     echo ""
@@ -311,8 +319,8 @@ import os
 data_dir = "$DATA_DIR"
 all_subsets = "algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus".split()
 
-print(f"{'Subset':<25} {'LoRA':>10} {'MLP':>10} {'PPL':>10} {'Oracle':>10} {'Best':>10}")
-print("-" * 75)
+print(f"{'Subset':<25} {'LoRA':>10} {'MLP':>10} {'PPL':>10} {'Ensemble':>10} {'Oracle':>10} {'Best':>10}")
+print("-" * 90)
 
 # Check for unified "all" model first
 all_mlp_dir = os.path.join(data_dir, "all", "mlp_model")
@@ -327,14 +335,14 @@ for fname in ["results_all.json", "results.json"]:
 if all_mlp_results:
     acc = all_mlp_results.get('test_best_cascade_acc', all_mlp_results.get('best_cascade_acc', 0))
     oracle = all_mlp_results.get('test_oracle_acc', all_mlp_results.get('oracle_acc', 0))
-    print(f"{'all (unified)':<25} {'-':>10} {acc:>10.4f} {'-':>10} {oracle:>10.4f} {'MLP':>10}")
-    print("-" * 75)
+    print(f"{'all (unified)':<25} {'-':>10} {acc:>10.4f} {'-':>10} {'-':>10} {oracle:>10.4f} {'MLP':>10}")
+    print("-" * 90)
 
 for subset in all_subsets:
-    row = {"lora": "-", "mlp": "-", "ppl": "-", "oracle": "-"}
+    row = {"lora": "-", "mlp": "-", "ppl": "-", "ensemble": "-", "oracle": "-"}
     best_val, best_name = 0, "-"
 
-    for m in ["lora", "mlp", "ppl"]:
+    for m in ["lora", "mlp", "ppl", "ensemble"]:
         path = f"{data_dir}/{subset}/{m}_model/results.json"
         if os.path.exists(path):
             try:
@@ -345,13 +353,13 @@ for subset in all_subsets:
                 if row["oracle"] == "-" and 'oracle_acc' in r:
                     row["oracle"] = f"{r.get('test_oracle_acc', r.get('oracle_acc')):.4f}"
                 if acc > best_val:
-                    best_val, best_name = acc, m.upper()
+                    best_val, best_name = acc, m.upper()[:3]
             except:
                 pass
 
-    print(f"{subset:<25} {row['lora']:>10} {row['mlp']:>10} {row['ppl']:>10} {row['oracle']:>10} {best_name:>10}")
+    print(f"{subset:<25} {row['lora']:>10} {row['mlp']:>10} {row['ppl']:>10} {row['ensemble']:>10} {row['oracle']:>10} {best_name:>10}")
 
-print("-" * 75)
+print("-" * 90)
 PYEOF
     exit 0
 fi
@@ -445,31 +453,74 @@ if [ "$RUN_PPL" = true ]; then
     echo ""
     echo "========== Training PPL Classifiers (Entropy-based) =========="
 
-    if [ "$TRAIN_SUBSET" = "all" ]; then
-        echo ">>> PPL training not supported for --train-subset all"
+    # PPL always trains per-subset (doesn't support merged "all" training)
+    # When --train-subset all, train each subset individually
+    if [ "$TRAIN_SUBSET" = "all" ] || [ -z "$TRAIN_SUBSET" ]; then
+        PPL_SUBSETS=("${ALL_SUBSETS[@]}")
     else
-        # Individual subset training
-        if [ -n "$TRAIN_SUBSET" ]; then
-            PPL_SUBSETS=("$TRAIN_SUBSET")
-        else
-            PPL_SUBSETS=("${ALL_SUBSETS[@]}")
-        fi
-
-        for subset in "${PPL_SUBSETS[@]}"; do
-            if check_model_exists "$subset" "ppl"; then
-                echo ""
-                echo ">>> PPL: $subset [SKIP - already trained]"
-            else
-                echo ""
-                echo ">>> PPL: $subset"
-                CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
-                    --ddp --subset $subset --data-dir $DATA_DIR --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
-            fi
-        done
+        PPL_SUBSETS=("$TRAIN_SUBSET")
     fi
+
+    for subset in "${PPL_SUBSETS[@]}"; do
+        if check_model_exists "$subset" "ppl"; then
+            echo ""
+            echo ">>> PPL: $subset [SKIP - already trained]"
+        else
+            echo ""
+            echo ">>> PPL: $subset"
+            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
+                --ddp --subset $subset --data-dir $DATA_DIR --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
+        fi
+    done
 else
     echo ""
     echo "========== Skipping PPL (not in --methods) =========="
+fi
+
+# Train Ensemble classifiers (MLP+PPL or LoRA+PPL)
+if [ "$RUN_ENSEMBLE" = true ]; then
+    echo ""
+    echo "========== Training Ensemble Classifiers =========="
+
+    # Ensemble always trains per-subset
+    if [ "$TRAIN_SUBSET" = "all" ] || [ -z "$TRAIN_SUBSET" ]; then
+        ENS_SUBSETS=("${ALL_SUBSETS[@]}")
+    else
+        ENS_SUBSETS=("$TRAIN_SUBSET")
+    fi
+
+    # Determine whether to use MLP or LoRA based on what was trained
+    USE_MLP_FLAG=""
+    if [ "$RUN_MLP" = true ]; then
+        USE_MLP_FLAG="--use-mlp"
+        echo ">>> Using MLP + PPL for ensemble"
+    elif [ "$RUN_LORA" = true ]; then
+        echo ">>> Using LoRA + PPL for ensemble"
+    else
+        # Check what exists
+        for subset in "${ENS_SUBSETS[@]}"; do
+            if [ -f "$DATA_DIR/$subset/mlp_model/results.json" ]; then
+                USE_MLP_FLAG="--use-mlp"
+                echo ">>> Found MLP models, using MLP + PPL for ensemble"
+                break
+            fi
+        done
+    fi
+
+    for subset in "${ENS_SUBSETS[@]}"; do
+        if check_model_exists "$subset" "ensemble"; then
+            echo ""
+            echo ">>> Ensemble: $subset [SKIP - already trained]"
+        else
+            echo ""
+            echo ">>> Ensemble: $subset"
+            CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python train_ensemble_classifier.py \
+                --subset $subset --data-dir $DATA_DIR $USE_MLP_FLAG
+        fi
+    done
+else
+    echo ""
+    echo "========== Skipping Ensemble (not in --methods) =========="
 fi
 
 # Compare results using Python for better formatting
@@ -514,11 +565,11 @@ def get_baseline(r):
     return r.get('test_per_stage_baseline_acc', r.get('per_stage_baseline_acc'))
 
 print()
-print("=" * 100)
+print("=" * 115)
 print("                              CASCADE ACCURACY COMPARISON")
-print("=" * 100)
-print(f"{'Subset':<25} {'LoRA':>12} {'MLP':>12} {'PPL':>12} {'Oracle':>12} {'Best':>12}")
-print("-" * 100)
+print("=" * 115)
+print(f"{'Subset':<25} {'LoRA':>12} {'MLP':>12} {'PPL':>12} {'Ensemble':>12} {'Oracle':>12} {'Best':>12}")
+print("-" * 115)
 
 # Check for unified "all" MLP model
 all_mlp_dir = os.path.join(data_dir, "all", "mlp_model")
@@ -535,24 +586,27 @@ if all_mlp_results and train_subset == "all":
     oracle_val = get_oracle(all_mlp_results)
     mlp_acc = f"{mlp_casc:.4f}" if mlp_casc is not None else "-"
     oracle = f"{oracle_val:.4f}" if oracle_val is not None else "-"
-    print(f"{'all (unified)':<25} {'-':>12} {mlp_acc:>12} {'-':>12} {oracle:>12} {'MLP':>12}")
-    print("-" * 100)
+    print(f"{'all (unified)':<25} {'-':>12} {mlp_acc:>12} {'-':>12} {'-':>12} {oracle:>12} {'MLP':>12}")
+    print("-" * 115)
 
 all_results = {}
 for subset in all_subsets:
     lora = get_results(subset, "lora")
     mlp = get_results(subset, "mlp")
     ppl = get_results(subset, "ppl")
+    ensemble = get_results(subset, "ensemble")
 
     lora_casc = get_cascade_acc(lora)
     mlp_casc = get_cascade_acc(mlp)
     ppl_casc = get_cascade_acc(ppl)
+    ensemble_casc = get_cascade_acc(ensemble)
 
     lora_acc = f"{lora_casc:.4f}" if lora_casc is not None else "-"
     mlp_acc = f"{mlp_casc:.4f}" if mlp_casc is not None else "-"
     ppl_acc = f"{ppl_casc:.4f}" if ppl_casc is not None else "-"
+    ensemble_acc = f"{ensemble_casc:.4f}" if ensemble_casc is not None else "-"
 
-    oracle_val = get_oracle(lora) or get_oracle(mlp) or get_oracle(ppl)
+    oracle_val = get_oracle(lora) or get_oracle(mlp) or get_oracle(ppl) or get_oracle(ensemble)
     oracle = f"{oracle_val:.4f}" if oracle_val is not None else "-"
 
     accs = []
@@ -562,26 +616,30 @@ for subset in all_subsets:
         accs.append(('MLP', mlp_casc))
     if ppl_casc is not None:
         accs.append(('PPL', ppl_casc))
+    if ensemble_casc is not None:
+        accs.append(('Ens', ensemble_casc))
 
     best = max(accs, key=lambda x: x[1])[0] if accs else "-"
 
-    print(f"{subset:<25} {lora_acc:>12} {mlp_acc:>12} {ppl_acc:>12} {oracle:>12} {best:>12}")
+    print(f"{subset:<25} {lora_acc:>12} {mlp_acc:>12} {ppl_acc:>12} {ensemble_acc:>12} {oracle:>12} {best:>12}")
 
-    all_results[subset] = {'lora': lora, 'mlp': mlp, 'ppl': ppl}
+    all_results[subset] = {'lora': lora, 'mlp': mlp, 'ppl': ppl, 'ensemble': ensemble}
 
-print("-" * 100)
+print("-" * 115)
 
 # Compute averages
 lora_accs = [get_cascade_acc(r['lora']) for r in all_results.values() if get_cascade_acc(r['lora']) is not None]
 mlp_accs = [get_cascade_acc(r['mlp']) for r in all_results.values() if get_cascade_acc(r['mlp']) is not None]
 ppl_accs = [get_cascade_acc(r['ppl']) for r in all_results.values() if get_cascade_acc(r['ppl']) is not None]
+ensemble_accs = [get_cascade_acc(r['ensemble']) for r in all_results.values() if get_cascade_acc(r['ensemble']) is not None]
 
 lora_avg = f"{sum(lora_accs)/len(lora_accs):.4f}" if lora_accs else "-"
 mlp_avg = f"{sum(mlp_accs)/len(mlp_accs):.4f}" if mlp_accs else "-"
 ppl_avg = f"{sum(ppl_accs)/len(ppl_accs):.4f}" if ppl_accs else "-"
+ensemble_avg = f"{sum(ensemble_accs)/len(ensemble_accs):.4f}" if ensemble_accs else "-"
 
-print(f"{'AVERAGE':<25} {lora_avg:>12} {mlp_avg:>12} {ppl_avg:>12}")
-print("=" * 100)
+print(f"{'AVERAGE':<25} {lora_avg:>12} {mlp_avg:>12} {ppl_avg:>12} {ensemble_avg:>12}")
+print("=" * 115)
 
 # Per-stage baseline accuracy
 print()
@@ -611,7 +669,8 @@ print()
 print("Done! Results saved in:")
 if train_subset == "all":
     print("  MLP (unified): all/mlp_model/results_*.json")
-print("  LoRA: {subset}/lora_model/results.json")
-print("  MLP:  {subset}/mlp_model/results.json")
-print("  PPL:  {subset}/ppl_model/results.json")
+print("  LoRA:     {subset}/lora_model/results.json")
+print("  MLP:      {subset}/mlp_model/results.json")
+print("  PPL:      {subset}/ppl_model/results.json")
+print("  Ensemble: {subset}/ensemble_model/results.json")
 EOF
