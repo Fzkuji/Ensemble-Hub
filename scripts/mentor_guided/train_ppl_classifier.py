@@ -8,12 +8,16 @@ Method:
 3. Train a simple regression model (LogisticRegression/XGBoost) on these features
 
 Usage:
-    # Single GPU
-    python train_ppl_classifier.py --subset algebra --data-dir /path/to/data
+    # Single GPU - single subset
+    python train_ppl_classifier.py --train-subset algebra --data-dir /path/to/data
 
-    # Multi-GPU with torchrun
+    # Multi-GPU with torchrun - single subset
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 train_ppl_classifier.py \
-        --ddp --subset algebra --data-dir /path/to/data
+        --ddp --train-subset algebra --data-dir /path/to/data
+
+    # Train on all subsets merged, evaluate on each separately
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 train_ppl_classifier.py \
+        --ddp --train-subset all --eval-subset all --data-dir /path/to/data
 """
 
 import argparse
@@ -424,8 +428,16 @@ def main():
     parser.add_argument("--data-dir", type=str,
                         default="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split",
                         help="Base directory with subset folders")
-    parser.add_argument("--subset", type=str, default="algebra",
-                        choices=SUBSETS + ["all"])
+    # Support both old --subset and new --train-subset for compatibility
+    parser.add_argument("--subset", type=str, default=None,
+                        choices=SUBSETS + ["all"],
+                        help="(Legacy) Same as --train-subset")
+    parser.add_argument("--train-subset", type=str, default=None,
+                        choices=SUBSETS + ["all"],
+                        help="Training subset. 'all' merges all subsets.")
+    parser.add_argument("--eval-subset", type=str, default=None,
+                        choices=SUBSETS + ["all"],
+                        help="Evaluation subset. 'all' evaluates each separately. Default: same as train.")
     parser.add_argument("--model-path", type=str,
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
     parser.add_argument("--output-dir", type=str, default=None)
@@ -443,6 +455,14 @@ def main():
                         help="Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%%). Keeps memory occupied throughout training.")
 
     args = parser.parse_args()
+
+    # Handle legacy --subset argument
+    if args.train_subset is None and args.subset is not None:
+        args.train_subset = args.subset
+    if args.train_subset is None:
+        args.train_subset = "algebra"  # Default
+    if args.eval_subset is None:
+        args.eval_subset = args.train_subset
 
     # Setup distributed
     rank, world_size, local_rank = setup_distributed()
@@ -464,13 +484,13 @@ def main():
         buffer = 2 * 1024**3
         max_allocatable = free_mem - buffer
         fill_bytes = min(target_bytes, max_allocatable)
-        
+
         if fill_bytes > 0:
             fill_elements = fill_bytes // 4  # float32 = 4 bytes
             lock_tensor = torch.empty(fill_elements, dtype=torch.float32, device=device)
             del lock_tensor  # Keep memory in cache, don't call empty_cache()
             _memory_lock_tensors[device_id] = True
-            
+
             total_gb = total_mem / 1024**3
             reserved_gb = torch.cuda.memory_reserved(device_id) / 1024**3
             if is_main_process():
@@ -489,21 +509,29 @@ def main():
         if is_main_process():
             logger.info(f"Pre-allocated {args.reserve_memory:.1f} GB GPU memory on {device} (will release after model load)")
 
-    subset_dir = os.path.join(args.data_dir, args.subset)
-    if not os.path.exists(subset_dir):
-        if is_main_process():
-            logger.error(f"Data directory not found: {subset_dir}")
-        cleanup_distributed()
-        return
+    # Determine training subsets
+    if args.train_subset == "all":
+        train_subsets = SUBSETS
+        output_base = os.path.join(args.data_dir, "all")
+    else:
+        train_subsets = [args.train_subset]
+        output_base = os.path.join(args.data_dir, args.train_subset)
+
+    # Determine evaluation subsets
+    if args.eval_subset == "all":
+        eval_subsets = SUBSETS
+    else:
+        eval_subsets = [args.eval_subset]
 
     if args.output_dir is None:
-        args.output_dir = os.path.join(subset_dir, "ppl_model")
+        args.output_dir = os.path.join(output_base, "ppl_model")
     if is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)
 
     if is_main_process():
-        logger.info(f"Subset: {args.subset}")
-        logger.info(f"Data dir: {subset_dir}")
+        logger.info(f"Train subset: {args.train_subset}")
+        logger.info(f"Eval subset: {args.eval_subset}")
+        logger.info(f"Data dir: {args.data_dir}")
         logger.info(f"Classifier: {args.classifier}")
         logger.info(f"DDP: {use_ddp}, World size: {world_size}")
 
@@ -568,13 +596,28 @@ def main():
             if device_id in _memory_lock_tensors:
                 logger.info(f"  All used memory is locked and will not be released")
 
-    # Load data
-    train_data = load_json_data(subset_dir, split="train")
-    if not train_data:
+    # Load data - merge from all train_subsets
+    train_data = {tokens: [] for tokens in TOKEN_LEVELS}
+    for subset in train_subsets:
+        subset_dir = os.path.join(args.data_dir, subset)
+        if not os.path.exists(subset_dir):
+            if is_main_process():
+                logger.warning(f"Subset directory not found: {subset_dir}")
+            continue
+        subset_data = load_json_data(subset_dir, split="train")
+        if subset_data:
+            for tokens in TOKEN_LEVELS:
+                if tokens in subset_data:
+                    train_data[tokens].extend(subset_data[tokens])
+
+    if not train_data or not train_data[TOKEN_LEVELS[0]]:
         if is_main_process():
             logger.error("No training data found!")
         cleanup_distributed()
         return
+
+    if is_main_process():
+        logger.info(f"Total training data: {len(train_data[TOKEN_LEVELS[0]])} samples from {len(train_subsets)} subset(s)")
 
     # Split train/val
     n_samples = len(train_data[TOKEN_LEVELS[0]])
@@ -707,7 +750,8 @@ def main():
 
         # Save results
         results = {
-            'subset': args.subset,
+            'train_subset': args.train_subset,
+            'eval_subset': args.eval_subset,
             'classifier': args.classifier,
             'train_acc': train_results['train_acc'],
             'val_acc': train_results['val_acc'],
@@ -720,10 +764,61 @@ def main():
             'per_stage_baseline_acc': detailed['baseline'],
         }
 
+        # Evaluate on test set for each eval_subset
+        logger.info(f"\n{'='*60}")
+        logger.info("Evaluating on TEST set...")
+        logger.info(f"{'='*60}")
+
+        test_results_per_subset = {}
+        for eval_sub in eval_subsets:
+            eval_dir = os.path.join(args.data_dir, eval_sub)
+            test_data = load_json_data(eval_dir, split="test")
+            if not test_data or not test_data[TOKEN_LEVELS[0]]:
+                logger.warning(f"No test data for {eval_sub}")
+                continue
+
+            logger.info(f"\nTest subset: {eval_sub} ({len(test_data[TOKEN_LEVELS[0]])} samples)")
+
+            # Extract features for test data (on main process only now)
+            X_test, y_test, _ = extract_features(
+                model, tokenizer, test_data, device, args.max_length
+            )
+
+            # Evaluate
+            test_cascade_acc, _, test_detailed = eval_cascade(clf, scaler, X_test, y_test)
+
+            logger.info(f"  Test Cascade Accuracy: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
+
+            test_results_per_subset[eval_sub] = {
+                'cascade_acc': test_cascade_acc,
+                'oracle_acc': test_detailed['oracle'],
+                'per_stage_auc': test_detailed['auc'],
+                'per_stage_baseline_acc': test_detailed['baseline'],
+            }
+
+        # Add test results to main results
+        if len(eval_subsets) == 1:
+            # Single eval subset - use flat structure for compatibility
+            sub = eval_subsets[0]
+            if sub in test_results_per_subset:
+                results['test_best_cascade_acc'] = test_results_per_subset[sub]['cascade_acc']
+                results['test_oracle_acc'] = test_results_per_subset[sub]['oracle_acc']
+                results['test_per_stage_auc'] = test_results_per_subset[sub]['per_stage_auc']
+                results['test_per_stage_baseline_acc'] = test_results_per_subset[sub]['per_stage_baseline_acc']
+        else:
+            # Multiple eval subsets - nested structure
+            results['test_results'] = test_results_per_subset
+
+            # Also compute average for summary
+            accs = [r['cascade_acc'] for r in test_results_per_subset.values()]
+            if accs:
+                results['test_best_cascade_acc'] = sum(accs) / len(accs)
+                logger.info(f"\nAverage Test Cascade Accuracy: {results['test_best_cascade_acc']:.4f}")
+
         results_path = os.path.join(args.output_dir, "results.json")
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2)
-        logger.info(f"Results saved to {results_path}")
+        logger.info(f"\nResults saved to {results_path}")
 
     cleanup_distributed()
 

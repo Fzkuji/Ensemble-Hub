@@ -453,25 +453,35 @@ if [ "$RUN_PPL" = true ]; then
     echo ""
     echo "========== Training PPL Classifiers (Entropy-based) =========="
 
-    # PPL always trains per-subset (doesn't support merged "all" training)
-    # When --train-subset all, train each subset individually
-    if [ "$TRAIN_SUBSET" = "all" ] || [ -z "$TRAIN_SUBSET" ]; then
-        PPL_SUBSETS=("${ALL_SUBSETS[@]}")
-    else
-        PPL_SUBSETS=("$TRAIN_SUBSET")
-    fi
-
-    for subset in "${PPL_SUBSETS[@]}"; do
-        if check_model_exists "$subset" "ppl"; then
-            echo ""
-            echo ">>> PPL: $subset [SKIP - already trained]"
+    if [ "$TRAIN_SUBSET" = "all" ]; then
+        # Unified training on all subsets merged
+        if check_model_exists "all" "ppl"; then
+            echo ">>> PPL: train=all, eval=$EVAL_SUBSET [SKIP - already trained]"
         else
-            echo ""
-            echo ">>> PPL: $subset"
+            echo ">>> PPL: train=all, eval=$EVAL_SUBSET"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
+                --ddp --train-subset all --eval-subset "$EVAL_SUBSET" --data-dir $DATA_DIR --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
         fi
-    done
+    else
+        # Individual subset training
+        if [ -n "$TRAIN_SUBSET" ]; then
+            PPL_SUBSETS=("$TRAIN_SUBSET")
+        else
+            PPL_SUBSETS=("${ALL_SUBSETS[@]}")
+        fi
+
+        for subset in "${PPL_SUBSETS[@]}"; do
+            if check_model_exists "$subset" "ppl"; then
+                echo ""
+                echo ">>> PPL: $subset [SKIP - already trained]"
+            else
+                echo ""
+                echo ">>> PPL: $subset"
+                CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
+                    --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
+            fi
+        done
+    fi
 else
     echo ""
     echo "========== Skipping PPL (not in --methods) =========="
