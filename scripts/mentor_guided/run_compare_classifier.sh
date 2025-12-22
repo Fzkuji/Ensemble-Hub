@@ -458,9 +458,10 @@ if [ "$RUN_PPL" = true ]; then
         if check_model_exists "all" "ppl"; then
             echo ">>> PPL: train=all, eval=$EVAL_SUBSET [SKIP - already trained]"
         else
-            echo ">>> PPL: train=all, eval=$EVAL_SUBSET"
+            echo ">>> PPL: train=all, eval=$EVAL_SUBSET (no_val=$NO_VAL)"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
-                --ddp --train-subset all --eval-subset "$EVAL_SUBSET" --data-dir $DATA_DIR --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
+                --ddp --train-subset all --eval-subset "$EVAL_SUBSET" --data-dir $DATA_DIR \
+                --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
         fi
     else
         # Individual subset training
@@ -476,9 +477,10 @@ if [ "$RUN_PPL" = true ]; then
                 echo ">>> PPL: $subset [SKIP - already trained]"
             else
                 echo ""
-                echo ">>> PPL: $subset"
+                echo ">>> PPL: $subset (no_val=$NO_VAL)"
                 CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
-                    --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
+                    --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR \
+                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
             fi
         done
     fi

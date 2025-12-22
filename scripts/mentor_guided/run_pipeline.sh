@@ -331,22 +331,30 @@ fi
 
 echo ""
 echo "========== Step 4: Train PPL Classifiers =========="
-if [ "$TRAIN_SUBSET" = "all" ]; then
-    echo ">>> PPL training skipped for --train-subset all (not supported)"
-else
-    # Determine subsets for PPL training
-    if [ -n "$TRAIN_SUBSET" ]; then
-        PPL_SUBSETS=("$TRAIN_SUBSET")
+if [ -n "$TRAIN_SUBSET" ]; then
+    # Specific train subset specified
+    if [ "$TRAIN_SUBSET" = "all" ]; then
+        PPL_MODEL_DIR="all"
     else
-        PPL_SUBSETS=("${ALL_SUBSETS[@]}")
+        PPL_MODEL_DIR="$TRAIN_SUBSET"
     fi
-    for subset in "${PPL_SUBSETS[@]}"; do
+
+    if check_model_exists "$PPL_MODEL_DIR" "ppl"; then
+        echo ">>> PPL: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET [SKIP - already trained, use --force to retrain]"
+    else
+        echo ">>> Training PPL: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET (no_val=$NO_VAL)"
+        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_ppl_classifier.py \
+            --ddp --train-subset $TRAIN_SUBSET --eval-subset $EVAL_SUBSET --data-dir $DATA_DIR $NO_VAL_FLAG
+    fi
+else
+    # No train subset specified - train each subset individually
+    for subset in "${ALL_SUBSETS[@]}"; do
         if check_model_exists "$subset" "ppl"; then
             echo ">>> PPL: $subset [SKIP - already trained, use --force to retrain]"
         else
-            echo ">>> Training PPL: $subset"
-            CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python train_ppl_classifier.py \
-                --subset $subset --data-dir $DATA_DIR
+            echo ">>> Training PPL: $subset (no_val=$NO_VAL)"
+            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_ppl_classifier.py \
+                --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR $NO_VAL_FLAG
         fi
     done
 fi

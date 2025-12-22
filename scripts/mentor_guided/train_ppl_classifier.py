@@ -443,7 +443,14 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--classifier", type=str, default="gb",
                         choices=["lr", "gb"])
-    parser.add_argument("--val-ratio", type=float, default=0.3)
+    parser.add_argument("--val-ratio", type=float, default=0.3,
+                        help="Validation split ratio (only used with --val)")
+    # Validation settings: default is NO validation split (consistent with MLP/LoRA)
+    parser.add_argument("--val", dest="use_val", action="store_true",
+                        help="Use validation split for threshold search")
+    parser.add_argument("--no-val", dest="use_val", action="store_false",
+                        help="Train on entire train set, eval on test (default)")
+    parser.set_defaults(use_val=False)
     parser.add_argument("--no-filter", action="store_true")
     parser.add_argument("--ddp", action="store_true",
                         help="Use DDP mode (with torchrun)")
@@ -619,23 +626,31 @@ def main():
     if is_main_process():
         logger.info(f"Total training data: {len(train_data[TOKEN_LEVELS[0]])} samples from {len(train_subsets)} subset(s)")
 
-    # Split train/val
+    # Split train/val or use all for training
     n_samples = len(train_data[TOKEN_LEVELS[0]])
-    train_idx, val_idx = sk_split(
-        np.arange(n_samples), test_size=args.val_ratio, random_state=42
-    )
 
-    val_data = {}
-    actual_train_data = {}
-    for tokens in TOKEN_LEVELS:
-        if tokens in train_data:
-            val_data[tokens] = [train_data[tokens][i] for i in val_idx]
-            actual_train_data[tokens] = [train_data[tokens][i] for i in train_idx]
-    train_data = actual_train_data
+    if not args.use_val:
+        # Use all train data for training, no validation split
+        val_data = None
+        if is_main_process():
+            logger.info(f"Using entire train set: {n_samples} samples (no validation split)")
+    else:
+        # Split train data into train/val
+        train_idx, val_idx = sk_split(
+            np.arange(n_samples), test_size=args.val_ratio, random_state=42
+        )
 
-    if is_main_process():
-        logger.info(f"Train: {len(train_data[TOKEN_LEVELS[0]])} samples")
-        logger.info(f"Val: {len(val_data[TOKEN_LEVELS[0]])} samples")
+        val_data = {}
+        actual_train_data = {}
+        for tokens in TOKEN_LEVELS:
+            if tokens in train_data:
+                val_data[tokens] = [train_data[tokens][i] for i in val_idx]
+                actual_train_data[tokens] = [train_data[tokens][i] for i in train_idx]
+        train_data = actual_train_data
+
+        if is_main_process():
+            logger.info(f"Train: {len(train_data[TOKEN_LEVELS[0]])} samples")
+            logger.info(f"Val: {len(val_data[TOKEN_LEVELS[0]])} samples")
 
     # Filter uniform samples (only filter train_data, keep val_data unfiltered for evaluation)
     if not args.no_filter:
@@ -655,29 +670,36 @@ def main():
         train_data = filter_varied(train_data)
         # val_data stays unfiltered for consistent evaluation
         if is_main_process():
-            logger.info(f"After filtering train: {len(train_data[TOKEN_LEVELS[0]])} samples (val unfiltered: {len(val_data[TOKEN_LEVELS[0]])})")
+            if val_data is not None:
+                logger.info(f"After filtering train: {len(train_data[TOKEN_LEVELS[0]])} samples (val unfiltered: {len(val_data[TOKEN_LEVELS[0]])})")
+            else:
+                logger.info(f"After filtering train: {len(train_data[TOKEN_LEVELS[0]])} samples")
 
     # For DDP, shard data across processes
     if use_ddp:
         n_train = len(train_data[TOKEN_LEVELS[0]])
-        n_val = len(val_data[TOKEN_LEVELS[0]])
-
         train_shard_size = (n_train + world_size - 1) // world_size
-        val_shard_size = (n_val + world_size - 1) // world_size
-
         train_start = rank * train_shard_size
         train_end = min(train_start + train_shard_size, n_train)
-        val_start = rank * val_shard_size
-        val_end = min(val_start + val_shard_size, n_val)
 
         train_shard = {}
-        val_shard = {}
         for tokens in TOKEN_LEVELS:
             train_shard[tokens] = train_data[tokens][train_start:train_end]
-            val_shard[tokens] = val_data[tokens][val_start:val_end]
 
-        if is_main_process():
-            logger.info(f"Rank {rank}: Train shard [{train_start}:{train_end}], Val shard [{val_start}:{val_end}]")
+        if val_data is not None:
+            n_val = len(val_data[TOKEN_LEVELS[0]])
+            val_shard_size = (n_val + world_size - 1) // world_size
+            val_start = rank * val_shard_size
+            val_end = min(val_start + val_shard_size, n_val)
+            val_shard = {}
+            for tokens in TOKEN_LEVELS:
+                val_shard[tokens] = val_data[tokens][val_start:val_end]
+            if is_main_process():
+                logger.info(f"Rank {rank}: Train shard [{train_start}:{train_end}], Val shard [{val_start}:{val_end}]")
+        else:
+            val_shard = None
+            if is_main_process():
+                logger.info(f"Rank {rank}: Train shard [{train_start}:{train_end}] (no val)")
     else:
         train_shard = train_data
         val_shard = val_data
@@ -688,52 +710,72 @@ def main():
     X_train, y_train, stages_train = extract_features(
         model, tokenizer, train_shard, device, args.max_length
     )
-    X_val, y_val, stages_val = extract_features(
-        model, tokenizer, val_shard, device, args.max_length
-    )
+
+    # Extract val features only if we have val data
+    if val_shard is not None:
+        X_val, y_val, stages_val = extract_features(
+            model, tokenizer, val_shard, device, args.max_length
+        )
+    else:
+        X_val, y_val = np.array([]), np.array([])
 
     # Gather results from all ranks
     if use_ddp:
         X_train_list = [None] * world_size
         y_train_list = [None] * world_size
-        X_val_list = [None] * world_size
-        y_val_list = [None] * world_size
 
         dist.all_gather_object(X_train_list, X_train)
         dist.all_gather_object(y_train_list, y_train)
-        dist.all_gather_object(X_val_list, X_val)
-        dist.all_gather_object(y_val_list, y_val)
 
         # Filter out empty arrays (some ranks may have no data)
         X_train_list = [x for x in X_train_list if len(x) > 0]
         y_train_list = [y for y in y_train_list if len(y) > 0]
-        X_val_list = [x for x in X_val_list if len(x) > 0]
-        y_val_list = [y for y in y_val_list if len(y) > 0]
 
         X_train = np.vstack(X_train_list) if X_train_list else np.array([])
         y_train = np.concatenate(y_train_list) if y_train_list else np.array([])
-        X_val = np.vstack(X_val_list) if X_val_list else np.array([])
-        y_val = np.concatenate(y_val_list) if y_val_list else np.array([])
+
+        if val_shard is not None:
+            X_val_list = [None] * world_size
+            y_val_list = [None] * world_size
+            dist.all_gather_object(X_val_list, X_val)
+            dist.all_gather_object(y_val_list, y_val)
+            X_val_list = [x for x in X_val_list if len(x) > 0]
+            y_val_list = [y for y in y_val_list if len(y) > 0]
+            X_val = np.vstack(X_val_list) if X_val_list else np.array([])
+            y_val = np.concatenate(y_val_list) if y_val_list else np.array([])
 
     if is_main_process():
         logger.info(f"Train features shape: {X_train.shape}")
-        logger.info(f"Val features shape: {X_val.shape}")
+        if len(X_val) > 0:
+            logger.info(f"Val features shape: {X_val.shape}")
 
         # Train classifier
         logger.info(f"Training {args.classifier} classifier...")
-        clf, scaler, train_results = train_classifier(
-            X_train, y_train, X_val, y_val, args.classifier
-        )
 
-        logger.info(f"Train Acc: {train_results['train_acc']:.4f}, Train AUC: {train_results['train_auc']:.4f}")
-        logger.info(f"Val Acc: {train_results['val_acc']:.4f}, Val AUC: {train_results['val_auc']:.4f}")
+        if args.use_val and len(X_val) > 0:
+            # With val: train on train, evaluate on val
+            clf, scaler, train_results = train_classifier(
+                X_train, y_train, X_val, y_val, args.classifier
+            )
+            logger.info(f"Train Acc: {train_results['train_acc']:.4f}, Train AUC: {train_results['train_auc']:.4f}")
+            logger.info(f"Val Acc: {train_results['val_acc']:.4f}, Val AUC: {train_results['val_auc']:.4f}")
 
-        # Cascade evaluation on val (unfiltered) for consistent comparison
-        logger.info("Running cascade evaluation on val (unfiltered)...")
+            # Cascade evaluation on val (unfiltered) for threshold search
+            logger.info("Running cascade evaluation on val (unfiltered)...")
+            cascade_acc, thresholds, detailed = eval_cascade(clf, scaler, X_val, y_val)
+            logger.info(f"Val Cascade Accuracy: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
+        else:
+            # No val: train on all train data, use train for threshold search
+            clf, scaler, train_results = train_classifier(
+                X_train, y_train, X_train, y_train, args.classifier  # Use train as "val" for metrics
+            )
+            logger.info(f"Train Acc: {train_results['train_acc']:.4f}, Train AUC: {train_results['train_auc']:.4f}")
 
-        cascade_acc, thresholds, detailed = eval_cascade(clf, scaler, X_val, y_val)
+            # Cascade evaluation on train for threshold search
+            logger.info("Running cascade evaluation on train (for threshold search)...")
+            cascade_acc, thresholds, detailed = eval_cascade(clf, scaler, X_train, y_train)
+            logger.info(f"Train Cascade Accuracy: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
 
-        logger.info(f"Val Cascade Accuracy: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
         logger.info(f"Thresholds: {thresholds}")
 
         auc_str = ", ".join([f"T{t}={detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
@@ -753,16 +795,18 @@ def main():
             'train_subset': args.train_subset,
             'eval_subset': args.eval_subset,
             'classifier': args.classifier,
+            'no_val': not args.use_val,
             'train_acc': train_results['train_acc'],
-            'val_acc': train_results['val_acc'],
             'train_auc': train_results['train_auc'],
-            'val_auc': train_results['val_auc'],
             'best_cascade_acc': cascade_acc,
             'best_thresholds': thresholds,
             'oracle_acc': detailed['oracle'],
             'per_stage_auc': detailed['auc'],
             'per_stage_baseline_acc': detailed['baseline'],
         }
+        if args.use_val:
+            results['val_acc'] = train_results['val_acc']
+            results['val_auc'] = train_results['val_auc']
 
         # Evaluate on test set for each eval_subset
         logger.info(f"\n{'='*60}")
