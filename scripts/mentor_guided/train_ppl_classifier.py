@@ -31,7 +31,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import roc_auc_score, accuracy_score
 from sklearn.model_selection import train_test_split as sk_split
 from sklearn.preprocessing import StandardScaler
@@ -329,6 +329,13 @@ def train_classifier(
 
     if model_type == "lr":
         clf = LogisticRegression(max_iter=1000, class_weight='balanced')
+    elif model_type == "rf":
+        clf = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=10,
+            class_weight='balanced',
+            random_state=42,
+        )
     else:
         clf = GradientBoostingClassifier(
             n_estimators=100,
@@ -442,7 +449,7 @@ def main():
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--classifier", type=str, default="gb",
-                        choices=["lr", "gb"])
+                        choices=["lr", "gb", "rf"])
     parser.add_argument("--val-ratio", type=float, default=0.3,
                         help="Validation split ratio (only used with --val)")
     # Validation settings: default is NO validation split (consistent with MLP/LoRA)
