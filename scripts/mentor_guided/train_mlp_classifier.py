@@ -944,7 +944,11 @@ def main():
         # No need to evaluate on train, just use fixed threshold
         final_thresholds = [args.fixed_threshold] * len(TOKEN_LEVELS)
         final_cascade_acc = 0.0  # Placeholder, will evaluate on test
-        final_detailed = {'oracle': 0.0}
+        final_detailed = {
+            'oracle': 0.0,
+            'auc': {t: 0.0 for t in TOKEN_LEVELS},
+            'baseline': {t: 0.0 for t in TOKEN_LEVELS},
+        }
         if is_main_process():
             logger.info(f"\nUsing fixed threshold {args.fixed_threshold}, skipping train cascade evaluation")
     else:
