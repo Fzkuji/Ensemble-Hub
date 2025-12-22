@@ -569,13 +569,20 @@ def main():
     n_samples = len(train_data[TOKEN_LEVELS[0]])
 
     if args.no_val:
-        # Use all data for both training and threshold search
-        val_data = train_data  # Same data for threshold search
+        # Use all train data for training, load test data for evaluation
+        val_data = train_data  # For threshold search (on train)
         n_train = n_samples
         n_val = n_samples
+
+        # Load test data for per-epoch evaluation
+        test_data = load_json_data(subset_dir, split="test")
+        n_test = len(test_data[TOKEN_LEVELS[0]]) if test_data else 0
+
         if is_main_process():
-            logger.info(f"No-val mode: Train on all {n_train} samples, search thresholds on same data")
+            logger.info(f"No-val mode: Train on all {n_train} samples")
+            logger.info(f"Test split: {n_test} samples (for per-epoch cascade eval)")
     else:
+        test_data = None  # Not used in normal mode
         from sklearn.model_selection import train_test_split as sk_split
         train_idx, val_idx = sk_split(
             np.arange(n_samples), test_size=args.val_ratio, random_state=42
@@ -758,24 +765,40 @@ def main():
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, criterion, device, args.grad_accum
         )
-        val_loss, val_acc, _, _, _ = eval_epoch(model, val_loader, criterion, device)
 
         if is_main_process():
             logger.info(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
-            logger.info(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
 
-        # Cascade evaluation
+        # In no-val mode, skip val_loader eval (it's same as train)
+        if not args.no_val:
+            val_loss, val_acc, _, _, _ = eval_epoch(model, val_loader, criterion, device)
+            if is_main_process():
+                logger.info(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+
+        # Cascade evaluation on train (for threshold search)
         if is_main_process():
-            logger.info("Running cascade evaluation...")
+            logger.info("Running cascade evaluation on train (for threshold search)...")
         cascade_acc, thresholds, detailed = eval_cascade_on_val(
             model, val_data, tokenizer, args.max_length, device
         )
 
         if is_main_process():
-            logger.info(f"Cascade Acc: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
+            logger.info(f"Train Cascade Acc: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
             logger.info(f"Thresholds: {thresholds}")
             auc_str = ", ".join([f"T{t}={detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
-            logger.info(f"AUC: {auc_str}")
+            logger.info(f"Train AUC: {auc_str}")
+
+        # In no-val mode, also evaluate on test split
+        if args.no_val and test_data:
+            if is_main_process():
+                logger.info("Running cascade evaluation on test...")
+            test_cascade_acc, test_thresholds, test_detailed = eval_cascade_on_val(
+                model, test_data, tokenizer, args.max_length, device
+            )
+            if is_main_process():
+                logger.info(f"Test Cascade Acc: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
+                test_auc_str = ", ".join([f"T{t}={test_detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
+                logger.info(f"Test AUC: {test_auc_str}")
 
         if cascade_acc > best_cascade_acc:
             best_cascade_acc = cascade_acc
@@ -798,19 +821,33 @@ def main():
         classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
         torch.save({'classifier': classifier_state}, os.path.join(args.output_dir, "last_model.pt"))
 
-    # Final cascade evaluation on val (unfiltered) for consistent comparison
+    # Final cascade evaluation on train (for threshold)
     if is_main_process():
-        logger.info("\nFinal cascade evaluation on val (unfiltered)...")
+        logger.info("\nFinal cascade evaluation on train...")
 
     final_cascade_acc, final_thresholds, final_detailed = eval_cascade_on_val(
         model, val_data, tokenizer, args.max_length, device
     )
     if is_main_process():
-        logger.info(f"Val Cascade Acc: {final_cascade_acc:.4f} (Oracle: {final_detailed['oracle']:.4f})")
+        logger.info(f"Train Cascade Acc: {final_cascade_acc:.4f} (Oracle: {final_detailed['oracle']:.4f})")
+
+    # Final evaluation on test (in no-val mode)
+    final_test_cascade_acc = None
+    final_test_detailed = None
+    if args.no_val and test_data:
+        if is_main_process():
+            logger.info("\nFinal cascade evaluation on test...")
+        final_test_cascade_acc, _, final_test_detailed = eval_cascade_on_val(
+            model, test_data, tokenizer, args.max_length, device
+        )
+        if is_main_process():
+            logger.info(f"Test Cascade Acc: {final_test_cascade_acc:.4f} (Oracle: {final_test_detailed['oracle']:.4f})")
 
     if is_main_process():
         logger.info("\n=== Final Results ===")
-        logger.info(f"Val Cascade Accuracy: {final_cascade_acc:.4f}")
+        logger.info(f"Train Cascade Accuracy: {final_cascade_acc:.4f}")
+        if final_test_cascade_acc is not None:
+            logger.info(f"Test Cascade Accuracy: {final_test_cascade_acc:.4f}")
         logger.info(f"Thresholds: {final_thresholds}")
 
         results = {
@@ -825,6 +862,14 @@ def main():
             'per_stage_baseline_acc': final_detailed['baseline'],
             'args': vars(args),
         }
+
+        # Add test results if available
+        if final_test_cascade_acc is not None:
+            results['test_best_cascade_acc'] = float(final_test_cascade_acc)
+            results['test_oracle_acc'] = final_test_detailed['oracle']
+            results['test_per_stage_auc'] = final_test_detailed['auc']
+            results['test_per_stage_baseline_acc'] = final_test_detailed['baseline']
+
         with open(os.path.join(args.output_dir, "results.json"), 'w') as f:
             json.dump(results, f, indent=2)
         logger.info(f"Results saved to {args.output_dir}/results.json")
