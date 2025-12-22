@@ -20,6 +20,8 @@
 #   --no-val              Train on entire train set, search thresholds on train, eval on test
 #   --pooling MODE        Pooling: last, mean (avg hidden states), mean_logits (per-token classify then avg)
 #   --dropout RATE        Dropout rate for MLP classifier (default: 0.3)
+#   --fixed-threshold TH  Use fixed threshold instead of searching (e.g., 0.5)
+#   --unfiltered-val      Use unfiltered data for validation/threshold search
 #
 # Examples:
 #   ./run_pipeline.sh --think                                    # Think mode, 8 GPUs, all subsets
@@ -48,6 +50,8 @@ FORCE=false
 NO_VAL=false
 POOLING="last"
 DROPOUT=0.3
+FIXED_THRESHOLD=""
+UNFILTERED_VAL=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -119,6 +123,14 @@ while [[ $# -gt 0 ]]; do
         --dropout)
             DROPOUT="$2"
             shift 2
+            ;;
+        --fixed-threshold)
+            FIXED_THRESHOLD="$2"
+            shift 2
+            ;;
+        --unfiltered-val)
+            UNFILTERED_VAL=true
+            shift
             ;;
         *)
             echo "Unknown option: $1"
@@ -265,6 +277,14 @@ NO_VAL_FLAG=""
 if [ "$NO_VAL" = true ]; then
     NO_VAL_FLAG="--no-val"
 fi
+FIXED_THRESHOLD_FLAG=""
+if [ -n "$FIXED_THRESHOLD" ]; then
+    FIXED_THRESHOLD_FLAG="--fixed-threshold $FIXED_THRESHOLD"
+fi
+UNFILTERED_VAL_FLAG=""
+if [ "$UNFILTERED_VAL" = true ]; then
+    UNFILTERED_VAL_FLAG="--unfiltered-val"
+fi
 
 if [ -n "$TRAIN_SUBSET" ]; then
     # Specific train subset specified
@@ -282,7 +302,7 @@ if [ -n "$TRAIN_SUBSET" ]; then
         CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
             --ddp --train-subset $TRAIN_SUBSET --eval-subset $EVAL_SUBSET --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
             --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
-            --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG
+            --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG
     fi
 else
     # No train subset specified - train each subset individually
@@ -294,7 +314,7 @@ else
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
                 --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
                 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
-                --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG
+                --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG
         fi
     done
 fi

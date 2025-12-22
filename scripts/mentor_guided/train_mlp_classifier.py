@@ -247,6 +247,40 @@ def load_all_subsets_data(base_dir: str, split: str = "train") -> Dict[int, List
     return merged_data
 
 
+def filter_varied_data(data: Dict[int, List[Dict]], verbose: bool = True) -> Dict[int, List[Dict]]:
+    """Filter out all-correct and all-wrong samples from raw data.
+
+    Returns a new dictionary with only 'varied' samples (different results across stages).
+    """
+    n_samples = len(data[TOKEN_LEVELS[0]])
+
+    varied_indices = []
+    all_correct_count = 0
+    all_wrong_count = 0
+
+    for i in range(n_samples):
+        labels = [1 if data[tokens][i].get('is_correct', False) else 0
+                  for tokens in TOKEN_LEVELS if tokens in data]
+        if all(l == 1 for l in labels):
+            all_correct_count += 1
+        elif all(l == 0 for l in labels):
+            all_wrong_count += 1
+        else:
+            varied_indices.append(i)
+
+    if verbose and is_main_process():
+        logger.info(f"Filtering raw data: {all_correct_count} all-correct, {all_wrong_count} all-wrong, "
+                   f"{len(varied_indices)} varied (kept)")
+
+    # Create filtered data
+    filtered_data = {}
+    for tokens in TOKEN_LEVELS:
+        if tokens in data:
+            filtered_data[tokens] = [data[tokens][i] for i in varied_indices]
+
+    return filtered_data
+
+
 class FrozenLLMClassifier(nn.Module):
     """Frozen LLM + trainable MLP classifier."""
 
@@ -386,8 +420,13 @@ def eval_cascade_on_val(
     tokenizer,
     max_length: int,
     device: str,
+    fixed_threshold: float = None,
 ) -> Tuple[float, List[float], Dict]:
-    """Evaluate cascade accuracy on validation set with threshold search."""
+    """Evaluate cascade accuracy on validation set with threshold search.
+
+    Args:
+        fixed_threshold: If set, use this fixed threshold for all stages instead of searching.
+    """
     model.eval()
     n_samples = len(val_data[TOKEN_LEVELS[0]])
 
@@ -444,16 +483,25 @@ def eval_cascade_on_val(
                 correct += gt[best_tokens][i]
         return correct / n_samples
 
-    threshold_candidates = [round(0.05 + i * 0.05, 2) for i in range(19)]
-    best_acc = 0
-    best_thresholds = None
+    # Threshold search or use fixed threshold
+    if fixed_threshold is not None:
+        # Use fixed threshold for all stages
+        best_thresholds = [fixed_threshold] * len(TOKEN_LEVELS)
+        best_acc = compute_cascade_acc(best_thresholds, all_probs, gt, n_samples)
+        if is_main_process():
+            logger.info(f"Using fixed threshold: {fixed_threshold}")
+    else:
+        # Search for best thresholds
+        threshold_candidates = [round(0.05 + i * 0.05, 2) for i in range(19)]
+        best_acc = 0
+        best_thresholds = None
 
-    for combo in product(threshold_candidates, repeat=len(TOKEN_LEVELS)):
-        thresholds = list(combo)
-        acc = compute_cascade_acc(thresholds, all_probs, gt, n_samples)
-        if acc > best_acc:
-            best_acc = acc
-            best_thresholds = thresholds
+        for combo in product(threshold_candidates, repeat=len(TOKEN_LEVELS)):
+            thresholds = list(combo)
+            acc = compute_cascade_acc(thresholds, all_probs, gt, n_samples)
+            if acc > best_acc:
+                best_acc = acc
+                best_thresholds = thresholds
 
     oracle_correct = 0
     for i in range(n_samples):
@@ -517,6 +565,10 @@ def main():
     parser.add_argument("--val-ratio", type=float, default=0.3)
     parser.add_argument("--no-val", action="store_true",
                         help="Train on entire train set, search thresholds on train data")
+    parser.add_argument("--fixed-threshold", type=float, default=None,
+                        help="Use fixed threshold instead of searching (e.g., 0.5)")
+    parser.add_argument("--unfiltered-val", action="store_true",
+                        help="Use unfiltered data for validation/threshold search")
     parser.add_argument("--reserve-memory", type=float, default=0,
                         help="Pre-allocate GPU memory in GB to prevent others from using it (released after model load)")
     parser.add_argument("--memory-lock", type=float, default=0,
@@ -762,15 +814,24 @@ def main():
             if device_id in _memory_lock_tensors:
                 logger.info(f"  All used memory is locked and will not be released")
 
-    # Create datasets (filter train only, keep val unfiltered for consistent evaluation)
+    # Create datasets (filter train, optionally filter val)
     filter_uniform = not args.no_filter
+    filter_val = filter_uniform and not args.unfiltered_val
     verbose = is_main_process()
     train_dataset = MentorDataset(train_data, tokenizer, args.max_length, filter_uniform=filter_uniform, verbose=verbose)
-    val_dataset = MentorDataset(val_data, tokenizer, args.max_length, filter_uniform=False, verbose=verbose)
+    val_dataset = MentorDataset(val_data, tokenizer, args.max_length, filter_uniform=filter_val, verbose=verbose)
+
+    # Also filter raw val_data for cascade evaluation (threshold search)
+    if filter_val:
+        val_data_for_cascade = filter_varied_data(val_data, verbose=verbose)
+    else:
+        val_data_for_cascade = val_data
 
     if verbose:
+        n_cascade_samples = len(val_data_for_cascade[TOKEN_LEVELS[0]])
         logger.info(f"Training: {len(train_dataset)} samples (filtered={filter_uniform})")
-        logger.info(f"Validation: {len(val_dataset)} samples (unfiltered)")
+        logger.info(f"Validation: {len(val_dataset)} samples (filtered={filter_val})")
+        logger.info(f"Cascade eval: {n_cascade_samples} samples (for threshold search)")
 
     if use_ddp:
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
@@ -835,9 +896,13 @@ def main():
 
         # Cascade evaluation on train (for threshold search)
         if is_main_process():
-            logger.info("Running cascade evaluation on train (for threshold search)...")
+            if args.fixed_threshold is not None:
+                logger.info(f"Running cascade evaluation with fixed threshold={args.fixed_threshold}...")
+            else:
+                logger.info("Running cascade evaluation on train (for threshold search)...")
         cascade_acc, thresholds, detailed = eval_cascade_on_val(
-            model, val_data, tokenizer, args.max_length, device
+            model, val_data_for_cascade, tokenizer, args.max_length, device,
+            fixed_threshold=args.fixed_threshold
         )
 
         if is_main_process():
@@ -874,7 +939,8 @@ def main():
         logger.info("\nFinal cascade evaluation on train...")
 
     final_cascade_acc, final_thresholds, final_detailed = eval_cascade_on_val(
-        model, val_data, tokenizer, args.max_length, device
+        model, val_data_for_cascade, tokenizer, args.max_length, device,
+        fixed_threshold=args.fixed_threshold
     )
     if is_main_process():
         logger.info(f"Train Cascade Acc: {final_cascade_acc:.4f} (Oracle: {final_detailed['oracle']:.4f})")
@@ -907,9 +973,10 @@ def main():
             if is_main_process():
                 logger.info(f"  Test samples: {n_test}")
 
-            # Evaluate
+            # Evaluate (use fixed_threshold if set, otherwise search)
             test_cascade_acc, _, test_detailed = eval_cascade_on_val(
-                model, subset_test_data, tokenizer, args.max_length, device
+                model, subset_test_data, tokenizer, args.max_length, device,
+                fixed_threshold=args.fixed_threshold
             )
 
             test_results_per_subset[eval_subset] = {
