@@ -3,17 +3,28 @@
 # Usage: ./run_compare_classifier.sh [OPTIONS]
 #
 # Options:
-#   --gpus GPUS       Comma-separated GPU IDs (default: 0,1,2,3,4,5,6,7)
-#   --subset SUBSET   Specific subset to run (default: all subsets)
-#   --data-dir DIR    Data directory
-#   --skip-lora       Skip LoRA training (if already done)
-#   --skip-mlp        Skip MLP training (if already done)
-#   --skip-ppl        Skip PPL training (if already done)
-#   --check           Only check file status (no training)
-#   --force           Force re-training even if results exist
-#   --batch-size BS   Batch size for LoRA/MLP training (default: 4)
-#   --reserve-memory GB  Pre-allocate GPU memory to prevent others from using it (released after model load)
-#   --memory-lock FRAC   Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%). Keeps memory occupied throughout training.
+#   --gpus GPUS           Comma-separated GPU IDs (default: 0,1,2,3,4,5,6,7)
+#   --subset SUBSET       (Legacy) Sets both train and eval subset
+#   --train-subset SUBSET Which subset(s) for training. 'all' merges all subsets.
+#   --eval-subset SUBSET  Which subset(s) for eval. 'all' tests each subset separately.
+#   --data-dir DIR        Data directory
+#   --methods METHODS     Comma-separated methods to run: lora,mlp,ppl (default: all)
+#   --check               Only check file status (no training)
+#   --force               Force re-training even if results exist
+#   --batch-size BS       Batch size for LoRA/MLP training (default: 4)
+#   --reserve-memory GB   Pre-allocate GPU memory
+#   --memory-lock FRAC    Lock GPU memory at this fraction (0.0-1.0)
+#   --no-val              Train on entire train set, eval on test
+#   --pooling MODE        Pooling: last, mean, mean_logits (default: last)
+#   --dropout RATE        Dropout rate for MLP classifier (default: 0.3)
+#   --fixed-threshold TH  Use fixed threshold instead of searching
+#   --skip-epoch-cascade  Skip cascade evaluation after each epoch
+#
+# Examples:
+#   ./run_compare_classifier.sh --methods mlp                    # Only test MLP
+#   ./run_compare_classifier.sh --methods mlp,ppl                # Test MLP and PPL
+#   ./run_compare_classifier.sh --train-subset all --eval-subset all  # Train on all, test each
+#   ./run_compare_classifier.sh --subset algebra --methods lora  # LoRA on algebra only
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,14 +34,19 @@ cd "$SCRIPT_DIR"
 GPUS="0,1,2,3,4,5,6,7"
 DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B"
 SUBSET=""
-SKIP_LORA=false
-SKIP_MLP=false
-SKIP_PPL=false
+TRAIN_SUBSET=""
+EVAL_SUBSET=""
+METHODS="lora,mlp,ppl"  # Default: all methods
 CHECK_ONLY=false
 FORCE=false
 BATCH_SIZE=4
 RESERVE_MEMORY=0
 MEMORY_LOCK=0
+NO_VAL=false
+POOLING="last"
+DROPOUT=0.3
+FIXED_THRESHOLD=""
+SKIP_EPOCH_CASCADE=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -43,21 +59,21 @@ while [[ $# -gt 0 ]]; do
             SUBSET="$2"
             shift 2
             ;;
+        --train-subset)
+            TRAIN_SUBSET="$2"
+            shift 2
+            ;;
+        --eval-subset)
+            EVAL_SUBSET="$2"
+            shift 2
+            ;;
         --data-dir)
             DATA_DIR="$2"
             shift 2
             ;;
-        --skip-lora)
-            SKIP_LORA=true
-            shift
-            ;;
-        --skip-mlp)
-            SKIP_MLP=true
-            shift
-            ;;
-        --skip-ppl)
-            SKIP_PPL=true
-            shift
+        --methods)
+            METHODS="$2"
+            shift 2
             ;;
         --check)
             CHECK_ONLY=true
@@ -79,6 +95,26 @@ while [[ $# -gt 0 ]]; do
             MEMORY_LOCK="$2"
             shift 2
             ;;
+        --no-val)
+            NO_VAL=true
+            shift
+            ;;
+        --pooling)
+            POOLING="$2"
+            shift 2
+            ;;
+        --dropout)
+            DROPOUT="$2"
+            shift 2
+            ;;
+        --fixed-threshold)
+            FIXED_THRESHOLD="$2"
+            shift 2
+            ;;
+        --skip-epoch-cascade)
+            SKIP_EPOCH_CASCADE=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -90,11 +126,48 @@ done
 IFS=',' read -ra GPU_ARRAY <<< "$GPUS"
 NUM_GPUS=${#GPU_ARRAY[@]}
 
-# Subsets to process
+# Parse methods
+RUN_LORA=false
+RUN_MLP=false
+RUN_PPL=false
+IFS=',' read -ra METHOD_ARRAY <<< "$METHODS"
+for method in "${METHOD_ARRAY[@]}"; do
+    case $method in
+        lora) RUN_LORA=true ;;
+        mlp) RUN_MLP=true ;;
+        ppl) RUN_PPL=true ;;
+        *) echo "Unknown method: $method (valid: lora, mlp, ppl)"; exit 1 ;;
+    esac
+done
+
+# All subsets list
+ALL_SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
+
+# Handle subset arguments: --subset sets both, individual args override
 if [ -n "$SUBSET" ]; then
-    SUBSETS=("$SUBSET")
+    if [ -z "$TRAIN_SUBSET" ]; then
+        TRAIN_SUBSET="$SUBSET"
+    fi
+    if [ -z "$EVAL_SUBSET" ]; then
+        EVAL_SUBSET="$SUBSET"
+    fi
+fi
+
+# Default: if nothing specified, run each subset individually
+if [ -z "$TRAIN_SUBSET" ]; then
+    TRAIN_SUBSET=""  # Will loop through all subsets individually
+fi
+if [ -z "$EVAL_SUBSET" ]; then
+    EVAL_SUBSET="$TRAIN_SUBSET"  # Default eval to same as train
+fi
+
+# Determine subsets to iterate (for display and individual training)
+if [ -n "$TRAIN_SUBSET" ] && [ "$TRAIN_SUBSET" != "all" ]; then
+    SUBSETS=("$TRAIN_SUBSET")
+elif [ "$TRAIN_SUBSET" = "all" ]; then
+    SUBSETS=("all")  # Single "all" entry for unified training
 else
-    SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
+    SUBSETS=("${ALL_SUBSETS[@]}")  # Loop through each
 fi
 
 echo "============================================================"
@@ -102,9 +175,11 @@ echo "Classifier Comparison: LoRA vs MLP vs PPL"
 echo "============================================================"
 echo "Data dir: $DATA_DIR"
 echo "GPUs: $GPUS (${NUM_GPUS} GPUs)"
+echo "Train subset: ${TRAIN_SUBSET:-each individually}"
+echo "Eval subset: ${EVAL_SUBSET:-same as train}"
+echo "Methods: $METHODS"
 echo "Batch size: $BATCH_SIZE"
 echo "Memory lock: $MEMORY_LOCK"
-echo "Subsets: ${SUBSETS[*]}"
 echo "============================================================"
 
 # Show GPU memory status
@@ -125,20 +200,18 @@ for gpu_str in gpus:
 
     props = torch.cuda.get_device_properties(gpu_id)
     total = props.total_memory / 1024**3
-    # Get current usage (from nvidia-smi perspective)
     try:
         import subprocess
         result = subprocess.run(
             ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits', '-i', str(gpu_id)],
             capture_output=True, text=True
         )
-        used = float(result.stdout.strip()) / 1024  # MB to GB
+        used = float(result.stdout.strip()) / 1024
     except:
         used = 0
     free = total - used
 
     status = ""
-    # 7B bf16 model needs ~14GB, LoRA training needs ~18GB total
     if free < 18:
         status = " <- May OOM for LoRA"
     elif free < 20:
@@ -149,36 +222,46 @@ for gpu_str in gpus:
 print("-" * 65)
 print("Note: 7B bf16 model needs ~14GB, LoRA training needs ~18-20GB total")
 
-# Check memory lock setting
 memory_lock = float("$MEMORY_LOCK") if "$MEMORY_LOCK" else 0
 if memory_lock > 0:
     print(f"\nMemory lock: {memory_lock*100:.0f}%")
-    for gpu_str in gpus[:1]:  # Just check first GPU
+    for gpu_str in gpus[:1]:
         gpu_id = int(gpu_str)
         if gpu_id < torch.cuda.device_count():
             total = torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3
             locked = total * memory_lock
             print(f"  GPU {gpu_id}: Will lock {locked:.1f}GB / {total:.1f}GB")
-            if locked < 18:
-                print(f"  WARNING: {locked:.1f}GB may not be enough for LoRA training (needs ~18-20GB)")
 GPUEOF
 echo "============================================================"
 
 # Helper function to check if model already trained
 check_model_exists() {
-    local subset=$1
+    local model_dir=$1
     local model_type=$2
-    # If --force, always return "not exists" to force retraining
     if [ "$FORCE" = true ]; then
         return 1
     fi
-    local result_file="$DATA_DIR/$subset/${model_type}_model/results.json"
+    local result_file="$DATA_DIR/$model_dir/${model_type}_model/results.json"
     if [ -f "$result_file" ]; then
-        return 0  # exists
+        return 0
     else
-        return 1  # not exists
+        return 1
     fi
 }
+
+# Build common flags
+NO_VAL_FLAG=""
+if [ "$NO_VAL" = true ]; then
+    NO_VAL_FLAG="--no-val"
+fi
+FIXED_THRESHOLD_FLAG=""
+if [ -n "$FIXED_THRESHOLD" ]; then
+    FIXED_THRESHOLD_FLAG="--fixed-threshold $FIXED_THRESHOLD"
+fi
+SKIP_EPOCH_CASCADE_FLAG=""
+if [ "$SKIP_EPOCH_CASCADE" = true ]; then
+    SKIP_EPOCH_CASCADE_FLAG="--skip-epoch-cascade"
+fi
 
 # Check-only mode: show file status and results
 if [ "$CHECK_ONLY" = true ]; then
@@ -186,7 +269,22 @@ if [ "$CHECK_ONLY" = true ]; then
     echo "========== FILE STATUS =========="
     printf "%-25s %-10s %-10s %-10s\n" "Subset" "LoRA" "MLP" "PPL"
     echo "------------------------------------------------------------"
-    for subset in "${SUBSETS[@]}"; do
+
+    # Check for unified "all" model
+    if [ -d "$DATA_DIR/all/mlp_model" ] || [ -d "$DATA_DIR/all/lora_model" ]; then
+        lora_status="-"
+        mlp_status="-"
+        ppl_status="-"
+        [ -f "$DATA_DIR/all/lora_model/results.json" ] && lora_status="OK"
+        # Check for results_all.json or results.json
+        [ -f "$DATA_DIR/all/mlp_model/results_all.json" ] && mlp_status="OK"
+        [ -f "$DATA_DIR/all/mlp_model/results.json" ] && mlp_status="OK"
+        [ -f "$DATA_DIR/all/ppl_model/results.json" ] && ppl_status="OK"
+        printf "%-25s %-10s %-10s %-10s\n" "all (unified)" "$lora_status" "$mlp_status" "$ppl_status"
+        echo "------------------------------------------------------------"
+    fi
+
+    for subset in "${ALL_SUBSETS[@]}"; do
         lora_status="-"
         mlp_status="-"
         ppl_status="-"
@@ -205,12 +303,28 @@ import json
 import os
 
 data_dir = "$DATA_DIR"
-subsets = "${SUBSETS[*]}".split()
+all_subsets = "algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus".split()
 
 print(f"{'Subset':<25} {'LoRA':>10} {'MLP':>10} {'PPL':>10} {'Oracle':>10} {'Best':>10}")
 print("-" * 75)
 
-for subset in subsets:
+# Check for unified "all" model first
+all_mlp_dir = os.path.join(data_dir, "all", "mlp_model")
+all_mlp_results = None
+for fname in ["results_all.json", "results.json"]:
+    fpath = os.path.join(all_mlp_dir, fname)
+    if os.path.exists(fpath):
+        with open(fpath) as f:
+            all_mlp_results = json.load(f)
+        break
+
+if all_mlp_results:
+    acc = all_mlp_results.get('test_best_cascade_acc', all_mlp_results.get('best_cascade_acc', 0))
+    oracle = all_mlp_results.get('test_oracle_acc', all_mlp_results.get('oracle_acc', 0))
+    print(f"{'all (unified)':<25} {'-':>10} {acc:>10.4f} {'-':>10} {oracle:>10.4f} {'MLP':>10}")
+    print("-" * 75)
+
+for subset in all_subsets:
     row = {"lora": "-", "mlp": "-", "ppl": "-", "oracle": "-"}
     best_val, best_name = 0, "-"
 
@@ -220,10 +334,10 @@ for subset in subsets:
             try:
                 with open(path) as f:
                     r = json.load(f)
-                acc = r.get('best_cascade_acc', 0)
+                acc = r.get('test_best_cascade_acc', r.get('best_cascade_acc', 0))
                 row[m] = f"{acc:.4f}"
                 if row["oracle"] == "-" and 'oracle_acc' in r:
-                    row["oracle"] = f"{r['oracle_acc']:.4f}"
+                    row["oracle"] = f"{r.get('test_oracle_acc', r.get('oracle_acc')):.4f}"
                 if acc > best_val:
                     best_val, best_name = acc, m.upper()
             except:
@@ -236,79 +350,126 @@ PYEOF
     exit 0
 fi
 
+# Determine model directory for "all" training
+if [ "$TRAIN_SUBSET" = "all" ]; then
+    MODEL_DIR="all"
+else
+    MODEL_DIR="$TRAIN_SUBSET"
+fi
+
 # Train LoRA classifiers
-if [ "$SKIP_LORA" = false ]; then
+if [ "$RUN_LORA" = true ]; then
     echo ""
     echo "========== Training LoRA Classifiers =========="
-    for subset in "${SUBSETS[@]}"; do
-        if check_model_exists "$subset" "lora"; then
-            echo ""
-            echo ">>> LoRA: $subset [SKIP - already trained]"
+
+    if [ "$TRAIN_SUBSET" = "all" ]; then
+        echo ">>> LoRA training not supported for --train-subset all"
+    else
+        # Determine subsets for LoRA training
+        if [ -n "$TRAIN_SUBSET" ]; then
+            LORA_SUBSETS=("$TRAIN_SUBSET")
         else
-            echo ""
-            echo ">>> LoRA: $subset"
-            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --epochs 3 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
+            LORA_SUBSETS=("${ALL_SUBSETS[@]}")
         fi
-    done
+
+        for subset in "${LORA_SUBSETS[@]}"; do
+            if check_model_exists "$subset" "lora"; then
+                echo ""
+                echo ">>> LoRA: $subset [SKIP - already trained]"
+            else
+                echo ""
+                echo ">>> LoRA: $subset"
+                CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
+                    --ddp --subset $subset --data-dir $DATA_DIR --epochs 3 --batch-size $BATCH_SIZE \
+                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
+            fi
+        done
+    fi
 else
     echo ""
-    echo "========== Skipping LoRA (--skip-lora) =========="
+    echo "========== Skipping LoRA (not in --methods) =========="
 fi
 
 # Train MLP classifiers
-if [ "$SKIP_MLP" = false ]; then
+if [ "$RUN_MLP" = true ]; then
     echo ""
     echo "========== Training MLP Classifiers (Frozen LLM) =========="
-    for subset in "${SUBSETS[@]}"; do
-        if check_model_exists "$subset" "mlp"; then
-            echo ""
-            echo ">>> MLP: $subset [SKIP - already trained]"
+
+    if [ "$TRAIN_SUBSET" = "all" ]; then
+        # Unified training on all subsets
+        if check_model_exists "all" "mlp"; then
+            echo ">>> MLP: train=all, eval=$EVAL_SUBSET [SKIP - already trained]"
         else
-            echo ""
-            echo ">>> MLP: $subset"
+            echo ">>> MLP: train=all, eval=$EVAL_SUBSET"
+            echo "    (pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29506 train_mlp_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --epochs 10 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
+                --ddp --train-subset all --eval-subset "$EVAL_SUBSET" --data-dir $DATA_DIR --epochs 10 --batch-size $BATCH_SIZE \
+                --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
+                --pooling $POOLING --dropout $DROPOUT $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $SKIP_EPOCH_CASCADE_FLAG
         fi
-    done
+    else
+        # Individual subset training
+        if [ -n "$TRAIN_SUBSET" ]; then
+            MLP_SUBSETS=("$TRAIN_SUBSET")
+        else
+            MLP_SUBSETS=("${ALL_SUBSETS[@]}")
+        fi
+
+        for subset in "${MLP_SUBSETS[@]}"; do
+            if check_model_exists "$subset" "mlp"; then
+                echo ""
+                echo ">>> MLP: $subset [SKIP - already trained]"
+            else
+                echo ""
+                echo ">>> MLP: $subset"
+                CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29506 train_mlp_classifier.py \
+                    --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR --epochs 10 --batch-size $BATCH_SIZE \
+                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
+                    --pooling $POOLING --dropout $DROPOUT $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $SKIP_EPOCH_CASCADE_FLAG
+            fi
+        done
+    fi
 else
     echo ""
-    echo "========== Skipping MLP (--skip-mlp) =========="
+    echo "========== Skipping MLP (not in --methods) =========="
 fi
 
 # Train PPL classifiers
-if [ "$SKIP_PPL" = false ]; then
+if [ "$RUN_PPL" = true ]; then
     echo ""
     echo "========== Training PPL Classifiers (Entropy-based) =========="
-    for subset in "${SUBSETS[@]}"; do
-        if check_model_exists "$subset" "ppl"; then
-            echo ""
-            echo ">>> PPL: $subset [SKIP - already trained]"
+
+    if [ "$TRAIN_SUBSET" = "all" ]; then
+        echo ">>> PPL training not supported for --train-subset all"
+    else
+        # Individual subset training
+        if [ -n "$TRAIN_SUBSET" ]; then
+            PPL_SUBSETS=("$TRAIN_SUBSET")
         else
-            echo ""
-            echo ">>> PPL: $subset"
-            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
+            PPL_SUBSETS=("${ALL_SUBSETS[@]}")
         fi
-    done
+
+        for subset in "${PPL_SUBSETS[@]}"; do
+            if check_model_exists "$subset" "ppl"; then
+                echo ""
+                echo ">>> PPL: $subset [SKIP - already trained]"
+            else
+                echo ""
+                echo ">>> PPL: $subset"
+                CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29507 train_ppl_classifier.py \
+                    --ddp --subset $subset --data-dir $DATA_DIR --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK
+            fi
+        done
+    fi
 else
     echo ""
-    echo "========== Skipping PPL (--skip-ppl) =========="
+    echo "========== Skipping PPL (not in --methods) =========="
 fi
-
-# Evaluate all classifiers on test split
-echo ""
-echo "========== Evaluating on Test Split =========="
-for subset in "${SUBSETS[@]}"; do
-    echo ">>> Test eval: $subset"
-    CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python eval_classifiers.py \
-        --data-dir $DATA_DIR --subset $subset --split test
-done
 
 # Compare results using Python for better formatting
 echo ""
 echo "============================================================"
-echo "                    COMPARISON RESULTS (TEST)"
+echo "                    COMPARISON RESULTS"
 echo "============================================================"
 
 python3 << EOF
@@ -316,13 +477,12 @@ import json
 import os
 
 data_dir = "$DATA_DIR"
-subsets = "${SUBSETS[*]}".split()
+all_subsets = "algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus".split()
+train_subset = "$TRAIN_SUBSET"
 
-# Token levels for length calculation
 TOKEN_LEVELS = [0, 100, 500, 1000]
 
 def get_results(subset, model_type):
-    """Get results for a specific subset and model type."""
     result_file = os.path.join(data_dir, subset, f"{model_type}_model", "results.json")
     if os.path.exists(result_file):
         try:
@@ -333,19 +493,16 @@ def get_results(subset, model_type):
     return None
 
 def get_cascade_acc(r):
-    """Get cascade accuracy (test split)."""
     if not r:
         return None
     return r.get('test_best_cascade_acc', r.get('best_cascade_acc'))
 
 def get_oracle(r):
-    """Get oracle accuracy (test split)."""
     if not r:
         return None
     return r.get('test_oracle_acc', r.get('oracle_acc'))
 
 def get_baseline(r):
-    """Get per-stage baseline (test split)."""
     if not r:
         return None
     return r.get('test_per_stage_baseline_acc', r.get('per_stage_baseline_acc'))
@@ -357,8 +514,26 @@ print("=" * 100)
 print(f"{'Subset':<25} {'LoRA':>12} {'MLP':>12} {'PPL':>12} {'Oracle':>12} {'Best':>12}")
 print("-" * 100)
 
+# Check for unified "all" MLP model
+all_mlp_dir = os.path.join(data_dir, "all", "mlp_model")
+all_mlp_results = None
+for fname in ["results_all.json", "results.json"]:
+    fpath = os.path.join(all_mlp_dir, fname)
+    if os.path.exists(fpath):
+        with open(fpath) as f:
+            all_mlp_results = json.load(f)
+        break
+
+if all_mlp_results and train_subset == "all":
+    mlp_casc = get_cascade_acc(all_mlp_results)
+    oracle_val = get_oracle(all_mlp_results)
+    mlp_acc = f"{mlp_casc:.4f}" if mlp_casc is not None else "-"
+    oracle = f"{oracle_val:.4f}" if oracle_val is not None else "-"
+    print(f"{'all (unified)':<25} {'-':>12} {mlp_acc:>12} {'-':>12} {oracle:>12} {'MLP':>12}")
+    print("-" * 100)
+
 all_results = {}
-for subset in subsets:
+for subset in all_subsets:
     lora = get_results(subset, "lora")
     mlp = get_results(subset, "mlp")
     ppl = get_results(subset, "ppl")
@@ -371,11 +546,9 @@ for subset in subsets:
     mlp_acc = f"{mlp_casc:.4f}" if mlp_casc is not None else "-"
     ppl_acc = f"{ppl_casc:.4f}" if ppl_casc is not None else "-"
 
-    # Get oracle from any available result
     oracle_val = get_oracle(lora) or get_oracle(mlp) or get_oracle(ppl)
     oracle = f"{oracle_val:.4f}" if oracle_val is not None else "-"
 
-    # Find best
     accs = []
     if lora_casc is not None:
         accs.append(('LoRA', lora_casc))
@@ -404,48 +577,7 @@ ppl_avg = f"{sum(ppl_accs)/len(ppl_accs):.4f}" if ppl_accs else "-"
 print(f"{'AVERAGE':<25} {lora_avg:>12} {mlp_avg:>12} {ppl_avg:>12}")
 print("=" * 100)
 
-# Per-stage AUC comparison
-print()
-print("=" * 100)
-print("                              PER-STAGE AUC COMPARISON")
-print("=" * 100)
-print(f"{'Subset':<20} {'Model':<8} {'T0':>10} {'T100':>10} {'T500':>10} {'T1000':>10} {'Avg':>10}")
-print("-" * 100)
-
-for subset in subsets:
-    for model_type, model_name in [('lora', 'LoRA'), ('mlp', 'MLP'), ('ppl', 'PPL')]:
-        results = all_results[subset][model_type]
-        auc = results.get('test_per_stage_auc', results.get('per_stage_auc')) if results else None
-        if auc:
-            t0 = f"{auc.get('0', auc.get('T0', 0)):.4f}"
-            t100 = f"{auc.get('100', auc.get('T100', 0)):.4f}"
-            t500 = f"{auc.get('500', auc.get('T500', 0)):.4f}"
-            t1000 = f"{auc.get('1000', auc.get('T1000', 0)):.4f}"
-            avg_auc = sum([auc.get(str(t), auc.get(f'T{t}', 0)) for t in TOKEN_LEVELS]) / 4
-            print(f"{subset:<20} {model_name:<8} {t0:>10} {t100:>10} {t500:>10} {t1000:>10} {avg_auc:>10.4f}")
-        else:
-            print(f"{subset:<20} {model_name:<8} {'-':>10} {'-':>10} {'-':>10} {'-':>10} {'-':>10}")
-    print("-" * 100)
-
-# Best thresholds comparison
-print()
-print("=" * 100)
-print("                              BEST THRESHOLDS (TEST)")
-print("=" * 100)
-print(f"{'Subset':<20} {'Model':<8} {'T0':>10} {'T100':>10} {'T500':>10} {'T1000':>10}")
-print("-" * 100)
-
-for subset in subsets:
-    for model_type, model_name in [('lora', 'LoRA'), ('mlp', 'MLP'), ('ppl', 'PPL')]:
-        results = all_results[subset][model_type]
-        th = results.get('test_best_thresholds', results.get('best_thresholds')) if results else None
-        if th:
-            print(f"{subset:<20} {model_name:<8} {th[0]:>10.2f} {th[1]:>10.2f} {th[2]:>10.2f} {th[3]:>10.2f}")
-        else:
-            print(f"{subset:<20} {model_name:<8} {'-':>10} {'-':>10} {'-':>10} {'-':>10}")
-    print("-" * 100)
-
-# Per-stage baseline accuracy (what % of samples are correct at each stage)
+# Per-stage baseline accuracy
 print()
 print("=" * 100)
 print("                         PER-STAGE BASELINE ACCURACY (Ground Truth)")
@@ -453,8 +585,7 @@ print("=" * 100)
 print(f"{'Subset':<25} {'T0':>12} {'T100':>12} {'T500':>12} {'T1000':>12}")
 print("-" * 100)
 
-for subset in subsets:
-    # Try to get from any model's results
+for subset in all_subsets:
     for model_type in ['lora', 'mlp', 'ppl']:
         results = all_results[subset][model_type]
         baseline = get_baseline(results)
@@ -472,6 +603,8 @@ print("=" * 100)
 
 print()
 print("Done! Results saved in:")
+if train_subset == "all":
+    print("  MLP (unified): all/mlp_model/results_*.json")
 print("  LoRA: {subset}/lora_model/results.json")
 print("  MLP:  {subset}/mlp_model/results.json")
 print("  PPL:  {subset}/ppl_model/results.json")
