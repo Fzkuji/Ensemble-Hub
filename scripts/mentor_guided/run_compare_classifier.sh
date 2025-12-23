@@ -619,7 +619,8 @@ def get_results(subset, model_type):
 def get_cascade_acc(r):
     if not r:
         return None
-    return r.get('test_best_cascade_acc', r.get('best_cascade_acc'))
+    # Check different key names used in various result formats
+    return r.get('test_best_cascade_acc', r.get('best_cascade_acc', r.get('cascade_acc')))
 
 def get_oracle(r):
     if not r:
