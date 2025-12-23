@@ -206,17 +206,14 @@ def get_lora_predictions(
 
 class MLPClassifierHead(nn.Module):
     """MLP classifier head (same as train_mlp_classifier.py)."""
-    def __init__(self, hidden_size: int, num_stages: int = 4, dropout: float = 0.3):
+    def __init__(self, hidden_size: int, num_stages: int = 4, dropout: float = 0.1):
         super().__init__()
         self.stage_embedding = nn.Embedding(num_stages, 64)
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_size + 64, 512),
+            nn.Linear(hidden_size + 64, 256),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, 2)
+            nn.Linear(256, 2),
         )
 
     def forward(self, hidden_state, stage):
