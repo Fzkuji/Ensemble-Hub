@@ -500,6 +500,7 @@ def main():
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--no-lora", action="store_true", help="Skip LoRA predictions (use MLP or PPL only)")
     parser.add_argument("--use-mlp", action="store_true", help="Use MLP model instead of LoRA")
+    parser.add_argument("--mlp-lora", action="store_true", help="Use both MLP and LoRA predictions (best combination)")
     parser.add_argument("--no-ppl", action="store_true", help="Skip PPL predictions")
     args = parser.parse_args()
 
@@ -556,30 +557,47 @@ def main():
         n_test = len(test_data[TOKEN_LEVELS[0]]) if test_data else 0
         print(f"Train: {n_train}, Test: {n_test}")
 
-        # Load neural network model (LoRA or MLP)
-        nn_model = None
+        # Load neural network models
+        mlp_model = None
+        lora_model = None
         tokenizer = None
-        nn_model_type = None
 
-        if args.use_mlp:
-            # Use MLP model
+        if args.mlp_lora:
+            # Use both MLP and LoRA
             print("Loading MLP model...")
-            nn_model, tokenizer = load_mlp_model(mlp_dir, args.base_model, device)
-            if nn_model is not None:
-                nn_model_type = "mlp"
+            mlp_model, tokenizer = load_mlp_model(mlp_dir, args.base_model, device)
+            if mlp_model is not None:
+                print("  MLP model loaded")
+            else:
+                print("  MLP model not found")
+
+            print("Loading LoRA model...")
+            lora_model, tokenizer_lora = load_lora_model(lora_dir, args.base_model, device)
+            if lora_model is not None:
+                print("  LoRA model loaded")
+                if tokenizer is None:
+                    tokenizer = tokenizer_lora
+            else:
+                print("  LoRA model not found")
+        elif args.use_mlp:
+            # Use MLP model only
+            print("Loading MLP model...")
+            mlp_model, tokenizer = load_mlp_model(mlp_dir, args.base_model, device)
+            if mlp_model is not None:
+                print("  MLP model loaded")
             else:
                 print("  MLP model not found")
         elif not args.no_lora:
-            # Use LoRA model
+            # Use LoRA model (default)
             print("Loading LoRA model...")
-            nn_model, tokenizer = load_lora_model(lora_dir, args.base_model, device)
-            if nn_model is not None:
-                nn_model_type = "lora"
+            lora_model, tokenizer = load_lora_model(lora_dir, args.base_model, device)
+            if lora_model is not None:
+                print("  LoRA model loaded")
             else:
                 print("  LoRA model not found, trying MLP...")
-                nn_model, tokenizer = load_mlp_model(mlp_dir, args.base_model, device)
-                if nn_model is not None:
-                    nn_model_type = "mlp"
+                mlp_model, tokenizer = load_mlp_model(mlp_dir, args.base_model, device)
+                if mlp_model is not None:
+                    print("  MLP model loaded as fallback")
 
         # Load PPL classifier
         ppl_clf = None
@@ -590,22 +608,24 @@ def main():
             if ppl_clf is None:
                 print("  PPL classifier not found, skipping PPL predictions")
 
-        if nn_model is None and ppl_clf is None:
+        if mlp_model is None and lora_model is None and ppl_clf is None:
             print("No models available for ensemble, skipping...")
             continue
 
         # Get predictions on train data
         print("\nGenerating predictions on train data...")
-        if nn_model_type == "mlp":
-            train_nn_preds = get_mlp_predictions(
-                nn_model, tokenizer, train_data, device, args.max_length, args.batch_size
+        train_mlp_preds = None
+        train_lora_preds = None
+
+        if mlp_model is not None:
+            train_mlp_preds = get_mlp_predictions(
+                mlp_model, tokenizer, train_data, device, args.max_length, args.batch_size
             )
-        elif nn_model_type == "lora":
-            train_nn_preds = get_lora_predictions(
-                nn_model, tokenizer, train_data, device, args.max_length, args.batch_size
+
+        if lora_model is not None:
+            train_lora_preds = get_lora_predictions(
+                lora_model, tokenizer, train_data, device, args.max_length, args.batch_size
             )
-        else:
-            train_nn_preds = None
 
         train_ppl_preds = get_ppl_predictions(ppl_clf, ppl_scaler, train_data) if ppl_clf else None
 
@@ -623,8 +643,10 @@ def main():
             for stage_idx, tokens in enumerate(TOKEN_LEVELS):
                 feat = [stage_idx, tokens / 1000.0]
 
-                if train_nn_preds:
-                    feat.append(train_nn_preds[tokens][i])
+                if train_mlp_preds:
+                    feat.append(train_mlp_preds[tokens][i])
+                if train_lora_preds:
+                    feat.append(train_lora_preds[tokens][i])
                 if train_ppl_preds:
                     feat.append(train_ppl_preds[tokens][i])
 
@@ -681,16 +703,18 @@ def main():
         # Evaluate on test
         if test_data:
             print("\nGenerating predictions on test data...")
-            if nn_model_type == "mlp":
-                test_nn_preds = get_mlp_predictions(
-                    nn_model, tokenizer, test_data, device, args.max_length, args.batch_size
+            test_mlp_preds = None
+            test_lora_preds = None
+
+            if mlp_model is not None:
+                test_mlp_preds = get_mlp_predictions(
+                    mlp_model, tokenizer, test_data, device, args.max_length, args.batch_size
                 )
-            elif nn_model_type == "lora":
-                test_nn_preds = get_lora_predictions(
-                    nn_model, tokenizer, test_data, device, args.max_length, args.batch_size
+
+            if lora_model is not None:
+                test_lora_preds = get_lora_predictions(
+                    lora_model, tokenizer, test_data, device, args.max_length, args.batch_size
                 )
-            else:
-                test_nn_preds = None
 
             test_ppl_preds = get_ppl_predictions(ppl_clf, ppl_scaler, test_data) if ppl_clf else None
 
@@ -703,8 +727,10 @@ def main():
                     test_labels[i, stage_idx] = 1 if test_data[tokens][i].get('is_correct', False) else 0
 
                     feat = [stage_idx, tokens / 1000.0]
-                    if test_nn_preds:
-                        feat.append(test_nn_preds[tokens][i])
+                    if test_mlp_preds:
+                        feat.append(test_mlp_preds[tokens][i])
+                    if test_lora_preds:
+                        feat.append(test_lora_preds[tokens][i])
                     if test_ppl_preds:
                         feat.append(test_ppl_preds[tokens][i])
                     sample_feat.extend(feat)
@@ -742,7 +768,8 @@ def main():
             'classifiers': stage_classifiers,
             'thresholds': best_thresholds,
             'method': args.method,
-            'nn_model_type': nn_model_type,
+            'has_mlp': mlp_model is not None,
+            'has_lora': lora_model is not None,
             'has_ppl': ppl_clf is not None,
         }
         with open(os.path.join(ensemble_dir, "model.pkl"), 'wb') as f:
@@ -751,7 +778,8 @@ def main():
         results = {
             'subset': subset,
             'method': args.method,
-            'nn_model_type': nn_model_type,
+            'has_mlp': mlp_model is not None,
+            'has_lora': lora_model is not None,
             'has_ppl': ppl_clf is not None,
             'train_cascade_acc': float(train_cascade_acc),
             'train_oracle': float(train_oracle),
@@ -771,9 +799,11 @@ def main():
         print(f"\nModel saved to: {ensemble_dir}")
 
         # Clean up GPU memory
-        if nn_model:
-            del nn_model
-            torch.cuda.empty_cache()
+        if mlp_model is not None:
+            del mlp_model
+        if lora_model is not None:
+            del lora_model
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

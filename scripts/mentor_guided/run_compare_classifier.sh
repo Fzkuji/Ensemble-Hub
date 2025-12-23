@@ -544,7 +544,7 @@ else
     echo "========== Skipping PPL (not in --methods) =========="
 fi
 
-# Train Ensemble classifiers (MLP+PPL or LoRA+PPL)
+# Train Ensemble classifiers (MLP+LoRA, MLP+PPL, or LoRA+PPL)
 if [ "$RUN_ENSEMBLE" = true ]; then
     echo ""
     echo "========== Training Ensemble Classifiers =========="
@@ -556,22 +556,38 @@ if [ "$RUN_ENSEMBLE" = true ]; then
         ENS_SUBSETS=("$TRAIN_SUBSET")
     fi
 
-    # Determine whether to use MLP or LoRA based on what was trained
-    USE_MLP_FLAG=""
-    if [ "$RUN_MLP" = true ]; then
-        USE_MLP_FLAG="--use-mlp"
+    # Determine which models to use for ensemble
+    # Priority: MLP+LoRA > MLP > LoRA (with optional PPL)
+    ENSEMBLE_FLAG=""
+    if [ "$RUN_MLP" = true ] && [ "$RUN_LORA" = true ]; then
+        ENSEMBLE_FLAG="--mlp-lora --no-ppl"
+        echo ">>> Using MLP + LoRA for ensemble (best combination)"
+    elif [ "$RUN_MLP" = true ]; then
+        ENSEMBLE_FLAG="--use-mlp"
         echo ">>> Using MLP + PPL for ensemble"
     elif [ "$RUN_LORA" = true ]; then
         echo ">>> Using LoRA + PPL for ensemble"
     else
-        # Check what exists
+        # Check what exists - prefer MLP+LoRA if both available
+        HAS_MLP=false
+        HAS_LORA=false
         for subset in "${ENS_SUBSETS[@]}"; do
-            if [ -f "$DATA_DIR/$subset/mlp_model/results.json" ]; then
-                USE_MLP_FLAG="--use-mlp"
-                echo ">>> Found MLP models, using MLP + PPL for ensemble"
-                break
+            if [ -f "$DATA_DIR/$subset/mlp_model/results.json" ] || [ -f "$DATA_DIR/all/mlp_model/results.json" ]; then
+                HAS_MLP=true
+            fi
+            if [ -f "$DATA_DIR/$subset/lora_model/results.json" ] || [ -f "$DATA_DIR/all/lora_model/results.json" ]; then
+                HAS_LORA=true
             fi
         done
+        if [ "$HAS_MLP" = true ] && [ "$HAS_LORA" = true ]; then
+            ENSEMBLE_FLAG="--mlp-lora --no-ppl"
+            echo ">>> Found both MLP and LoRA models, using MLP + LoRA for ensemble"
+        elif [ "$HAS_MLP" = true ]; then
+            ENSEMBLE_FLAG="--use-mlp"
+            echo ">>> Found MLP models, using MLP + PPL for ensemble"
+        elif [ "$HAS_LORA" = true ]; then
+            echo ">>> Found LoRA models, using LoRA + PPL for ensemble"
+        fi
     fi
 
     for subset in "${ENS_SUBSETS[@]}"; do
@@ -582,7 +598,7 @@ if [ "$RUN_ENSEMBLE" = true ]; then
             echo ""
             echo ">>> Ensemble: $subset"
             CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python train_ensemble_classifier.py \
-                --subset $subset --data-dir $DATA_DIR $USE_MLP_FLAG
+                --subset $subset --data-dir $DATA_DIR $ENSEMBLE_FLAG
         fi
     done
 else
