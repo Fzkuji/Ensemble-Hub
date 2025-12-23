@@ -515,11 +515,37 @@ def main():
         print(f"{'='*60}")
 
         subset_dir = os.path.join(args.data_dir, subset)
+        unified_dir = os.path.join(args.data_dir, "all")  # Unified model directory
+
+        # Check for per-subset models first, fallback to unified models
         lora_dir = os.path.join(subset_dir, "lora_model")
+        if not os.path.exists(os.path.join(lora_dir, "classifier_head.pt")):
+            unified_lora = os.path.join(unified_dir, "lora_model")
+            if os.path.exists(os.path.join(unified_lora, "classifier_head.pt")):
+                lora_dir = unified_lora
+
         mlp_dir = os.path.join(subset_dir, "mlp_model")
+        if not os.path.exists(os.path.join(mlp_dir, "classifier_head.pt")):
+            unified_mlp = os.path.join(unified_dir, "mlp_model")
+            if os.path.exists(os.path.join(unified_mlp, "classifier_head.pt")):
+                mlp_dir = unified_mlp
+
         ppl_dir = os.path.join(subset_dir, "ppl_model")
+        if not os.path.exists(os.path.join(ppl_dir, "classifier.pkl")):
+            unified_ppl = os.path.join(unified_dir, "ppl_model")
+            if os.path.exists(os.path.join(unified_ppl, "classifier.pkl")):
+                ppl_dir = unified_ppl
+
         ensemble_dir = os.path.join(subset_dir, "ensemble_model")
         os.makedirs(ensemble_dir, exist_ok=True)
+
+        # Log model directories being used
+        if "all" in mlp_dir:
+            print(f"Using unified MLP model from: {mlp_dir}")
+        if "all" in lora_dir:
+            print(f"Using unified LoRA model from: {lora_dir}")
+        if "all" in ppl_dir:
+            print(f"Using unified PPL model from: {ppl_dir}")
 
         # Load data
         train_data = load_json_data(subset_dir, split="train")
