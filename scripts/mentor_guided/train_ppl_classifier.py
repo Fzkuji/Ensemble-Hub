@@ -862,9 +862,12 @@ def main():
 
             # Also compute average for summary
             accs = [r['cascade_acc'] for r in test_results_per_subset.values()]
+            oracles = [r['oracle_acc'] for r in test_results_per_subset.values()]
             if accs:
                 results['test_best_cascade_acc'] = sum(accs) / len(accs)
+                results['test_oracle_acc'] = sum(oracles) / len(oracles)
                 logger.info(f"\nAverage Test Cascade Accuracy: {results['test_best_cascade_acc']:.4f}")
+                logger.info(f"Average Test Oracle: {results['test_oracle_acc']:.4f}")
 
         results_path = os.path.join(args.output_dir, "results.json")
         with open(results_path, 'w') as f:
