@@ -523,6 +523,35 @@ def get_classifier_results(data_dir: str, subset: str, model_type: str, model_so
                         'oracle_acc': sub_r.get('oracle_acc', 0),
                         'source': 'all',
                     }
+        
+        # 对于 LoRA，检查 all/lora_model 的结果
+        if model_type == "lora":
+            # 检查 results.json
+            lora_result = os.path.join(all_model_dir, "results.json")
+            if os.path.exists(lora_result):
+                with open(lora_result, 'r') as f:
+                    r = json.load(f)
+                # 检查是否有 per-subset 结果
+                if 'test_results_per_subset' in r and subset in r['test_results_per_subset']:
+                    sub_r = r['test_results_per_subset'][subset]
+                    return {
+                        'cascade_acc': sub_r.get('cascade_acc', sub_r.get('cascade_accuracy', 0)),
+                        'oracle_acc': sub_r.get('oracle_acc', sub_r.get('oracle', 0)),
+                        'source': 'all',
+                    }
+            # 检查 cascade_eval.json
+            lora_eval = os.path.join(all_model_dir, "cascade_eval.json")
+            if os.path.exists(lora_eval):
+                with open(lora_eval, 'r') as f:
+                    r = json.load(f)
+                # 检查是否有 per-subset 结果
+                if 'per_subset' in r and subset in r['per_subset']:
+                    sub_r = r['per_subset'][subset]
+                    return {
+                        'cascade_acc': sub_r.get('cascade_accuracy', sub_r.get('cascade_acc', 0)),
+                        'oracle_acc': sub_r.get('oracle', sub_r.get('oracle_acc', 0)),
+                        'source': 'all',
+                    }
     
     return None
 
