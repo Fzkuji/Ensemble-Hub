@@ -235,6 +235,37 @@ def load_json_data(data_dir: str, split: str = "train") -> Dict[int, List[Dict]]
     return data
 
 
+def load_all_subsets_data(base_dir: str, split: str = "train") -> Dict[int, List[Dict]]:
+    """Load and merge JSON data from all subsets."""
+    merged_data = {tokens: [] for tokens in TOKEN_LEVELS}
+
+    for subset in SUBSETS:
+        subset_dir = os.path.join(base_dir, subset, split)
+        if not os.path.exists(subset_dir):
+            logger.warning(f"Subset dir not found: {subset_dir}")
+            continue
+
+        for tokens in TOKEN_LEVELS:
+            filepath = os.path.join(subset_dir, f"tokens{tokens}.json")
+            if os.path.exists(filepath):
+                with open(filepath, 'r') as f:
+                    subset_data = json.load(f)
+                    # Add subset info for tracking
+                    for item in subset_data:
+                        item['subset'] = subset
+                    merged_data[tokens].extend(subset_data)
+                if is_main_process():
+                    logger.info(f"Loaded {len(subset_data)} samples from {subset}/{split}/tokens{tokens}.json")
+
+    # Log total counts
+    if is_main_process():
+        for tokens in TOKEN_LEVELS:
+            if merged_data[tokens]:
+                logger.info(f"Total tokens{tokens}: {len(merged_data[tokens])} samples (merged from all subsets)")
+
+    return merged_data
+
+
 class LoRAClassifier(nn.Module):
     """Wrapper combining base model with LoRA and classification head."""
 
@@ -683,23 +714,22 @@ def main():
         if is_main_process():
             logger.info(f"Pre-allocated {args.reserve_memory:.1f} GB GPU memory on {device} (will release after model load)")
 
-    # Determine subset directory
-    if args.subset == "all":
+    # Determine subset directory and training mode
+    train_all_subsets = (args.subset == "all")
+    
+    if train_all_subsets:
+        # When training on all subsets, output goes to data_dir/all/lora_model
         subset_dir = os.path.join(args.data_dir, "all")
-        train_split = "train"
-        test_split = "test"
+        os.makedirs(subset_dir, exist_ok=True)
     else:
         subset_dir = os.path.join(args.data_dir, args.subset)
-        train_split = "train"
-        test_split = "test"
-
-    # Validate data directory exists
-    if not os.path.exists(subset_dir):
-        if is_main_process():
-            logger.error(f"Data directory not found: {subset_dir}")
-            logger.error(f"Please check --data-dir and --subset arguments")
-        cleanup_distributed()
-        return
+        # Validate data directory exists
+        if not os.path.exists(subset_dir):
+            if is_main_process():
+                logger.error(f"Data directory not found: {subset_dir}")
+                logger.error(f"Please check --data-dir and --subset arguments")
+            cleanup_distributed()
+            return
 
     if args.output_dir is None:
         args.output_dir = os.path.join(subset_dir, "lora_model")
@@ -714,8 +744,11 @@ def main():
     # Load train data and split into train/val
     if is_main_process():
         logger.info("Loading training data...")
-    train_data = load_json_data(subset_dir, split=train_split)
-    if not train_data:
+    if train_all_subsets:
+        train_data = load_all_subsets_data(args.data_dir, split="train")
+    else:
+        train_data = load_json_data(subset_dir, split="train")
+    if not train_data or not train_data.get(TOKEN_LEVELS[0]):
         if is_main_process():
             logger.error("No training data found!")
         cleanup_distributed()
@@ -751,12 +784,14 @@ def main():
             logger.info(f"Train: {n_train} samples, Val: {n_val} samples (split ratio: {1-args.val_ratio:.0%}/{args.val_ratio:.0%})")
 
     # Always load test data for final evaluation (ensures consistent Oracle)
+    # Note: For --subset all, test data will be loaded per-subset during evaluation
     test_data = None
-    if is_main_process():
-        logger.info("Loading test data for evaluation...")
-    test_data = load_json_data(subset_dir, split="test")
-    if test_data and is_main_process():
-        logger.info(f"Test: {len(test_data[TOKEN_LEVELS[0]])} samples")
+    if not train_all_subsets:
+        if is_main_process():
+            logger.info("Loading test data for evaluation...")
+        test_data = load_json_data(subset_dir, split="test")
+        if test_data and is_main_process():
+            logger.info(f"Test: {len(test_data[TOKEN_LEVELS[0]])} samples")
 
     # Load tokenizer
     if is_main_process():
