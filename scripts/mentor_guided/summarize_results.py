@@ -441,7 +441,117 @@ def summarize(data_dir: str, show_length: bool = True):
             cascade_vs_mentor = avg_cascade - avg_acc
             print(f"Cascade vs Mentor-Only: {cascade_vs_mentor:+.4f} ({cascade_vs_mentor*100:+.2f}%)")
 
+    # 分类器对比表格
+    print_classifier_comparison(data_dir)
+
     print()
+
+
+def get_classifier_results(data_dir: str, subset: str, model_type: str):
+    """获取指定分类器的结果"""
+    # 首先检查 all 目录
+    all_model_dir = os.path.join(data_dir, "all", f"{model_type}_model")
+    
+    # 对于 MLP，检查 per-subset 结果
+    if model_type == "mlp":
+        for fname in [f"results_{subset}.json", "results_all.json", "results.json"]:
+            fpath = os.path.join(all_model_dir, fname)
+            if os.path.exists(fpath):
+                with open(fpath, 'r') as f:
+                    r = json.load(f)
+                # 检查是否有 per-subset 结果
+                if 'test_results_per_subset' in r and subset in r['test_results_per_subset']:
+                    sub_r = r['test_results_per_subset'][subset]
+                    return {
+                        'cascade_acc': sub_r.get('cascade_acc', 0),
+                        'oracle_acc': sub_r.get('oracle_acc', 0),
+                    }
+    
+    # 对于 PPL，检查 test_results
+    if model_type == "ppl":
+        ppl_path = os.path.join(all_model_dir, "results.json")
+        if os.path.exists(ppl_path):
+            with open(ppl_path, 'r') as f:
+                r = json.load(f)
+            if 'test_results' in r and subset in r['test_results']:
+                sub_r = r['test_results'][subset]
+                return {
+                    'cascade_acc': sub_r.get('cascade_acc', 0),
+                    'oracle_acc': sub_r.get('oracle_acc', 0),
+                }
+    
+    # 检查 subset 目录
+    result_file = os.path.join(data_dir, subset, f"{model_type}_model", "results.json")
+    if os.path.exists(result_file):
+        with open(result_file, 'r') as f:
+            r = json.load(f)
+        return {
+            'cascade_acc': r.get('test_best_cascade_acc', r.get('best_cascade_acc', r.get('cascade_acc', 0))),
+            'oracle_acc': r.get('test_oracle_acc', r.get('oracle_acc', 0)),
+        }
+    
+    return None
+
+
+def print_classifier_comparison(data_dir: str):
+    """打印分类器对比表格"""
+    print("\n" + "=" * 115)
+    print("                              CLASSIFIER COMPARISON")
+    print("=" * 115)
+    print(f"{'Subset':<25} {'MLP':>12} {'PPL':>12} {'Ensemble':>12} {'Oracle':>12} {'Best':>12}")
+    print("-" * 115)
+    
+    totals = {'mlp': [], 'ppl': [], 'ensemble': []}
+    
+    for subset in SUBSETS:
+        mlp_r = get_classifier_results(data_dir, subset, "mlp")
+        ppl_r = get_classifier_results(data_dir, subset, "ppl")
+        ens_r = get_classifier_results(data_dir, subset, "ensemble")
+        
+        mlp_acc = mlp_r['cascade_acc'] if mlp_r else None
+        ppl_acc = ppl_r['cascade_acc'] if ppl_r else None
+        ens_acc = ens_r['cascade_acc'] if ens_r else None
+        
+        # Oracle (优先使用 PPL 的，因为它在原始测试数据上评估)
+        oracle = None
+        if ppl_r and ppl_r.get('oracle_acc'):
+            oracle = ppl_r['oracle_acc']
+        elif mlp_r and mlp_r.get('oracle_acc'):
+            oracle = mlp_r['oracle_acc']
+        elif ens_r and ens_r.get('oracle_acc'):
+            oracle = ens_r['oracle_acc']
+        
+        # 格式化输出
+        mlp_str = f"{mlp_acc:.4f}" if mlp_acc is not None else "-"
+        ppl_str = f"{ppl_acc:.4f}" if ppl_acc is not None else "-"
+        ens_str = f"{ens_acc:.4f}" if ens_acc is not None else "-"
+        oracle_str = f"{oracle:.4f}" if oracle is not None else "-"
+        
+        # 找最佳
+        accs = []
+        if mlp_acc is not None:
+            accs.append(('MLP', mlp_acc))
+            totals['mlp'].append(mlp_acc)
+        if ppl_acc is not None:
+            accs.append(('PPL', ppl_acc))
+            totals['ppl'].append(ppl_acc)
+        if ens_acc is not None:
+            accs.append(('Ens', ens_acc))
+            totals['ensemble'].append(ens_acc)
+        
+        best = max(accs, key=lambda x: x[1])[0] if accs else "-"
+        
+        print(f"{subset:<25} {mlp_str:>12} {ppl_str:>12} {ens_str:>12} {oracle_str:>12} {best:>12}")
+    
+    print("-" * 115)
+    
+    # 计算平均值
+    mlp_avg = f"{np.mean(totals['mlp']):.4f}" if totals['mlp'] else "-"
+    ppl_avg = f"{np.mean(totals['ppl']):.4f}" if totals['ppl'] else "-"
+    ens_avg = f"{np.mean(totals['ensemble']):.4f}" if totals['ensemble'] else "-"
+    
+    print(f"{'AVERAGE':<25} {mlp_avg:>12} {ppl_avg:>12} {ens_avg:>12}")
+    print("=" * 115)
 
 
 def summarize_single(data_dir: str, subset: str, model_dir: str = None, show_length: bool = True):
