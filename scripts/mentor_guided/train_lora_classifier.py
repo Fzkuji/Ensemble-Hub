@@ -583,6 +583,9 @@ def main():
     parser.add_argument("--subset", type=str, default="algebra",
                         choices=SUBSETS + ["all"],
                         help="Which subset to train on (default: algebra)")
+    parser.add_argument("--eval-subset", type=str, default=None,
+                        choices=SUBSETS + ["all"],
+                        help="Which subset(s) to evaluate on (default: same as --subset). 'all' evaluates each subset separately.")
     parser.add_argument("--model-path", type=str,
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
     parser.add_argument("--output-dir", type=str, default=None,
@@ -1009,19 +1012,48 @@ def main():
             tokenizer.save_pretrained(args.output_dir)
             logger.info(f"Best model saved to {args.output_dir}")
 
-        # Also evaluate on test to get consistent Oracle (same as --no-val mode)
-        test_cascade_acc = None
-        test_detailed = None
-        if test_data is not None:
+        # Determine eval subsets
+        eval_subset = args.eval_subset if args.eval_subset else args.subset
+        eval_all_subsets = (eval_subset == "all")
+        eval_subsets = SUBSETS if eval_all_subsets else [eval_subset]
+        
+        # Evaluate on test for each subset
+        test_results_per_subset = {}
+        if is_main_process():
+            logger.info(f"\n=== Final Test Evaluation on {len(eval_subsets)} subset(s) ===")
+        
+        for es in eval_subsets:
+            eval_subset_dir = os.path.join(args.data_dir, es)
             if is_main_process():
-                logger.info("\nEvaluating on test with thresholds from val...")
+                logger.info(f"\nEvaluating on: {es}")
+            
+            # Load test data for this subset
+            subset_test_data = load_json_data(eval_subset_dir, split="test")
+            if not subset_test_data or not subset_test_data.get(TOKEN_LEVELS[0]):
+                if is_main_process():
+                    logger.warning(f"  No test data found for {es}, skipping...")
+                continue
+            
+            n_test = len(subset_test_data[TOKEN_LEVELS[0]])
+            if is_main_process():
+                logger.info(f"  Test samples: {n_test}")
+            
             test_cascade_acc, _, test_detailed = eval_cascade_with_thresholds(
-                model, test_data, tokenizer, args.max_length, device, final_thresholds, args.eval_batch_size
+                model, subset_test_data, tokenizer, args.max_length, device, final_thresholds, args.eval_batch_size
             )
+            
+            test_results_per_subset[es] = {
+                'cascade_acc': float(test_cascade_acc),
+                'oracle_acc': test_detailed['oracle'],
+                'per_stage_auc': test_detailed['auc'],
+                'per_stage_baseline_acc': test_detailed['baseline'],
+                'n_test': n_test,
+            }
+            
             if is_main_process():
-                logger.info(f"Test Cascade Acc: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
+                logger.info(f"  Cascade Acc: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
                 auc_str = ", ".join([f"T{t}={test_detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
-                logger.info(f"Test Per-stage AUC: {auc_str}")
+                logger.info(f"  AUC: {auc_str}")
     else:
         # No validation: search thresholds on entire train set (unfiltered)
         if is_main_process():
@@ -1037,19 +1069,48 @@ def main():
             auc_str = ", ".join([f"T{t}={final_detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
             logger.info(f"Per-stage AUC: {auc_str}")
 
-        # Final test evaluation with thresholds from train
-        test_cascade_acc = None
-        test_detailed = None
-        if test_data is not None:
+        # Determine eval subsets
+        eval_subset = args.eval_subset if args.eval_subset else args.subset
+        eval_all_subsets = (eval_subset == "all")
+        eval_subsets = SUBSETS if eval_all_subsets else [eval_subset]
+        
+        # Evaluate on test for each subset
+        test_results_per_subset = {}
+        if is_main_process():
+            logger.info(f"\n=== Final Test Evaluation on {len(eval_subsets)} subset(s) ===")
+        
+        for es in eval_subsets:
+            eval_subset_dir = os.path.join(args.data_dir, es)
             if is_main_process():
-                logger.info("\nFinal: Evaluating on test with thresholds from train...")
+                logger.info(f"\nEvaluating on: {es}")
+            
+            # Load test data for this subset
+            subset_test_data = load_json_data(eval_subset_dir, split="test")
+            if not subset_test_data or not subset_test_data.get(TOKEN_LEVELS[0]):
+                if is_main_process():
+                    logger.warning(f"  No test data found for {es}, skipping...")
+                continue
+            
+            n_test = len(subset_test_data[TOKEN_LEVELS[0]])
+            if is_main_process():
+                logger.info(f"  Test samples: {n_test}")
+            
             test_cascade_acc, _, test_detailed = eval_cascade_with_thresholds(
-                model, test_data, tokenizer, args.max_length, device, final_thresholds, args.eval_batch_size
+                model, subset_test_data, tokenizer, args.max_length, device, final_thresholds, args.eval_batch_size
             )
+            
+            test_results_per_subset[es] = {
+                'cascade_acc': float(test_cascade_acc),
+                'oracle_acc': test_detailed['oracle'],
+                'per_stage_auc': test_detailed['auc'],
+                'per_stage_baseline_acc': test_detailed['baseline'],
+                'n_test': n_test,
+            }
+            
             if is_main_process():
-                logger.info(f"Test Cascade Acc: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
+                logger.info(f"  Cascade Acc: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
                 auc_str = ", ".join([f"T{t}={test_detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
-                logger.info(f"Test Per-stage AUC: {auc_str}")
+                logger.info(f"  AUC: {auc_str}")
 
     # Save last epoch model
     if is_main_process():
@@ -1081,6 +1142,7 @@ def main():
         # Save results
         results = {
             'subset': args.subset,
+            'eval_subset': args.eval_subset if args.eval_subset else args.subset,
             'n_train': n_train,
             'n_val': n_val,
             'no_val': not args.use_val,
@@ -1094,12 +1156,24 @@ def main():
             'args': vars(args),
         }
 
-        # Always add test results (ensures consistent Oracle across all classifiers)
-        if test_cascade_acc is not None:
-            results['test_cascade_acc'] = float(test_cascade_acc)
-            results['test_oracle_acc'] = test_detailed['oracle']
-            results['test_per_stage_auc'] = test_detailed['auc']
-            results['test_per_stage_baseline_acc'] = test_detailed['baseline']
+        # Add per-subset test results
+        if test_results_per_subset:
+            results['test_results_per_subset'] = test_results_per_subset
+            # For backward compatibility, also add overall test results
+            if len(test_results_per_subset) == 1:
+                single_result = list(test_results_per_subset.values())[0]
+                results['test_cascade_acc'] = single_result['cascade_acc']
+                results['test_oracle_acc'] = single_result['oracle_acc']
+                results['test_per_stage_auc'] = single_result['per_stage_auc']
+                results['test_per_stage_baseline_acc'] = single_result['per_stage_baseline_acc']
+            else:
+                # Multiple subsets: compute averages
+                results['test_cascade_acc'] = sum(r['cascade_acc'] for r in test_results_per_subset.values()) / len(test_results_per_subset)
+                results['test_oracle_acc'] = sum(r['oracle_acc'] for r in test_results_per_subset.values()) / len(test_results_per_subset)
+            
+            logger.info("\nTest Results by Subset:")
+            for subset_name, subset_result in test_results_per_subset.items():
+                logger.info(f"  {subset_name}: {subset_result['cascade_acc']:.4f} (Oracle: {subset_result['oracle_acc']:.4f})")
 
         with open(os.path.join(args.output_dir, "results.json"), 'w') as f:
             json.dump(results, f, indent=2)

@@ -432,7 +432,15 @@ if [ "$RUN_LORA" = true ]; then
     echo "========== Training LoRA Classifiers =========="
 
     if [ "$TRAIN_SUBSET" = "all" ]; then
-        echo ">>> LoRA training not supported for --train-subset all"
+        # Unified training on all subsets
+        if check_model_exists "all" "lora"; then
+            echo ">>> LoRA: train=all, eval=$EVAL_SUBSET [SKIP - already trained]"
+        else
+            echo ">>> LoRA: train=all, eval=$EVAL_SUBSET"
+            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
+                --ddp --subset all --eval-subset "$EVAL_SUBSET" --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
+                --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+        fi
     else
         # Determine subsets for LoRA training
         if [ -n "$TRAIN_SUBSET" ]; then
