@@ -383,7 +383,12 @@ fi
 
 echo ""
 echo "========== Step 6: Summarize Results =========="
-python summarize_results.py --data-dir $DATA_DIR
+# 根据训练方式选择 model-source
+if [[ "$TRAIN_SUBSET" == "all" ]]; then
+    python summarize_results.py --data-dir $DATA_DIR --model-source all
+else
+    python summarize_results.py --data-dir $DATA_DIR --model-source individual
+fi
 
 echo ""
 echo "========== Done! =========="

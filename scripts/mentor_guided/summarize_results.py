@@ -120,16 +120,23 @@ def compute_length_stats(data_dir: str, subset: str, split: str = "test"):
     return length_stats
 
 
-def summarize(data_dir: str, show_length: bool = True):
-    """汇总所有子集的结果"""
+def summarize(data_dir: str, show_length: bool = True, model_source: str = "individual"):
+    """汇总所有子集的结果
+    
+    Args:
+        data_dir: 数据目录
+        show_length: 是否显示长度统计
+        model_source: 模型来源 - "individual" (各子集单独训练), "all" (合并训练)
+    """
     # 计算实际行宽
     if show_length:
         line_width = W_SUBSET + W_N + W_TOKEN_GROUP * 4 + W_ORACLE + W_CASCADE + W_GAP + 8
     else:
         line_width = 110
 
+    source_label = "[individual]" if model_source == "individual" else "[all]"
     print("=" * line_width)
-    print(f"Results Summary: {data_dir}")
+    print(f"Results Summary: {data_dir} {source_label}")
     print("=" * line_width)
 
     if show_length:
@@ -166,40 +173,38 @@ def summarize(data_dir: str, show_length: bool = True):
     # Collect gap data for later analysis
     collected_gaps = []  # [(subset, gap, n, oracle, cascade)]
 
-    # Check for unified "all" model results (只作为 fallback)
+    # 根据 model_source 决定加载路径
     all_mlp_results = None
     all_mlp_dir = os.path.join(data_dir, "all", "mlp_model")
 
     for subset in SUBSETS:
         r = None
-        model_source = None  # 记录结果来源
 
-        # 新的优先级：优先使用各子集单独训练的结果
-        # Priority: 1) subset/mlp_model, 2) subset/lora_model, 3) all/mlp_model (fallback)
-        
-        # 1. 首先检查各子集单独训练的 MLP 结果
-        mlp_file = os.path.join(data_dir, subset, "mlp_model", "results.json")
-        if os.path.exists(mlp_file):
-            with open(mlp_file, 'r') as f:
-                mlp_r = json.load(f)
-            r = {
-                'n_test': mlp_r.get('n_val', 0),
-                'baseline': mlp_r.get('test_per_stage_baseline_acc', mlp_r.get('per_stage_baseline_acc', {})),
-                'oracle': mlp_r.get('test_oracle_acc', mlp_r.get('oracle_acc', 0)),
-                'cascade_accuracy': mlp_r.get('test_best_cascade_acc', mlp_r.get('best_cascade_acc', 0)),
-            }
-            model_source = "individual"
+        if model_source == "individual":
+            # 优先使用各子集单独训练的结果
+            # Priority: 1) subset/mlp_model, 2) subset/lora_model
+            
+            # 1. 首先检查各子集单独训练的 MLP 结果
+            mlp_file = os.path.join(data_dir, subset, "mlp_model", "results.json")
+            if os.path.exists(mlp_file):
+                with open(mlp_file, 'r') as f:
+                    mlp_r = json.load(f)
+                r = {
+                    'n_test': mlp_r.get('n_val', 0),
+                    'baseline': mlp_r.get('test_per_stage_baseline_acc', mlp_r.get('per_stage_baseline_acc', {})),
+                    'oracle': mlp_r.get('test_oracle_acc', mlp_r.get('oracle_acc', 0)),
+                    'cascade_accuracy': mlp_r.get('test_best_cascade_acc', mlp_r.get('best_cascade_acc', 0)),
+                }
 
-        # 2. 然后检查各子集的 LoRA 结果
-        if r is None:
-            result_file = os.path.join(data_dir, subset, "lora_model", "cascade_eval.json")
-            if os.path.exists(result_file):
-                with open(result_file, 'r') as f:
-                    r = json.load(f)
-                model_source = "individual_lora"
+            # 2. 然后检查各子集的 LoRA 结果
+            if r is None:
+                result_file = os.path.join(data_dir, subset, "lora_model", "cascade_eval.json")
+                if os.path.exists(result_file):
+                    with open(result_file, 'r') as f:
+                        r = json.load(f)
 
-        # 3. 最后 fallback 到 all/ 目录的结果
-        if r is None:
+        elif model_source == "all":
+            # 从 all/ 目录加载合并训练的结果
             # 延迟加载 all_mlp_results
             if all_mlp_results is None:
                 for fname in ["results_all.json", "results.json"]:
@@ -219,7 +224,6 @@ def summarize(data_dir: str, show_length: bool = True):
                         'oracle': subset_results.get('oracle_acc', 0),
                         'cascade_accuracy': subset_results.get('cascade_acc', 0),
                     }
-                    model_source = "all"
             
             # 检查 all/mlp_model 的 per-subset 结果文件
             if r is None:
@@ -242,7 +246,6 @@ def summarize(data_dir: str, show_length: bool = True):
                             'oracle': subset_mlp.get('test_oracle_acc', subset_mlp.get('oracle_acc', 0)),
                             'cascade_accuracy': subset_mlp.get('test_best_cascade_acc', subset_mlp.get('best_cascade_acc', 0)),
                         }
-                    model_source = "all"
 
         if r is None:
             print(f"{subset:<{W_SUBSET}} (not evaluated)")
@@ -449,79 +452,86 @@ def summarize(data_dir: str, show_length: bool = True):
             print(f"Cascade vs Mentor-Only: {cascade_vs_mentor:+.4f} ({cascade_vs_mentor*100:+.2f}%)")
 
     # 分类器对比表格
-    print_classifier_comparison(data_dir)
+    print_classifier_comparison(data_dir, model_source)
 
     print()
 
 
-def get_classifier_results(data_dir: str, subset: str, model_type: str):
+def get_classifier_results(data_dir: str, subset: str, model_type: str, model_source: str = "individual"):
     """获取指定分类器的结果
     
-    优先级：1) subset 目录 (各子集单独训练), 2) all 目录 (合并训练)
+    Args:
+        data_dir: 数据目录
+        subset: 子集名称
+        model_type: 模型类型 (mlp, ppl, lora, ensemble)
+        model_source: 模型来源 - "individual" (各子集单独训练), "all" (合并训练)
     """
-    # 1. 首先检查 subset 目录（优先使用各子集单独训练的结果）
-    result_file = os.path.join(data_dir, subset, f"{model_type}_model", "results.json")
-    if os.path.exists(result_file):
-        with open(result_file, 'r') as f:
-            r = json.load(f)
-        return {
-            'cascade_acc': r.get('test_best_cascade_acc', r.get('best_cascade_acc', r.get('cascade_acc', 0))),
-            'oracle_acc': r.get('test_oracle_acc', r.get('oracle_acc', 0)),
-            'source': 'individual',
-        }
-    
-    # 对于 LoRA，还检查 cascade_eval.json
-    if model_type == "lora":
-        lora_eval_file = os.path.join(data_dir, subset, "lora_model", "cascade_eval.json")
-        if os.path.exists(lora_eval_file):
-            with open(lora_eval_file, 'r') as f:
+    if model_source == "individual":
+        # 从 subset 目录加载各子集单独训练的结果
+        result_file = os.path.join(data_dir, subset, f"{model_type}_model", "results.json")
+        if os.path.exists(result_file):
+            with open(result_file, 'r') as f:
                 r = json.load(f)
             return {
-                'cascade_acc': r.get('cascade_accuracy', 0),
-                'oracle_acc': r.get('oracle', 0),
+                'cascade_acc': r.get('test_best_cascade_acc', r.get('best_cascade_acc', r.get('cascade_acc', 0))),
+                'oracle_acc': r.get('test_oracle_acc', r.get('oracle_acc', 0)),
                 'source': 'individual',
             }
-    
-    # 2. Fallback 到 all 目录（合并训练的结果）
-    all_model_dir = os.path.join(data_dir, "all", f"{model_type}_model")
-    
-    # 对于 MLP，检查 per-subset 结果
-    if model_type == "mlp":
-        for fname in [f"results_{subset}.json", "results_all.json", "results.json"]:
-            fpath = os.path.join(all_model_dir, fname)
-            if os.path.exists(fpath):
-                with open(fpath, 'r') as f:
+        
+        # 对于 LoRA，还检查 cascade_eval.json
+        if model_type == "lora":
+            lora_eval_file = os.path.join(data_dir, subset, "lora_model", "cascade_eval.json")
+            if os.path.exists(lora_eval_file):
+                with open(lora_eval_file, 'r') as f:
                     r = json.load(f)
-                # 检查是否有 per-subset 结果
-                if 'test_results_per_subset' in r and subset in r['test_results_per_subset']:
-                    sub_r = r['test_results_per_subset'][subset]
+                return {
+                    'cascade_acc': r.get('cascade_accuracy', 0),
+                    'oracle_acc': r.get('oracle', 0),
+                    'source': 'individual',
+                }
+    
+    elif model_source == "all":
+        # 从 all 目录加载合并训练的结果
+        all_model_dir = os.path.join(data_dir, "all", f"{model_type}_model")
+        
+        # 对于 MLP，检查 per-subset 结果
+        if model_type == "mlp":
+            for fname in [f"results_{subset}.json", "results_all.json", "results.json"]:
+                fpath = os.path.join(all_model_dir, fname)
+                if os.path.exists(fpath):
+                    with open(fpath, 'r') as f:
+                        r = json.load(f)
+                    # 检查是否有 per-subset 结果
+                    if 'test_results_per_subset' in r and subset in r['test_results_per_subset']:
+                        sub_r = r['test_results_per_subset'][subset]
+                        return {
+                            'cascade_acc': sub_r.get('cascade_acc', 0),
+                            'oracle_acc': sub_r.get('oracle_acc', 0),
+                            'source': 'all',
+                        }
+        
+        # 对于 PPL，检查 test_results
+        if model_type == "ppl":
+            ppl_path = os.path.join(all_model_dir, "results.json")
+            if os.path.exists(ppl_path):
+                with open(ppl_path, 'r') as f:
+                    r = json.load(f)
+                if 'test_results' in r and subset in r['test_results']:
+                    sub_r = r['test_results'][subset]
                     return {
                         'cascade_acc': sub_r.get('cascade_acc', 0),
                         'oracle_acc': sub_r.get('oracle_acc', 0),
                         'source': 'all',
                     }
     
-    # 对于 PPL，检查 test_results
-    if model_type == "ppl":
-        ppl_path = os.path.join(all_model_dir, "results.json")
-        if os.path.exists(ppl_path):
-            with open(ppl_path, 'r') as f:
-                r = json.load(f)
-            if 'test_results' in r and subset in r['test_results']:
-                sub_r = r['test_results'][subset]
-                return {
-                    'cascade_acc': sub_r.get('cascade_acc', 0),
-                    'oracle_acc': sub_r.get('oracle_acc', 0),
-                    'source': 'all',
-                }
-    
     return None
 
 
-def print_classifier_comparison(data_dir: str):
+def print_classifier_comparison(data_dir: str, model_source: str = "individual"):
     """打印分类器对比表格"""
+    source_label = "[individual]" if model_source == "individual" else "[all]"
     print("\n" + "=" * 130)
-    print("                                   CLASSIFIER COMPARISON")
+    print(f"                                   CLASSIFIER COMPARISON {source_label}")
     print("=" * 130)
     print(f"{'Subset':<25} {'LoRA':>12} {'MLP':>12} {'PPL':>12} {'Ensemble':>12} {'Oracle':>12} {'Best':>12}")
     print("-" * 130)
@@ -529,10 +539,10 @@ def print_classifier_comparison(data_dir: str):
     totals = {'lora': [], 'mlp': [], 'ppl': [], 'ensemble': []}
     
     for subset in SUBSETS:
-        lora_r = get_classifier_results(data_dir, subset, "lora")
-        mlp_r = get_classifier_results(data_dir, subset, "mlp")
-        ppl_r = get_classifier_results(data_dir, subset, "ppl")
-        ens_r = get_classifier_results(data_dir, subset, "ensemble")
+        lora_r = get_classifier_results(data_dir, subset, "lora", model_source)
+        mlp_r = get_classifier_results(data_dir, subset, "mlp", model_source)
+        ppl_r = get_classifier_results(data_dir, subset, "ppl", model_source)
+        ens_r = get_classifier_results(data_dir, subset, "ensemble", model_source)
         
         lora_acc = lora_r['cascade_acc'] if lora_r else None
         mlp_acc = mlp_r['cascade_acc'] if mlp_r else None
@@ -695,13 +705,16 @@ def main():
                         help="Model directory for single subset mode")
     parser.add_argument("--no-length", action="store_true",
                         help="Don't show generation length statistics")
+    parser.add_argument("--model-source", type=str, default="individual",
+                        choices=["individual", "all"],
+                        help="Model source: 'individual' (per-subset trained) or 'all' (unified trained)")
 
     args = parser.parse_args()
 
     if args.subset:
         summarize_single(args.data_dir, args.subset, args.model_dir, show_length=not args.no_length)
     else:
-        summarize(args.data_dir, show_length=not args.no_length)
+        summarize(args.data_dir, show_length=not args.no_length, model_source=args.model_source)
 
 
 if __name__ == "__main__":
