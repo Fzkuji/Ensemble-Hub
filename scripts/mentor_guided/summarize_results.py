@@ -122,41 +122,31 @@ def compute_length_stats(data_dir: str, subset: str, split: str = "test"):
 
 def summarize(data_dir: str, show_length: bool = True):
     """汇总所有子集的结果"""
-    # Mentor 列宽度 (acc + len)
-    W_MENTOR = W_ACC + W_LEN
-    # Oracle/Cascade 列宽度 (acc + m_len + i_len)
-    W_ORACLE_FULL = W_ACC + W_LEN + W_LEN
-    W_CASCADE_FULL = W_ACC + W_LEN + W_LEN
-    
     # 计算实际行宽
     if show_length:
-        line_width = W_SUBSET + W_N + W_TOKEN_GROUP * 4 + W_MENTOR + W_ORACLE_FULL + W_CASCADE_FULL + W_GAP + 12
+        line_width = W_SUBSET + W_N + W_TOKEN_GROUP * 4 + W_ORACLE + W_CASCADE + W_GAP + 8
     else:
-        line_width = 120
+        line_width = 110
 
     print("=" * line_width)
     print(f"Results Summary: {data_dir}")
     print("=" * line_width)
 
     if show_length:
-        # 表头第一行：Subset, N, T0, T100, T500, T1000, Mentor, Oracle, Cascade, Gap
+        # 表头第一行：Subset, N, T0, T100, T500, T1000, Oracle, Cascade, Gap
         print(f"{'Subset':<{W_SUBSET}} {'N':<{W_N}} "
               f"{'T0':<{W_TOKEN_GROUP}} {'T100':<{W_TOKEN_GROUP}} "
               f"{'T500':<{W_TOKEN_GROUP}} {'T1000':<{W_TOKEN_GROUP}} "
-              f"{'Mentor':<{W_MENTOR}} "
-              f"{'Oracle':<{W_ORACLE_FULL}} {'Cascade':<{W_CASCADE_FULL}} {'Gap':<{W_GAP}}")
+              f"{'Oracle':<{W_ORACLE}} {'Cascade':<{W_CASCADE}} {'Gap':<{W_GAP}}")
         # 表头第二行：acc, m_len, i_len
         print(f"{'':<{W_SUBSET}} {'':<{W_N}} "
               f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}} "
               f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}} "
               f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}} "
-              f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}} "
-              f"{'acc':<{W_ACC}}{'len':<{W_LEN}} "
-              f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}} "
               f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}}")
     else:
         print(f"{'Subset':<{W_SUBSET}} {'N':<{W_N}} {'T0':<{W_ACC}} {'T100':<{W_ACC}} "
-              f"{'T500':<{W_ACC}} {'T1000':<{W_ACC}} {'Mentor':<{W_ACC}} {'Oracle':<{W_ORACLE}} "
+              f"{'T500':<{W_ACC}} {'T1000':<{W_ACC}} {'Oracle':<{W_ORACLE}} "
               f"{'Cascade':<{W_CASCADE}} {'Gap':<{W_GAP}}")
 
     print("-" * line_width)
@@ -169,90 +159,90 @@ def summarize(data_dir: str, show_length: bool = True):
     total_t100 = 0
     total_t500 = 0
     total_t1000 = 0
-    total_mentor_acc = 0
-    total_mentor_only_len = 0
     total_mentor_len = {0: 0, 100: 0, 500: 0, 1000: 0}
     total_intern_len = {0: 0, 100: 0, 500: 0, 1000: 0}
     total_len_count = {0: 0, 100: 0, 500: 0, 1000: 0}
-    # Oracle/Cascade 长度累计
-    total_oracle_m_len = 0
-    total_oracle_i_len = 0
-    total_cascade_m_len = 0
-    total_cascade_i_len = 0
 
     # Collect gap data for later analysis
     collected_gaps = []  # [(subset, gap, n, oracle, cascade)]
 
-    # Check for unified "all" model results with per-subset test results
-    # Try: results_all.json (new), results.json (legacy), or per-subset results_{subset}.json
+    # Check for unified "all" model results (只作为 fallback)
     all_mlp_results = None
     all_mlp_dir = os.path.join(data_dir, "all", "mlp_model")
 
-    # Try results_all.json first (new format), then results.json (legacy)
-    for fname in ["results_all.json", "results.json"]:
-        fpath = os.path.join(all_mlp_dir, fname)
-        if os.path.exists(fpath):
-            with open(fpath, 'r') as f:
-                all_mlp_results = json.load(f)
-            break
-
     for subset in SUBSETS:
         r = None
+        model_source = None  # 记录结果来源
 
-        # Priority: 1) per-subset results file, 2) all/mlp_model with test_results_per_subset, 3) subset/mlp_model, 4) subset/lora_model
-        # Check for per-subset result file (e.g., results_algebra.json)
-        subset_result_file = os.path.join(all_mlp_dir, f"results_{subset}.json")
-        if os.path.exists(subset_result_file):
-            with open(subset_result_file, 'r') as f:
-                subset_mlp = json.load(f)
-            # Get from test_results_per_subset if available
-            if 'test_results_per_subset' in subset_mlp and subset in subset_mlp['test_results_per_subset']:
-                subset_results = subset_mlp['test_results_per_subset'][subset]
-                r = {
-                    'n_test': subset_results.get('n_test', subset_results.get('n_samples', 0)),
-                    'baseline': subset_results.get('per_stage_baseline_acc', {}),
-                    'oracle': subset_results.get('oracle_acc', 0),
-                    'cascade_accuracy': subset_results.get('cascade_acc', 0),
-                }
-            else:
-                # Fallback to top-level results
-                r = {
-                    'n_test': subset_mlp.get('n_val', 0),
-                    'baseline': subset_mlp.get('test_per_stage_baseline_acc', subset_mlp.get('per_stage_baseline_acc', {})),
-                    'oracle': subset_mlp.get('test_oracle_acc', subset_mlp.get('oracle_acc', 0)),
-                    'cascade_accuracy': subset_mlp.get('test_best_cascade_acc', subset_mlp.get('best_cascade_acc', 0)),
-                }
+        # 新的优先级：优先使用各子集单独训练的结果
+        # Priority: 1) subset/mlp_model, 2) subset/lora_model, 3) all/mlp_model (fallback)
+        
+        # 1. 首先检查各子集单独训练的 MLP 结果
+        mlp_file = os.path.join(data_dir, subset, "mlp_model", "results.json")
+        if os.path.exists(mlp_file):
+            with open(mlp_file, 'r') as f:
+                mlp_r = json.load(f)
+            r = {
+                'n_test': mlp_r.get('n_val', 0),
+                'baseline': mlp_r.get('test_per_stage_baseline_acc', mlp_r.get('per_stage_baseline_acc', {})),
+                'oracle': mlp_r.get('test_oracle_acc', mlp_r.get('oracle_acc', 0)),
+                'cascade_accuracy': mlp_r.get('test_best_cascade_acc', mlp_r.get('best_cascade_acc', 0)),
+            }
+            model_source = "individual"
 
-        if r is None and all_mlp_results and 'test_results_per_subset' in all_mlp_results:
-            subset_results = all_mlp_results['test_results_per_subset'].get(subset)
-            if subset_results:
-                # Convert MLP test_results_per_subset format to expected format
-                r = {
-                    'n_test': subset_results.get('n_test', subset_results.get('n_samples', 0)),
-                    'baseline': subset_results.get('per_stage_baseline_acc', {}),
-                    'oracle': subset_results.get('oracle_acc', 0),
-                    'cascade_accuracy': subset_results.get('cascade_acc', 0),
-                }
-
+        # 2. 然后检查各子集的 LoRA 结果
         if r is None:
-            # Try subset-specific MLP results
-            mlp_file = os.path.join(data_dir, subset, "mlp_model", "results.json")
-            if os.path.exists(mlp_file):
-                with open(mlp_file, 'r') as f:
-                    mlp_r = json.load(f)
-                r = {
-                    'n_test': mlp_r.get('n_val', 0),
-                    'baseline': mlp_r.get('test_per_stage_baseline_acc', mlp_r.get('per_stage_baseline_acc', {})),
-                    'oracle': mlp_r.get('test_oracle_acc', mlp_r.get('oracle_acc', 0)),
-                    'cascade_accuracy': mlp_r.get('test_best_cascade_acc', mlp_r.get('best_cascade_acc', 0)),
-                }
-
-        if r is None:
-            # Fall back to LoRA cascade_eval.json
             result_file = os.path.join(data_dir, subset, "lora_model", "cascade_eval.json")
             if os.path.exists(result_file):
                 with open(result_file, 'r') as f:
                     r = json.load(f)
+                model_source = "individual_lora"
+
+        # 3. 最后 fallback 到 all/ 目录的结果
+        if r is None:
+            # 延迟加载 all_mlp_results
+            if all_mlp_results is None:
+                for fname in ["results_all.json", "results.json"]:
+                    fpath = os.path.join(all_mlp_dir, fname)
+                    if os.path.exists(fpath):
+                        with open(fpath, 'r') as f:
+                            all_mlp_results = json.load(f)
+                        break
+            
+            # 检查 all/mlp_model 的 per-subset 结果
+            if all_mlp_results and 'test_results_per_subset' in all_mlp_results:
+                subset_results = all_mlp_results['test_results_per_subset'].get(subset)
+                if subset_results:
+                    r = {
+                        'n_test': subset_results.get('n_test', subset_results.get('n_samples', 0)),
+                        'baseline': subset_results.get('per_stage_baseline_acc', {}),
+                        'oracle': subset_results.get('oracle_acc', 0),
+                        'cascade_accuracy': subset_results.get('cascade_acc', 0),
+                    }
+                    model_source = "all"
+            
+            # 检查 all/mlp_model 的 per-subset 结果文件
+            if r is None:
+                subset_result_file = os.path.join(all_mlp_dir, f"results_{subset}.json")
+                if os.path.exists(subset_result_file):
+                    with open(subset_result_file, 'r') as f:
+                        subset_mlp = json.load(f)
+                    if 'test_results_per_subset' in subset_mlp and subset in subset_mlp['test_results_per_subset']:
+                        subset_results = subset_mlp['test_results_per_subset'][subset]
+                        r = {
+                            'n_test': subset_results.get('n_test', subset_results.get('n_samples', 0)),
+                            'baseline': subset_results.get('per_stage_baseline_acc', {}),
+                            'oracle': subset_results.get('oracle_acc', 0),
+                            'cascade_accuracy': subset_results.get('cascade_acc', 0),
+                        }
+                    else:
+                        r = {
+                            'n_test': subset_mlp.get('n_val', 0),
+                            'baseline': subset_mlp.get('test_per_stage_baseline_acc', subset_mlp.get('per_stage_baseline_acc', {})),
+                            'oracle': subset_mlp.get('test_oracle_acc', subset_mlp.get('oracle_acc', 0)),
+                            'cascade_accuracy': subset_mlp.get('test_best_cascade_acc', subset_mlp.get('best_cascade_acc', 0)),
+                        }
+                    model_source = "all"
 
         if r is None:
             print(f"{subset:<{W_SUBSET}} (not evaluated)")
@@ -272,17 +262,6 @@ def summarize(data_dir: str, show_length: bool = True):
         best_baseline = max(b.values())
         gap = cascade - best_baseline
 
-        # 获取 Mentor-only 结果
-        mentor_stats = compute_mentor_only_stats(data_dir, subset)
-        mentor_acc = mentor_stats['accuracy'] if mentor_stats else 0
-        mentor_len = mentor_stats['mentor_length_mean'] if mentor_stats else 0
-
-        # 获取 Oracle/Cascade 长度 (从原始结果中获取)
-        oracle_m_len = r.get('oracle_length', {}).get('mentor_mean', 0) if isinstance(r, dict) else 0
-        oracle_i_len = r.get('oracle_length', {}).get('intern_mean', 0) if isinstance(r, dict) else 0
-        cascade_m_len = r.get('cascade_length', {}).get('mentor_mean', 0) if isinstance(r, dict) else 0
-        cascade_i_len = r.get('cascade_length', {}).get('intern_mean', 0) if isinstance(r, dict) else 0
-
         if show_length:
             # 计算长度统计
             length_stats = compute_length_stats(data_dir, subset)
@@ -301,26 +280,10 @@ def summarize(data_dir: str, show_length: bool = True):
             l500 = length_stats.get(500)
             l1000 = length_stats.get(1000)
 
-            # Mentor 列格式化
-            mentor_acc_str = f"{mentor_acc:<{W_ACC}.4f}" if mentor_acc else f"{'-':<{W_ACC}}"
-            mentor_len_str = f"{mentor_len:<{W_LEN}.1f}" if mentor_len else f"{'-':<{W_LEN}}"
-
-            # Oracle 列格式化
-            oracle_acc_str = f"{oracle:<{W_ACC}.4f}"
-            oracle_m_str = f"{oracle_m_len:<{W_LEN}.1f}" if oracle_m_len else f"{'-':<{W_LEN}}"
-            oracle_i_str = f"{oracle_i_len:<{W_LEN}.1f}" if oracle_i_len else f"{'-':<{W_LEN}}"
-
-            # Cascade 列格式化
-            cascade_acc_str = f"{cascade:<{W_ACC}.4f}"
-            cascade_m_str = f"{cascade_m_len:<{W_LEN}.1f}" if cascade_m_len else f"{'-':<{W_LEN}}"
-            cascade_i_str = f"{cascade_i_len:<{W_LEN}.1f}" if cascade_i_len else f"{'-':<{W_LEN}}"
-
             print(f"{subset:<{W_SUBSET}} {n:<{W_N}} "
                   f"{fmt_token_group(t0, l0)} {fmt_token_group(t100, l100)} "
                   f"{fmt_token_group(t500, l500)} {fmt_token_group(t1000, l1000)} "
-                  f"{mentor_acc_str}{mentor_len_str} "
-                  f"{oracle_acc_str}{oracle_m_str}{oracle_i_str} "
-                  f"{cascade_acc_str}{cascade_m_str}{cascade_i_str} {gap:+.4f}")
+                  f"{oracle:<{W_ORACLE}.4f} {cascade:<{W_CASCADE}.4f} {gap:+.4f}")
 
             # 累计长度统计
             for tokens, l_stat in [(0, l0), (100, l100), (500, l500), (1000, l1000)]:
@@ -330,26 +293,10 @@ def summarize(data_dir: str, show_length: bool = True):
                     if l_stat.get('intern', {}).get('mean'):
                         total_intern_len[tokens] += l_stat['intern']['mean'] * n
                     total_len_count[tokens] += n
-            
-            # 累计 Oracle/Cascade 长度
-            if oracle_m_len:
-                total_oracle_m_len += oracle_m_len * n
-            if oracle_i_len:
-                total_oracle_i_len += oracle_i_len * n
-            if cascade_m_len:
-                total_cascade_m_len += cascade_m_len * n
-            if cascade_i_len:
-                total_cascade_i_len += cascade_i_len * n
         else:
-            mentor_acc_str = f"{mentor_acc:<{W_ACC}.4f}" if mentor_acc else "-"
             print(f"{subset:<{W_SUBSET}} {n:<{W_N}} {t0:<{W_ACC}.4f} {t100:<{W_ACC}.4f} "
-                  f"{t500:<{W_ACC}.4f} {t1000:<{W_ACC}.4f} {mentor_acc_str:<{W_ACC}} {oracle:<{W_ORACLE}.4f} "
+                  f"{t500:<{W_ACC}.4f} {t1000:<{W_ACC}.4f} {oracle:<{W_ORACLE}.4f} "
                   f"{cascade:<{W_CASCADE}.4f} {gap:+.4f}")
-        
-        # 累计 Mentor 统计
-        if mentor_stats:
-            total_mentor_acc += mentor_acc * n
-            total_mentor_only_len += mentor_len * n
 
         total_n += n
         total_oracle += oracle * n
@@ -373,10 +320,6 @@ def summarize(data_dir: str, show_length: bool = True):
         avg_cascade = total_cascade / total_n
         avg_gap = (total_cascade - total_best_baseline) / total_n
 
-        # Mentor 平均值
-        avg_mentor_acc = total_mentor_acc / total_n if total_n > 0 else 0
-        avg_mentor_len = total_mentor_only_len / total_n if total_n > 0 else 0
-
         if show_length:
             def fmt_total_token_group(acc, tokens):
                 """格式化 TOTAL 行的 acc + m_len + i_len"""
@@ -390,34 +333,14 @@ def summarize(data_dir: str, show_length: bool = True):
                 i_str = f"{i_len:<{W_LEN}.1f}" if i_len else f"{'-':<{W_LEN}}"
                 return f"{acc:<{W_ACC}.4f}{m_str}{i_str}"
 
-            mentor_acc_str = f"{avg_mentor_acc:<{W_ACC}.4f}" if avg_mentor_acc else f"{'-':<{W_ACC}}"
-            mentor_len_str = f"{avg_mentor_len:<{W_LEN}.1f}" if avg_mentor_len else f"{'-':<{W_LEN}}"
-
-            # Oracle/Cascade 平均长度
-            avg_oracle_m = total_oracle_m_len / total_n if total_n > 0 else 0
-            avg_oracle_i = total_oracle_i_len / total_n if total_n > 0 else 0
-            avg_cascade_m = total_cascade_m_len / total_n if total_n > 0 else 0
-            avg_cascade_i = total_cascade_i_len / total_n if total_n > 0 else 0
-
-            oracle_acc_str = f"{avg_oracle:<{W_ACC}.4f}"
-            oracle_m_str = f"{avg_oracle_m:<{W_LEN}.1f}" if avg_oracle_m else f"{'-':<{W_LEN}}"
-            oracle_i_str = f"{avg_oracle_i:<{W_LEN}.1f}" if avg_oracle_i else f"{'-':<{W_LEN}}"
-
-            cascade_acc_str = f"{avg_cascade:<{W_ACC}.4f}"
-            cascade_m_str = f"{avg_cascade_m:<{W_LEN}.1f}" if avg_cascade_m else f"{'-':<{W_LEN}}"
-            cascade_i_str = f"{avg_cascade_i:<{W_LEN}.1f}" if avg_cascade_i else f"{'-':<{W_LEN}}"
-
             print(f"{'TOTAL (weighted)':<{W_SUBSET}} {total_n:<{W_N}} "
                   f"{fmt_total_token_group(avg_t0, 0)} {fmt_total_token_group(avg_t100, 100)} "
                   f"{fmt_total_token_group(avg_t500, 500)} {fmt_total_token_group(avg_t1000, 1000)} "
-                  f"{mentor_acc_str}{mentor_len_str} "
-                  f"{oracle_acc_str}{oracle_m_str}{oracle_i_str} "
-                  f"{cascade_acc_str}{cascade_m_str}{cascade_i_str} {avg_gap:+.4f}")
+                  f"{avg_oracle:<{W_ORACLE}.4f} {avg_cascade:<{W_CASCADE}.4f} {avg_gap:+.4f}")
         else:
-            mentor_acc_str = f"{avg_mentor_acc:<{W_ACC}.4f}" if avg_mentor_acc else "-"
             print(f"{'TOTAL (weighted)':<{W_SUBSET}} {total_n:<{W_N}} {avg_t0:<{W_ACC}.4f} "
                   f"{avg_t100:<{W_ACC}.4f} {avg_t500:<{W_ACC}.4f} {avg_t1000:<{W_ACC}.4f} "
-                  f"{mentor_acc_str:<{W_ACC}} {avg_oracle:<{W_ORACLE}.4f} {avg_cascade:<{W_CASCADE}.4f} {avg_gap:+.4f}")
+                  f"{avg_oracle:<{W_ORACLE}.4f} {avg_cascade:<{W_CASCADE}.4f} {avg_gap:+.4f}")
 
     print("=" * line_width)
 
@@ -532,8 +455,34 @@ def summarize(data_dir: str, show_length: bool = True):
 
 
 def get_classifier_results(data_dir: str, subset: str, model_type: str):
-    """获取指定分类器的结果"""
-    # 首先检查 all 目录
+    """获取指定分类器的结果
+    
+    优先级：1) subset 目录 (各子集单独训练), 2) all 目录 (合并训练)
+    """
+    # 1. 首先检查 subset 目录（优先使用各子集单独训练的结果）
+    result_file = os.path.join(data_dir, subset, f"{model_type}_model", "results.json")
+    if os.path.exists(result_file):
+        with open(result_file, 'r') as f:
+            r = json.load(f)
+        return {
+            'cascade_acc': r.get('test_best_cascade_acc', r.get('best_cascade_acc', r.get('cascade_acc', 0))),
+            'oracle_acc': r.get('test_oracle_acc', r.get('oracle_acc', 0)),
+            'source': 'individual',
+        }
+    
+    # 对于 LoRA，还检查 cascade_eval.json
+    if model_type == "lora":
+        lora_eval_file = os.path.join(data_dir, subset, "lora_model", "cascade_eval.json")
+        if os.path.exists(lora_eval_file):
+            with open(lora_eval_file, 'r') as f:
+                r = json.load(f)
+            return {
+                'cascade_acc': r.get('cascade_accuracy', 0),
+                'oracle_acc': r.get('oracle', 0),
+                'source': 'individual',
+            }
+    
+    # 2. Fallback 到 all 目录（合并训练的结果）
     all_model_dir = os.path.join(data_dir, "all", f"{model_type}_model")
     
     # 对于 MLP，检查 per-subset 结果
@@ -549,6 +498,7 @@ def get_classifier_results(data_dir: str, subset: str, model_type: str):
                     return {
                         'cascade_acc': sub_r.get('cascade_acc', 0),
                         'oracle_acc': sub_r.get('oracle_acc', 0),
+                        'source': 'all',
                     }
     
     # 对于 PPL，检查 test_results
@@ -562,17 +512,8 @@ def get_classifier_results(data_dir: str, subset: str, model_type: str):
                 return {
                     'cascade_acc': sub_r.get('cascade_acc', 0),
                     'oracle_acc': sub_r.get('oracle_acc', 0),
+                    'source': 'all',
                 }
-    
-    # 检查 subset 目录
-    result_file = os.path.join(data_dir, subset, f"{model_type}_model", "results.json")
-    if os.path.exists(result_file):
-        with open(result_file, 'r') as f:
-            r = json.load(f)
-        return {
-            'cascade_acc': r.get('test_best_cascade_acc', r.get('best_cascade_acc', r.get('cascade_acc', 0))),
-            'oracle_acc': r.get('test_oracle_acc', r.get('oracle_acc', 0)),
-        }
     
     return None
 
