@@ -26,4 +26,4 @@ results/
 saves/
 
 # Submodules
-lm-evaluation-harness/
+lm-evaluation-harness/data/acte_experiments/

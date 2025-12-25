@@ -495,19 +495,21 @@ def get_classifier_results(data_dir: str, subset: str, model_type: str):
 
 def print_classifier_comparison(data_dir: str):
     """打印分类器对比表格"""
-    print("\n" + "=" * 115)
-    print("                              CLASSIFIER COMPARISON")
-    print("=" * 115)
-    print(f"{'Subset':<25} {'MLP':>12} {'PPL':>12} {'Ensemble':>12} {'Oracle':>12} {'Best':>12}")
-    print("-" * 115)
+    print("\n" + "=" * 130)
+    print("                                   CLASSIFIER COMPARISON")
+    print("=" * 130)
+    print(f"{'Subset':<25} {'LoRA':>12} {'MLP':>12} {'PPL':>12} {'Ensemble':>12} {'Oracle':>12} {'Best':>12}")
+    print("-" * 130)
     
-    totals = {'mlp': [], 'ppl': [], 'ensemble': []}
+    totals = {'lora': [], 'mlp': [], 'ppl': [], 'ensemble': []}
     
     for subset in SUBSETS:
+        lora_r = get_classifier_results(data_dir, subset, "lora")
         mlp_r = get_classifier_results(data_dir, subset, "mlp")
         ppl_r = get_classifier_results(data_dir, subset, "ppl")
         ens_r = get_classifier_results(data_dir, subset, "ensemble")
         
+        lora_acc = lora_r['cascade_acc'] if lora_r else None
         mlp_acc = mlp_r['cascade_acc'] if mlp_r else None
         ppl_acc = ppl_r['cascade_acc'] if ppl_r else None
         ens_acc = ens_r['cascade_acc'] if ens_r else None
@@ -518,10 +520,13 @@ def print_classifier_comparison(data_dir: str):
             oracle = ppl_r['oracle_acc']
         elif mlp_r and mlp_r.get('oracle_acc'):
             oracle = mlp_r['oracle_acc']
+        elif lora_r and lora_r.get('oracle_acc'):
+            oracle = lora_r['oracle_acc']
         elif ens_r and ens_r.get('oracle_acc'):
             oracle = ens_r['oracle_acc']
         
         # 格式化输出
+        lora_str = f"{lora_acc:.4f}" if lora_acc is not None else "-"
         mlp_str = f"{mlp_acc:.4f}" if mlp_acc is not None else "-"
         ppl_str = f"{ppl_acc:.4f}" if ppl_acc is not None else "-"
         ens_str = f"{ens_acc:.4f}" if ens_acc is not None else "-"
@@ -529,29 +534,33 @@ def print_classifier_comparison(data_dir: str):
         
         # 找最佳
         accs = []
-        if mlp_acc is not None:
+        if lora_acc is not None and lora_acc > 0:
+            accs.append(('LoRA', lora_acc))
+            totals['lora'].append(lora_acc)
+        if mlp_acc is not None and mlp_acc > 0:
             accs.append(('MLP', mlp_acc))
             totals['mlp'].append(mlp_acc)
-        if ppl_acc is not None:
+        if ppl_acc is not None and ppl_acc > 0:
             accs.append(('PPL', ppl_acc))
             totals['ppl'].append(ppl_acc)
-        if ens_acc is not None:
+        if ens_acc is not None and ens_acc > 0:
             accs.append(('Ens', ens_acc))
             totals['ensemble'].append(ens_acc)
         
         best = max(accs, key=lambda x: x[1])[0] if accs else "-"
         
-        print(f"{subset:<25} {mlp_str:>12} {ppl_str:>12} {ens_str:>12} {oracle_str:>12} {best:>12}")
+        print(f"{subset:<25} {lora_str:>12} {mlp_str:>12} {ppl_str:>12} {ens_str:>12} {oracle_str:>12} {best:>12}")
     
-    print("-" * 115)
+    print("-" * 130)
     
     # 计算平均值
+    lora_avg = f"{np.mean(totals['lora']):.4f}" if totals['lora'] else "-"
     mlp_avg = f"{np.mean(totals['mlp']):.4f}" if totals['mlp'] else "-"
     ppl_avg = f"{np.mean(totals['ppl']):.4f}" if totals['ppl'] else "-"
     ens_avg = f"{np.mean(totals['ensemble']):.4f}" if totals['ensemble'] else "-"
     
-    print(f"{'AVERAGE':<25} {mlp_avg:>12} {ppl_avg:>12} {ens_avg:>12}")
-    print("=" * 115)
+    print(f"{'AVERAGE':<25} {lora_avg:>12} {mlp_avg:>12} {ppl_avg:>12} {ens_avg:>12}")
+    print("=" * 130)
 
 
 def summarize_single(data_dir: str, subset: str, model_dir: str = None, show_length: bool = True):
