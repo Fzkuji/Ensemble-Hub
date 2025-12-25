@@ -317,7 +317,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, grad_accum_step
 
     optimizer.zero_grad()
 
-    pbar = tqdm(dataloader, desc="Training")
+    pbar = tqdm(dataloader, desc="Training", disable=not is_main_process())
     for step, batch in enumerate(pbar):
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
@@ -353,7 +353,7 @@ def eval_epoch(model, dataloader, criterion, device):
     all_stages = []
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
+        for batch in tqdm(dataloader, desc="Evaluating", disable=not is_main_process()):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
