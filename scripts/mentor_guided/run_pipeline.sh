@@ -382,7 +382,46 @@ else
 fi
 
 echo ""
-echo "========== Step 6: Summarize Results =========="
+echo "========== Step 6: Train LoRA Classifiers =========="
+if [ -n "$TRAIN_SUBSET" ]; then
+    # Specific train subset specified
+    if [ "$TRAIN_SUBSET" = "all" ]; then
+        LORA_MODEL_DIR="all"
+        if check_model_exists "$LORA_MODEL_DIR" "lora"; then
+            echo ">>> LoRA: train=all, eval=$EVAL_SUBSET [SKIP - already trained, use --force to retrain]"
+        else
+            echo ">>> Training LoRA: train=all, eval=$EVAL_SUBSET"
+            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
+                --ddp --subset all --eval-subset "$EVAL_SUBSET" --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
+                --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+        fi
+    else
+        LORA_MODEL_DIR="$TRAIN_SUBSET"
+        if check_model_exists "$LORA_MODEL_DIR" "lora"; then
+            echo ">>> LoRA: $TRAIN_SUBSET [SKIP - already trained, use --force to retrain]"
+        else
+            echo ">>> Training LoRA: $TRAIN_SUBSET"
+            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
+                --ddp --subset $TRAIN_SUBSET --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
+                --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+        fi
+    fi
+else
+    # No train subset specified - train each subset individually
+    for subset in "${ALL_SUBSETS[@]}"; do
+        if check_model_exists "$subset" "lora"; then
+            echo ">>> LoRA: $subset [SKIP - already trained, use --force to retrain]"
+        else
+            echo ">>> Training LoRA: $subset"
+            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
+                --ddp --subset $subset --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
+                --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+        fi
+    done
+fi
+
+echo ""
+echo "========== Step 7: Summarize Results =========="
 # 根据训练方式选择 model-source
 if [[ "$TRAIN_SUBSET" == "all" ]]; then
     python summarize_results.py --data-dir $DATA_DIR --model-source all
