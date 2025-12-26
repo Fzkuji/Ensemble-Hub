@@ -60,7 +60,69 @@ python collect_data_vllm_think.py --split test --parallel --gpus 0,1,2,3,4,5,6,7
 
 **输出目录**: `hendrycks_math_split_standard_DeepSeek-R1-Distill-Qwen-7B/`
 
-### 2.3 参数说明
+### 2.3 Mentor/Intern 模型分离（大-小模型协作）
+
+支持使用不同大小的模型分别作为 Mentor（大模型）和 Intern（小模型）。
+
+#### 方案 1：使用不同 GPU（推荐）
+
+当 Mentor 和 Intern 使用不同的 GPU 时，会自动使用默认内存利用率（0.9），因为它们不共享内存。
+
+```bash
+# Mentor 使用 GPU 0-3，Intern 使用 GPU 4-7
+python collect_data_vllm_think.py \
+  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
+  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
+  --gpus 0,1,2,3 \
+  --mentor-gpus 0,1,2,3 \
+  --intern-gpus 4,5,6,7 \
+  --split train \
+  --parallel
+```
+
+**优点**：
+- 两个模型互不干扰，内存充足
+- 自动使用默认内存利用率（0.9），无需手动设置
+- 性能稳定，推荐使用
+
+#### 方案 2：使用相同 GPU（需要合理分配内存）
+
+当 Mentor 和 Intern 使用相同的 GPU 时，需要手动设置内存利用率，避免内存冲突。
+
+```bash
+# 两个模型都在 GPU 0-7 上，需要设置内存利用率
+python collect_data_vllm_think.py \
+  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
+  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
+  --mentor-memory-util 0.4 \
+  --intern-memory-util 0.25 \
+  --split train \
+  --parallel \
+  --gpus 0,1,2,3,4,5,6,7
+```
+
+**内存利用率建议**：
+- **32B Mentor 模型**：0.4-0.5（根据 GPU 显存调整）
+- **7B Intern 模型**：0.2-0.3（根据 GPU 显存调整）
+- 如果仍然内存不足，可以进一步降低或使用方案 1
+
+#### 方案 3：调整模型长度（减少内存使用）
+
+如果内存仍然不足，可以降低 `max_model_len`：
+
+```bash
+python collect_data_vllm_think.py \
+  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
+  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
+  --mentor-max-model-len 4096 \
+  --intern-max-model-len 8192 \
+  --mentor-memory-util 0.4 \
+  --split train \
+  --parallel \
+  --gpus 0,1,2,3,4,5,6,7
+```
+
+### 2.4 参数说明
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
@@ -68,9 +130,22 @@ python collect_data_vllm_think.py --split test --parallel --gpus 0,1,2,3,4,5,6,7
 | `--parallel` | 启用多 GPU 并行 | - |
 | `--gpus` | GPU 列表 | `0,1,2,3,4,5,6,7` |
 | `--no-think` | 禁用思考（标准 prompt） | - |
-| `--model` | 模型名称 | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` |
+| `--model` | 模型名称（legacy，建议使用 --mentor-model 和 --intern-model） | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` |
+| `--mentor-model` | Mentor 模型名称（大模型，如 32B） | 同 `--model` |
+| `--intern-model` | Intern 模型名称（小模型，如 7B） | 同 `--model` |
+| `--mentor-gpus` | Mentor 模型使用的 GPU 列表 | 同 `--gpus` |
+| `--intern-gpus` | Intern 模型使用的 GPU 列表 | 同 `--gpus` |
+| `--mentor-memory-util` | Mentor 模型 GPU 内存利用率（仅当使用相同 GPU 时生效） | `0.5` |
+| `--intern-memory-util` | Intern 模型 GPU 内存利用率（仅当使用相同 GPU 时生效） | `0.3` |
+| `--mentor-max-model-len` | Mentor 模型最大长度 | 同 `--max-model-len` |
+| `--intern-max-model-len` | Intern 模型最大长度 | 同 `--max-model-len` |
 | `--batch-size` | 批量大小 | `8` |
 | `--token-levels` | Token 级别列表 | `0,100,500,1000` |
+| `--max-model-len` | 最大模型长度 | `8192` |
+
+**注意**：
+- 当 `--mentor-gpus` 和 `--intern-gpus` 不同时，会自动使用默认内存利用率（0.9），忽略 `--mentor-memory-util` 和 `--intern-memory-util`
+- 当使用相同 GPU 时，必须合理设置内存利用率，否则可能出现内存不足错误
 
 ---
 
