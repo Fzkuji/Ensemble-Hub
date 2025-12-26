@@ -475,8 +475,18 @@ def worker_process_all_tasks(
         logger.info(f"[Worker {rank}] Processing subset {subset_name}: {len(shard_data)} samples")
 
         for token_level in token_levels:
+            # Check if merged file already exists (skip if it does)
+            merged_file = os.path.join(output_dir, f"tokens{token_level}.json")
+            if os.path.exists(merged_file):
+                logger.info(f"[Worker {rank}] {subset_name} tokens={token_level} already exists, skipping...")
+                continue
+            
             logger.info(f"[Worker {rank}] {subset_name} tokens={token_level}...")
-            results = collect_data_for_token_level(mentor_model, intern_model, shard_data, token_level, batch_size, use_think=use_think)
+            try:
+                results = collect_data_for_token_level(mentor_model, intern_model, shard_data, token_level, batch_size, use_think=use_think)
+            except Exception as e:
+                logger.error(f"[Worker {rank}] Error collecting {subset_name} tokens={token_level}: {e}", exc_info=True)
+                continue
 
             correct = sum(1 for r in results if r['is_correct'])
             accuracy = correct / len(results) if results else 0
