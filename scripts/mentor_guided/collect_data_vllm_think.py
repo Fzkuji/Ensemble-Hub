@@ -702,8 +702,18 @@ def main():
     gpus = [int(g.strip()) for g in args.gpus.split(",")]
 
     # Set output directory (default: server path)
-    # Use exp_name if provided, otherwise use model name
-    exp_name = args.exp_name if args.exp_name else args.model.split('/')[-1]
+    # Build experiment name from models
+    if args.exp_name:
+        exp_name = args.exp_name
+    elif mentor_model != intern_model:
+        # Different models: include both in path
+        mentor_short = mentor_model.split('/')[-1]
+        intern_short = intern_model.split('/')[-1]
+        exp_name = f"m{mentor_short}_i{intern_short}"
+    else:
+        # Same model: use single model name
+        exp_name = args.model.split('/')[-1]
+    
     mode_suffix = "think" if use_think else "standard"
     if args.output_dir is None:
         if args.dataset == "math500":

@@ -155,8 +155,26 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Extract model name for directory
-MODEL_NAME=$(echo $MODEL | sed 's|.*/||')
+# Extract model name(s) for directory
+if [ -n "$MENTOR_MODEL" ] && [ -n "$INTERN_MODEL" ]; then
+    # Both models specified: use both in path
+    MENTOR_SHORT=$(echo $MENTOR_MODEL | sed 's|.*/||')
+    INTERN_SHORT=$(echo $INTERN_MODEL | sed 's|.*/||')
+    MODEL_NAME="m${MENTOR_SHORT}_i${INTERN_SHORT}"
+elif [ -n "$MENTOR_MODEL" ]; then
+    # Only mentor specified: use mentor + default intern
+    MENTOR_SHORT=$(echo $MENTOR_MODEL | sed 's|.*/||')
+    INTERN_SHORT=$(echo $MODEL | sed 's|.*/||')
+    MODEL_NAME="m${MENTOR_SHORT}_i${INTERN_SHORT}"
+elif [ -n "$INTERN_MODEL" ]; then
+    # Only intern specified: use default mentor + intern
+    MENTOR_SHORT=$(echo $MODEL | sed 's|.*/||')
+    INTERN_SHORT=$(echo $INTERN_MODEL | sed 's|.*/||')
+    MODEL_NAME="m${MENTOR_SHORT}_i${INTERN_SHORT}"
+else
+    # Same model for both: use single model name
+    MODEL_NAME=$(echo $MODEL | sed 's|.*/||')
+fi
 
 # Set data directory based on think mode
 if [ "$USE_THINK" = true ]; then
