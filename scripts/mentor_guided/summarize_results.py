@@ -128,9 +128,11 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
         show_length: 是否显示长度统计
         model_source: 模型来源 - "individual" (各子集单独训练), "all" (合并训练)
     """
-    # 计算实际行宽 (T0-T1000 各 24, Oracle/Cascade 各 24)
+    # Mentor 列宽度 (acc + len)
+    W_MENTOR = W_ACC + W_LEN
+    # 计算实际行宽 (T0-T1000 各 24, Mentor 16, Oracle/Cascade 各 24)
     if show_length:
-        line_width = W_SUBSET + W_N + W_TOKEN_GROUP * 6 + W_GAP + 10
+        line_width = W_SUBSET + W_N + W_TOKEN_GROUP * 4 + W_MENTOR + W_TOKEN_GROUP * 2 + W_GAP + 10
     else:
         line_width = 110
 
@@ -140,10 +142,13 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
     print("=" * line_width)
 
     if show_length:
-        # 表头第一行：Subset, N, T0, T100, T500, T1000, Oracle, Cascade, Gap
+        # Mentor 列宽度 (acc + len，没有 i_len)
+        W_MENTOR = W_ACC + W_LEN
+        # 表头第一行：Subset, N, T0, T100, T500, T1000, Mentor, Oracle, Cascade, Gap
         print(f"{'Subset':<{W_SUBSET}} {'N':<{W_N}} "
               f"{'T0':<{W_TOKEN_GROUP}} {'T100':<{W_TOKEN_GROUP}} "
               f"{'T500':<{W_TOKEN_GROUP}} {'T1000':<{W_TOKEN_GROUP}} "
+              f"{'Mentor':<{W_MENTOR}} "
               f"{'Oracle':<{W_TOKEN_GROUP}} {'Cascade':<{W_TOKEN_GROUP}} {'Gap':<{W_GAP}}")
         # 表头第二行：acc, m_len, i_len
         print(f"{'':<{W_SUBSET}} {'':<{W_N}} "
@@ -151,11 +156,12 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
               f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}} "
               f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}} "
               f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}} "
+              f"{'acc':<{W_ACC}}{'len':<{W_LEN}} "
               f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}} "
               f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}}")
     else:
         print(f"{'Subset':<{W_SUBSET}} {'N':<{W_N}} {'T0':<{W_ACC}} {'T100':<{W_ACC}} "
-              f"{'T500':<{W_ACC}} {'T1000':<{W_ACC}} {'Oracle':<{W_ORACLE}} "
+              f"{'T500':<{W_ACC}} {'T1000':<{W_ACC}} {'Mentor':<{W_ACC}} {'Oracle':<{W_ORACLE}} "
               f"{'Cascade':<{W_CASCADE}} {'Gap':<{W_GAP}}")
 
     print("-" * line_width)
@@ -171,6 +177,9 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
     total_mentor_len = {0: 0, 100: 0, 500: 0, 1000: 0}
     total_intern_len = {0: 0, 100: 0, 500: 0, 1000: 0}
     total_len_count = {0: 0, 100: 0, 500: 0, 1000: 0}
+    # Mentor-only 累计
+    total_mentor_acc = 0
+    total_mentor_only_len = 0
     # Oracle/Cascade 长度累计
     total_oracle_m_len = 0
     total_oracle_i_len = 0
@@ -296,6 +305,11 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
             l500 = length_stats.get(500)
             l1000 = length_stats.get(1000)
             
+            # 获取 Mentor-only 结果
+            mentor_stats = compute_mentor_only_stats(data_dir, subset)
+            mentor_acc = mentor_stats['accuracy'] if mentor_stats else 0
+            mentor_len = mentor_stats['mentor_length_mean'] if mentor_stats else 0
+            
             # 获取 Oracle/Cascade 长度（从结果文件中读取）
             oracle_len = r.get('oracle_length', {})
             cascade_len = r.get('cascade_length', {})
@@ -303,6 +317,10 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
             oracle_i = oracle_len.get('intern_mean', 0)
             cascade_m = cascade_len.get('mentor_mean', 0)
             cascade_i = cascade_len.get('intern_mean', 0)
+            
+            # Mentor 列格式化
+            mentor_acc_str = f"{mentor_acc:<{W_ACC}.4f}" if mentor_acc else f"{'-':<{W_ACC}}"
+            mentor_len_str = f"{mentor_len:<{W_LEN}.1f}" if mentor_len else f"{'-':<{W_LEN}}"
             
             oracle_m_str = f"{oracle_m:<{W_LEN}.1f}" if oracle_m else f"{'-':<{W_LEN}}"
             oracle_i_str = f"{oracle_i:<{W_LEN}.1f}" if oracle_i else f"{'-':<{W_LEN}}"
@@ -312,6 +330,7 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
             print(f"{subset:<{W_SUBSET}} {n:<{W_N}} "
                   f"{fmt_token_group(t0, l0)} {fmt_token_group(t100, l100)} "
                   f"{fmt_token_group(t500, l500)} {fmt_token_group(t1000, l1000)} "
+                  f"{mentor_acc_str}{mentor_len_str} "
                   f"{oracle:<{W_ACC}.4f}{oracle_m_str}{oracle_i_str} "
                   f"{cascade:<{W_ACC}.4f}{cascade_m_str}{cascade_i_str} {gap:+.4f}")
 
@@ -324,6 +343,11 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
                         total_intern_len[tokens] += l_stat['intern']['mean'] * n
                     total_len_count[tokens] += n
             
+            # 累计 Mentor 统计
+            if mentor_stats:
+                total_mentor_acc += mentor_acc * n
+                total_mentor_only_len += mentor_len * n
+            
             # 累计 Oracle/Cascade 长度
             if oracle_m:
                 total_oracle_m_len += oracle_m * n
@@ -334,9 +358,16 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
             if cascade_i:
                 total_cascade_i_len += cascade_i * n
         else:
+            # 获取 Mentor-only 结果（不显示长度时也需要）
+            mentor_stats = compute_mentor_only_stats(data_dir, subset)
+            mentor_acc = mentor_stats['accuracy'] if mentor_stats else 0
+            mentor_acc_str = f"{mentor_acc:<{W_ACC}.4f}" if mentor_acc else "-"
             print(f"{subset:<{W_SUBSET}} {n:<{W_N}} {t0:<{W_ACC}.4f} {t100:<{W_ACC}.4f} "
-                  f"{t500:<{W_ACC}.4f} {t1000:<{W_ACC}.4f} {oracle:<{W_ORACLE}.4f} "
+                  f"{t500:<{W_ACC}.4f} {t1000:<{W_ACC}.4f} {mentor_acc_str:<{W_ACC}} {oracle:<{W_ORACLE}.4f} "
                   f"{cascade:<{W_CASCADE}.4f} {gap:+.4f}")
+            # 累计 Mentor（不显示长度时）
+            if mentor_stats:
+                total_mentor_acc += mentor_acc * n
 
         total_n += n
         total_oracle += oracle * n
@@ -373,12 +404,18 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
                 i_str = f"{i_len:<{W_LEN}.1f}" if i_len else f"{'-':<{W_LEN}}"
                 return f"{acc:<{W_ACC}.4f}{m_str}{i_str}"
 
+            # Mentor 平均值
+            avg_mentor_acc = total_mentor_acc / total_n if total_n > 0 else 0
+            avg_mentor_len = total_mentor_only_len / total_n if total_n > 0 else 0
+            
             # Oracle/Cascade 平均长度
             avg_oracle_m = total_oracle_m_len / total_n if total_n > 0 else 0
             avg_oracle_i = total_oracle_i_len / total_n if total_n > 0 else 0
             avg_cascade_m = total_cascade_m_len / total_n if total_n > 0 else 0
             avg_cascade_i = total_cascade_i_len / total_n if total_n > 0 else 0
             
+            mentor_acc_str = f"{avg_mentor_acc:<{W_ACC}.4f}" if avg_mentor_acc else f"{'-':<{W_ACC}}"
+            mentor_len_str = f"{avg_mentor_len:<{W_LEN}.1f}" if avg_mentor_len else f"{'-':<{W_LEN}}"
             oracle_m_str = f"{avg_oracle_m:<{W_LEN}.1f}" if avg_oracle_m else f"{'-':<{W_LEN}}"
             oracle_i_str = f"{avg_oracle_i:<{W_LEN}.1f}" if avg_oracle_i else f"{'-':<{W_LEN}}"
             cascade_m_str = f"{avg_cascade_m:<{W_LEN}.1f}" if avg_cascade_m else f"{'-':<{W_LEN}}"
@@ -387,12 +424,15 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
             print(f"{'TOTAL (weighted)':<{W_SUBSET}} {total_n:<{W_N}} "
                   f"{fmt_total_token_group(avg_t0, 0)} {fmt_total_token_group(avg_t100, 100)} "
                   f"{fmt_total_token_group(avg_t500, 500)} {fmt_total_token_group(avg_t1000, 1000)} "
+                  f"{mentor_acc_str}{mentor_len_str} "
                   f"{avg_oracle:<{W_ACC}.4f}{oracle_m_str}{oracle_i_str} "
                   f"{avg_cascade:<{W_ACC}.4f}{cascade_m_str}{cascade_i_str} {avg_gap:+.4f}")
         else:
+            avg_mentor_acc = total_mentor_acc / total_n if total_n > 0 else 0
+            mentor_acc_str = f"{avg_mentor_acc:<{W_ACC}.4f}" if avg_mentor_acc else "-"
             print(f"{'TOTAL (weighted)':<{W_SUBSET}} {total_n:<{W_N}} {avg_t0:<{W_ACC}.4f} "
                   f"{avg_t100:<{W_ACC}.4f} {avg_t500:<{W_ACC}.4f} {avg_t1000:<{W_ACC}.4f} "
-                  f"{avg_oracle:<{W_ORACLE}.4f} {avg_cascade:<{W_CASCADE}.4f} {avg_gap:+.4f}")
+                  f"{mentor_acc_str:<{W_ACC}} {avg_oracle:<{W_ORACLE}.4f} {avg_cascade:<{W_CASCADE}.4f} {avg_gap:+.4f}")
 
     print("=" * line_width)
 
