@@ -19,7 +19,7 @@
 #   --skip-existing          Skip token levels that already exist
 #
 # Examples:
-#   ./run_test_token_levels.sh --mentor-model "deepseek-ai/DeepSeek-R1-32B" --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+#   ./run_test_token_levels.sh --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 #   ./run_test_token_levels.sh --token-levels "100,200,500,1000"
 #   ./run_test_token_levels.sh --no-think --skip-existing
 
