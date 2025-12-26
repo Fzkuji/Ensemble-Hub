@@ -91,6 +91,7 @@ class VLLMInference:
         gpu_id: int = 0,
         tensor_parallel_size: int = 1,
         max_model_len: int = 8192,
+        gpu_memory_utilization: float = 0.9,
     ):
         """Initialize vLLM model.
 
@@ -99,6 +100,7 @@ class VLLMInference:
             gpu_id: GPU ID to use
             tensor_parallel_size: Number of GPUs for tensor parallelism
             max_model_len: Maximum model context length
+            gpu_memory_utilization: Fraction of GPU memory to use (default: 0.9)
         """
         try:
             from vllm import LLM, SamplingParams
@@ -107,7 +109,7 @@ class VLLMInference:
 
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-        logger.info(f"Loading model {model_name} with vLLM on GPU {gpu_id}...")
+        logger.info(f"Loading model {model_name} with vLLM on GPU {gpu_id} (memory_util={gpu_memory_utilization})...")
 
         self.model = LLM(
             model=model_name,
@@ -115,6 +117,7 @@ class VLLMInference:
             max_model_len=max_model_len,
             trust_remote_code=True,
             dtype="bfloat16",
+            gpu_memory_utilization=gpu_memory_utilization,
         )
         self.tokenizer = self.model.get_tokenizer()
         self.SamplingParams = SamplingParams
@@ -428,13 +431,17 @@ def worker_process_all_tasks(
     all_tasks: List[Tuple[str, str, List[Dict[str, Any]]]],  # [(subset, output_dir, data), ...]
     token_levels: List[int],
     use_think: bool = True,
+    mentor_gpu_id: int = None,
+    intern_gpu_id: int = None,
+    mentor_memory_util: float = 0.6,
+    intern_memory_util: float = 0.3,
 ):
     """Worker process that processes ALL subsets and token levels with TWO model inits.
 
     Args:
         rank: Worker rank
         world_size: Total number of workers
-        gpu_id: GPU ID to use
+        gpu_id: Default GPU ID to use
         mentor_model_name: Mentor model name (large model)
         intern_model_name: Intern model name (small model)
         max_model_len: Max model context length
@@ -442,23 +449,33 @@ def worker_process_all_tasks(
         all_tasks: List of (subset_name, output_dir, data) tuples
         token_levels: List of token levels to collect
         use_think: Whether to use think prompt
+        mentor_gpu_id: GPU ID for mentor model (if None, uses gpu_id)
+        intern_gpu_id: GPU ID for intern model (if None, uses gpu_id)
+        mentor_memory_util: GPU memory utilization for mentor model (default: 0.6)
+        intern_memory_util: GPU memory utilization for intern model (default: 0.3)
     """
-    logger.info(f"[Worker {rank}] GPU {gpu_id}: Initializing models (one time for all tasks)...")
+    # Determine GPU IDs for each model
+    mentor_gpu = mentor_gpu_id if mentor_gpu_id is not None else gpu_id
+    intern_gpu = intern_gpu_id if intern_gpu_id is not None else gpu_id
+    
+    logger.info(f"[Worker {rank}] Initializing models (mentor on GPU {mentor_gpu}, intern on GPU {intern_gpu})...")
 
     # Initialize mentor model (large model)
-    logger.info(f"[Worker {rank}] Loading mentor model: {mentor_model_name}...")
+    logger.info(f"[Worker {rank}] Loading mentor model: {mentor_model_name} on GPU {mentor_gpu} (memory_util={mentor_memory_util})...")
     mentor_model = VLLMInference(
         model_name=mentor_model_name,
-        gpu_id=gpu_id,
+        gpu_id=mentor_gpu,
         max_model_len=max_model_len,
+        gpu_memory_utilization=mentor_memory_util,
     )
 
     # Initialize intern model (small model)
-    logger.info(f"[Worker {rank}] Loading intern model: {intern_model_name}...")
+    logger.info(f"[Worker {rank}] Loading intern model: {intern_model_name} on GPU {intern_gpu} (memory_util={intern_memory_util})...")
     intern_model = VLLMInference(
         model_name=intern_model_name,
-        gpu_id=gpu_id,
+        gpu_id=intern_gpu,
         max_model_len=max_model_len,
+        gpu_memory_utilization=intern_memory_util,
     )
 
     logger.info(f"[Worker {rank}] Models loaded, processing {len(all_tasks)} subsets × {len(token_levels)} token levels")
@@ -535,6 +552,10 @@ def collect_parallel(
     gpus: List[int],
     output_dir: str,
     use_think: bool = True,
+    mentor_gpu_ids: List[int] = None,
+    intern_gpu_ids: List[int] = None,
+    mentor_memory_util: float = 0.6,
+    intern_memory_util: float = 0.3,
 ) -> Dict[int, Dict[str, Any]]:
     """Collect data for a single dataset in parallel.
 
@@ -551,6 +572,10 @@ def collect_parallel(
         token_levels=token_levels,
         gpus=gpus,
         use_think=use_think,
+        mentor_gpu_ids=mentor_gpu_ids,
+        intern_gpu_ids=intern_gpu_ids,
+        mentor_memory_util=mentor_memory_util,
+        intern_memory_util=intern_memory_util,
     )
     return results.get("single", {})
 
@@ -591,18 +616,40 @@ def collect_all_parallel(
     token_levels: List[int],
     gpus: List[int],
     use_think: bool = True,
+    mentor_gpu_ids: List[int] = None,
+    intern_gpu_ids: List[int] = None,
+    mentor_memory_util: float = 0.6,
+    intern_memory_util: float = 0.3,
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """Collect data for ALL subsets in parallel with TWO model inits per GPU.
 
     Workers merge results immediately after each (subset, token_level) completes.
+    
+    Args:
+        mentor_gpu_ids: List of GPU IDs for mentor models (if None, uses gpus)
+        intern_gpu_ids: List of GPU IDs for intern models (if None, uses gpus)
+        mentor_memory_util: GPU memory utilization for mentor model (default: 0.6)
+        intern_memory_util: GPU memory utilization for intern model (default: 0.3)
     """
     world_size = len(gpus)
+    
+    # If separate GPU lists not provided, use same GPUs for both
+    if mentor_gpu_ids is None:
+        mentor_gpu_ids = gpus
+    if intern_gpu_ids is None:
+        intern_gpu_ids = gpus
+    
+    # Ensure GPU lists match world_size
+    if len(mentor_gpu_ids) != world_size:
+        mentor_gpu_ids = mentor_gpu_ids[:world_size] if len(mentor_gpu_ids) > world_size else mentor_gpu_ids + [mentor_gpu_ids[-1]] * (world_size - len(mentor_gpu_ids))
+    if len(intern_gpu_ids) != world_size:
+        intern_gpu_ids = intern_gpu_ids[:world_size] if len(intern_gpu_ids) > world_size else intern_gpu_ids + [intern_gpu_ids[-1]] * (world_size - len(intern_gpu_ids))
 
     print(f"\n{'='*60}", flush=True)
     print(f"[MAIN] Starting parallel collection", flush=True)
-    print(f"[MAIN] Mentor model: {mentor_model_name}", flush=True)
-    print(f"[MAIN] Intern model: {intern_model_name}", flush=True)
-    print(f"[MAIN] GPUs: {gpus} ({world_size} workers)", flush=True)
+    print(f"[MAIN] Mentor model: {mentor_model_name} (GPU: {mentor_gpu_ids}, memory_util={mentor_memory_util})", flush=True)
+    print(f"[MAIN] Intern model: {intern_model_name} (GPU: {intern_gpu_ids}, memory_util={intern_memory_util})", flush=True)
+    print(f"[MAIN] Workers: {world_size}", flush=True)
     print(f"[MAIN] Subsets: {len(all_tasks)}", flush=True)
     print(f"[MAIN] Token levels: {token_levels}", flush=True)
     print(f"{'='*60}\n", flush=True)
@@ -632,13 +679,15 @@ def collect_all_parallel(
     # Start all workers
     processes = []
     for rank, gpu_id in enumerate(gpus):
+        mentor_gpu = mentor_gpu_ids[rank]
+        intern_gpu = intern_gpu_ids[rank]
         p = mp.Process(
             target=worker_process_all_tasks,
-            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think)
+            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util)
         )
         p.start()
         processes.append(p)
-        print(f"[MAIN] Started worker {rank} on GPU {gpu_id} (PID: {p.pid})", flush=True)
+        print(f"[MAIN] Started worker {rank} (mentor GPU {mentor_gpu}, intern GPU {intern_gpu}, PID: {p.pid})", flush=True)
 
     print(f"\n[MAIN] All {world_size} workers started. Waiting...\n", flush=True)
 
@@ -687,6 +736,14 @@ def main():
                         help="Enable parallel data collection with multiple GPUs")
     parser.add_argument("--gpus", type=str, default="0,1,2,3,4,5,6,7",
                         help="Comma-separated list of GPUs for parallel mode")
+    parser.add_argument("--mentor-gpus", type=str, default=None,
+                        help="Comma-separated list of GPUs for mentor models (if None, uses --gpus)")
+    parser.add_argument("--intern-gpus", type=str, default=None,
+                        help="Comma-separated list of GPUs for intern models (if None, uses --gpus)")
+    parser.add_argument("--mentor-memory-util", type=float, default=0.6,
+                        help="GPU memory utilization for mentor model (default: 0.6)")
+    parser.add_argument("--intern-memory-util", type=float, default=0.3,
+                        help="GPU memory utilization for intern model (default: 0.3)")
     # Think mode control
     parser.add_argument("--no-think", action="store_true",
                         help="Disable structured thinking prompt (use standard prompt)")
@@ -710,6 +767,14 @@ def main():
 
     # Parse GPUs for parallel mode
     gpus = [int(g.strip()) for g in args.gpus.split(",")]
+    
+    # Parse mentor and intern GPU IDs
+    mentor_gpu_ids = None
+    intern_gpu_ids = None
+    if args.mentor_gpus:
+        mentor_gpu_ids = [int(g.strip()) for g in args.mentor_gpus.split(",")]
+    if args.intern_gpus:
+        intern_gpu_ids = [int(g.strip()) for g in args.intern_gpus.split(",")]
 
     # Set output directory (default: server path)
     # Build experiment name from models
@@ -762,6 +827,10 @@ def main():
                 gpus=gpus,
                 output_dir=output_subdir,
                 use_think=use_think,
+                mentor_gpu_ids=mentor_gpu_ids,
+                intern_gpu_ids=intern_gpu_ids,
+                mentor_memory_util=args.mentor_memory_util,
+                intern_memory_util=args.intern_memory_util,
             )
             for token_level in token_levels:
                 token_stats = stats.get(token_level)
@@ -863,6 +932,10 @@ def main():
                 token_levels=token_levels,
                 gpus=gpus,
                 use_think=use_think,
+                mentor_gpu_ids=mentor_gpu_ids,
+                intern_gpu_ids=intern_gpu_ids,
+                mentor_memory_util=args.mentor_memory_util,
+                intern_memory_util=args.intern_memory_util,
             )
         else:
             # Sequential mode or single subset
