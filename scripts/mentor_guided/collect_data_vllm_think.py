@@ -305,7 +305,8 @@ def load_hendrycks_math_all(split: str = "train") -> List[Dict[str, Any]]:
 
 
 def collect_data_for_token_level(
-    model: VLLMInference,
+    mentor_model: VLLMInference,
+    intern_model: VLLMInference,
     data: List[Dict[str, Any]],
     token_level: int,
     batch_size: int = 8,
@@ -319,7 +320,8 @@ def collect_data_for_token_level(
     - token_level>0: Mentor generates first N tokens, then Intern CONTINUES from there
 
     Args:
-        model: VLLMInference instance
+        mentor_model: VLLMInference instance for mentor (large model)
+        intern_model: VLLMInference instance for intern (small model)
         data: List of problems
         token_level: -1 for mentor only, 0 for intern only, >0 for mentor tokens
         batch_size: Batch size for inference
@@ -338,12 +340,12 @@ def collect_data_for_token_level(
 
         if token_level == MENTOR_ONLY_LEVEL:
             # Mentor only - mentor generates full answer, no intern
-            prompts = [model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
-            responses = model.generate(prompts)
+            prompts = [mentor_model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
+            responses = mentor_model.generate(prompts)
 
             for item, response in zip(batch, responses):
                 is_correct = check_math_correctness(response, item['ground_truth'])
-                mentor_length = len(model.tokenizer.encode(response)) if response else 0
+                mentor_length = len(mentor_model.tokenizer.encode(response)) if response else 0
                 results.append({
                     'question': item['question'],
                     'ground_truth': item['ground_truth'],
@@ -358,13 +360,13 @@ def collect_data_for_token_level(
                 })
         elif token_level == 0:
             # No mentor - intern generates from scratch
-            prompts = [model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
-            responses = model.generate(prompts)
+            prompts = [intern_model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
+            responses = intern_model.generate(prompts)
 
             for item, response in zip(batch, responses):
                 is_correct = check_math_correctness(response, item['ground_truth'])
                 # Calculate token length
-                intern_length = len(model.tokenizer.encode(response)) if response else 0
+                intern_length = len(intern_model.tokenizer.encode(response)) if response else 0
                 results.append({
                     'question': item['question'],
                     'ground_truth': item['ground_truth'],
@@ -379,8 +381,8 @@ def collect_data_for_token_level(
                 })
         else:
             # Mentor generates first N tokens
-            prompts = [model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
-            mentor_outputs = model.generate_mentor_tokens(prompts, max_tokens=token_level)
+            prompts = [mentor_model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
+            mentor_outputs = mentor_model.generate_mentor_tokens(prompts, max_tokens=token_level)
 
             # Intern CONTINUES from mentor's output (not starting over)
             # Concatenate prompt + mentor_output, then continue generating
@@ -388,7 +390,7 @@ def collect_data_for_token_level(
                 prompt + mentor_output
                 for prompt, mentor_output in zip(prompts, mentor_outputs)
             ]
-            intern_continuations = model.generate(continued_prompts)
+            intern_continuations = intern_model.generate(continued_prompts)
 
             for item, mentor_output, intern_continuation in zip(batch, mentor_outputs, intern_continuations):
                 # Full response = mentor_output + intern_continuation
@@ -396,8 +398,8 @@ def collect_data_for_token_level(
                 is_correct = check_math_correctness(full_response, item['ground_truth'])
 
                 # Calculate token lengths
-                mentor_length = len(model.tokenizer.encode(mentor_output)) if mentor_output else 0
-                intern_length = len(model.tokenizer.encode(intern_continuation)) if intern_continuation else 0
+                mentor_length = len(mentor_model.tokenizer.encode(mentor_output)) if mentor_output else 0
+                intern_length = len(intern_model.tokenizer.encode(intern_continuation)) if intern_continuation else 0
 
                 results.append({
                     'question': item['question'],
@@ -419,36 +421,47 @@ def worker_process_all_tasks(
     rank: int,
     world_size: int,
     gpu_id: int,
-    model_name: str,
+    mentor_model_name: str,
+    intern_model_name: str,
     max_model_len: int,
     batch_size: int,
     all_tasks: List[Tuple[str, str, List[Dict[str, Any]]]],  # [(subset, output_dir, data), ...]
     token_levels: List[int],
     use_think: bool = True,
 ):
-    """Worker process that processes ALL subsets and token levels with ONE model init.
+    """Worker process that processes ALL subsets and token levels with TWO model inits.
 
     Args:
         rank: Worker rank
         world_size: Total number of workers
         gpu_id: GPU ID to use
-        model_name: Model name
+        mentor_model_name: Mentor model name (large model)
+        intern_model_name: Intern model name (small model)
         max_model_len: Max model context length
         batch_size: Batch size
         all_tasks: List of (subset_name, output_dir, data) tuples
         token_levels: List of token levels to collect
         use_think: Whether to use think prompt
     """
-    logger.info(f"[Worker {rank}] GPU {gpu_id}: Initializing model (one time for all tasks)...")
+    logger.info(f"[Worker {rank}] GPU {gpu_id}: Initializing models (one time for all tasks)...")
 
-    # Initialize model ONCE
-    model = VLLMInference(
-        model_name=model_name,
+    # Initialize mentor model (large model)
+    logger.info(f"[Worker {rank}] Loading mentor model: {mentor_model_name}...")
+    mentor_model = VLLMInference(
+        model_name=mentor_model_name,
         gpu_id=gpu_id,
         max_model_len=max_model_len,
     )
 
-    logger.info(f"[Worker {rank}] Model loaded, processing {len(all_tasks)} subsets × {len(token_levels)} token levels")
+    # Initialize intern model (small model)
+    logger.info(f"[Worker {rank}] Loading intern model: {intern_model_name}...")
+    intern_model = VLLMInference(
+        model_name=intern_model_name,
+        gpu_id=gpu_id,
+        max_model_len=max_model_len,
+    )
+
+    logger.info(f"[Worker {rank}] Models loaded, processing {len(all_tasks)} subsets × {len(token_levels)} token levels")
 
     # Process all tasks
     for subset_name, output_dir, data in all_tasks:
@@ -463,7 +476,7 @@ def worker_process_all_tasks(
 
         for token_level in token_levels:
             logger.info(f"[Worker {rank}] {subset_name} tokens={token_level}...")
-            results = collect_data_for_token_level(model, shard_data, token_level, batch_size, use_think=use_think)
+            results = collect_data_for_token_level(mentor_model, intern_model, shard_data, token_level, batch_size, use_think=use_think)
 
             correct = sum(1 for r in results if r['is_correct'])
             accuracy = correct / len(results) if results else 0
@@ -503,7 +516,8 @@ def worker_process_all_tasks(
 
 
 def collect_parallel(
-    model_name: str,
+    mentor_model_name: str,
+    intern_model_name: str,
     max_model_len: int,
     batch_size: int,
     data: List[Dict[str, Any]],
@@ -519,7 +533,8 @@ def collect_parallel(
     """
     all_tasks = [("single", output_dir, data)]
     results = collect_all_parallel(
-        model_name=model_name,
+        mentor_model_name=mentor_model_name,
+        intern_model_name=intern_model_name,
         max_model_len=max_model_len,
         batch_size=batch_size,
         all_tasks=all_tasks,
@@ -558,7 +573,8 @@ def merge_rank_files(output_dir: str, token_level: int, world_size: int) -> Tupl
 
 
 def collect_all_parallel(
-    model_name: str,
+    mentor_model_name: str,
+    intern_model_name: str,
     max_model_len: int,
     batch_size: int,
     all_tasks: List[Tuple[str, str, List[Dict[str, Any]]]],
@@ -566,7 +582,7 @@ def collect_all_parallel(
     gpus: List[int],
     use_think: bool = True,
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
-    """Collect data for ALL subsets in parallel with ONE model init per GPU.
+    """Collect data for ALL subsets in parallel with TWO model inits per GPU.
 
     Workers merge results immediately after each (subset, token_level) completes.
     """
@@ -574,6 +590,8 @@ def collect_all_parallel(
 
     print(f"\n{'='*60}", flush=True)
     print(f"[MAIN] Starting parallel collection", flush=True)
+    print(f"[MAIN] Mentor model: {mentor_model_name}", flush=True)
+    print(f"[MAIN] Intern model: {intern_model_name}", flush=True)
     print(f"[MAIN] GPUs: {gpus} ({world_size} workers)", flush=True)
     print(f"[MAIN] Subsets: {len(all_tasks)}", flush=True)
     print(f"[MAIN] Token levels: {token_levels}", flush=True)
@@ -606,7 +624,7 @@ def collect_all_parallel(
     for rank, gpu_id in enumerate(gpus):
         p = mp.Process(
             target=worker_process_all_tasks,
-            args=(rank, world_size, gpu_id, model_name, max_model_len, batch_size, all_tasks, token_levels, use_think)
+            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think)
         )
         p.start()
         processes.append(p)
@@ -629,7 +647,11 @@ def main():
     parser = argparse.ArgumentParser(description="Collect data with vLLM and thinking prompt")
     parser.add_argument("--model", type=str,
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
-                        help="Model name")
+                        help="Model name (legacy, use --mentor-model and --intern-model instead)")
+    parser.add_argument("--mentor-model", type=str, default=None,
+                        help="Mentor model name (large model, e.g., 32B). If not set, uses --model")
+    parser.add_argument("--intern-model", type=str, default=None,
+                        help="Intern model name (small model, e.g., 7B). If not set, uses --model")
     parser.add_argument("--dataset", type=str, default="hendrycks_math",
                         choices=["hendrycks_math", "math500", "hendrycks_math_all"],
                         help="Dataset: hendrycks_math (by subset), math500 (MATH-500), hendrycks_math_all (all subsets merged)")
@@ -660,6 +682,15 @@ def main():
                         help="Disable structured thinking prompt (use standard prompt)")
 
     args = parser.parse_args()
+
+    # Determine mentor and intern models
+    mentor_model = args.mentor_model if args.mentor_model else args.model
+    intern_model = args.intern_model if args.intern_model else args.model
+    
+    if mentor_model != intern_model:
+        logger.info(f"Using different models: Mentor={mentor_model}, Intern={intern_model}")
+    else:
+        logger.info(f"Using same model for both: {mentor_model}")
 
     # Determine if using think mode
     use_think = not args.no_think
@@ -702,7 +733,8 @@ def main():
 
         if args.parallel:
             stats = collect_parallel(
-                model_name=args.model,
+                mentor_model_name=mentor_model,
+                intern_model_name=intern_model,
                 max_model_len=args.max_model_len,
                 batch_size=args.batch_size,
                 data=data,
@@ -726,15 +758,23 @@ def main():
                     logger.warning("  tokens=%s: no merged results found", token_level)
             return
         else:
-            model = VLLMInference(
-                model_name=args.model,
+            # Non-parallel mode: initialize both models
+            logger.info(f"Loading mentor model: {mentor_model}...")
+            mentor_model_instance = VLLMInference(
+                model_name=mentor_model,
+                gpu_id=args.gpu,
+                max_model_len=args.max_model_len,
+            )
+            logger.info(f"Loading intern model: {intern_model}...")
+            intern_model_instance = VLLMInference(
+                model_name=intern_model,
                 gpu_id=args.gpu,
                 max_model_len=args.max_model_len,
             )
             all_results = {}
             for token_level in token_levels:
                 logger.info(f"\nCollecting data for tokens={token_level}...")
-                results = collect_data_for_token_level(model, data, token_level, args.batch_size, use_think=use_think)
+                results = collect_data_for_token_level(mentor_model_instance, intern_model_instance, data, token_level, args.batch_size, use_think=use_think)
                 all_results[token_level] = results
 
         # Save results (sequential mode)

@@ -38,6 +38,8 @@ cd "$SCRIPT_DIR"
 GPUS="0,1,2,3,4,5,6,7"
 USE_THINK=true
 MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+MENTOR_MODEL=""
+INTERN_MODEL=""
 SUBSET=""
 TRAIN_SUBSET=""
 EVAL_SUBSET=""
@@ -72,6 +74,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --model)
             MODEL="$2"
+            shift 2
+            ;;
+        --mentor-model)
+            MENTOR_MODEL="$2"
+            shift 2
+            ;;
+        --intern-model)
+            INTERN_MODEL="$2"
             shift 2
             ;;
         --subset)
@@ -194,11 +204,33 @@ TOKEN_LEVELS="-1,0,100,500,1000"
 IFS=',' read -ra GPU_ARRAY <<< "$GPUS"
 NUM_GPUS=${#GPU_ARRAY[@]}
 
+# Build model arguments for data collection
+MODEL_ARGS=""
+if [ -n "$MENTOR_MODEL" ] && [ -n "$INTERN_MODEL" ]; then
+    MODEL_ARGS="--mentor-model $MENTOR_MODEL --intern-model $INTERN_MODEL"
+    echo "Using different models: Mentor=$MENTOR_MODEL, Intern=$INTERN_MODEL"
+elif [ -n "$MENTOR_MODEL" ]; then
+    MODEL_ARGS="--mentor-model $MENTOR_MODEL --intern-model $MODEL"
+    echo "Using mentor model: $MENTOR_MODEL, intern model: $MODEL"
+elif [ -n "$INTERN_MODEL" ]; then
+    MODEL_ARGS="--mentor-model $MODEL --intern-model $INTERN_MODEL"
+    echo "Using mentor model: $MODEL, intern model: $INTERN_MODEL"
+else
+    MODEL_ARGS="--model $MODEL"
+    echo "Using same model for both: $MODEL"
+fi
+
 echo "============================================================"
 echo "DeepSeek R1 vLLM Pipeline"
 echo "============================================================"
 echo "Mode: $MODE"
 echo "Model: $MODEL"
+if [ -n "$MENTOR_MODEL" ]; then
+    echo "Mentor model: $MENTOR_MODEL"
+fi
+if [ -n "$INTERN_MODEL" ]; then
+    echo "Intern model: $INTERN_MODEL"
+fi
 echo "Data dir: $DATA_DIR"
 echo "GPUs: $GPUS (${NUM_GPUS} GPUs)"
 echo "Train subset: ${TRAIN_SUBSET:-all (individual)}"
@@ -249,7 +281,7 @@ if [ "$TRAIN_EXISTS" = true ]; then
     echo "Train data already exists, skipping collection..."
 else
     echo "Collecting train data..."
-    python collect_data_vllm_think.py --split train --parallel --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG
+    python collect_data_vllm_think.py $MODEL_ARGS --split train --parallel --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG
 fi
 
 # Check if test data already exists
@@ -265,7 +297,7 @@ if [ "$TEST_EXISTS" = true ]; then
     echo "Test data already exists, skipping collection..."
 else
     echo "Collecting test data..."
-    python collect_data_vllm_think.py --split test --parallel --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG
+    python collect_data_vllm_think.py $MODEL_ARGS --split test --parallel --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG
 fi
 
 echo ""
