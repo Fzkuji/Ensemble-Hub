@@ -366,8 +366,13 @@ def eval_cascade(
     scaler: StandardScaler,
     features: np.ndarray,
     labels: np.ndarray,
+    data: Dict[int, List[Dict]] = None,
 ) -> Tuple[float, List[float], Dict]:
-    """Evaluate cascade accuracy with threshold search."""
+    """Evaluate cascade accuracy with threshold search.
+    
+    Args:
+        data: Optional data dict to compute length statistics
+    """
     from itertools import product
 
     n_stages = len(TOKEN_LEVELS)
@@ -407,8 +412,51 @@ def eval_cascade(
             best_acc = acc
             best_thresholds = thresholds
 
-    oracle_correct = sum(1 for i in range(n_samples) if any(gt[i, :] == 1))
+    # Compute Oracle accuracy and length stats
+    oracle_correct = 0
+    oracle_mentor_lens = []
+    oracle_intern_lens = []
+    for i in range(n_samples):
+        for stage_idx in range(n_stages):
+            if gt[i, stage_idx] == 1:
+                oracle_correct += 1
+                # Get length for this oracle choice
+                if data:
+                    tokens = TOKEN_LEVELS[stage_idx]
+                    item = data[tokens][i]
+                    m_len = item.get('mentor_length', 0)
+                    i_len = item.get('intern_length', item.get('num_tokens', 0))
+                    oracle_mentor_lens.append(m_len)
+                    oracle_intern_lens.append(i_len)
+                break
+    
     oracle_acc = oracle_correct / n_samples
+    
+    # Compute Cascade length stats using best thresholds
+    cascade_mentor_lens = []
+    cascade_intern_lens = []
+    if data:
+        for i in range(n_samples):
+            decided = False
+            for stage_idx in range(n_stages):
+                prob = probs[i, stage_idx]
+                if prob >= best_thresholds[stage_idx]:
+                    tokens = TOKEN_LEVELS[stage_idx]
+                    item = data[tokens][i]
+                    m_len = item.get('mentor_length', 0)
+                    i_len = item.get('intern_length', item.get('num_tokens', 0))
+                    cascade_mentor_lens.append(m_len)
+                    cascade_intern_lens.append(i_len)
+                    decided = True
+                    break
+            if not decided:
+                # Use last stage
+                tokens = TOKEN_LEVELS[-1]
+                item = data[tokens][i]
+                m_len = item.get('mentor_length', 0)
+                i_len = item.get('intern_length', item.get('num_tokens', 0))
+                cascade_mentor_lens.append(m_len)
+                cascade_intern_lens.append(i_len)
 
     stage_acc = {}
     stage_auc = {}
@@ -426,6 +474,18 @@ def eval_cascade(
         'baseline': stage_acc,
         'auc': stage_auc,
     }
+    
+    # Add length stats if data provided
+    if data and oracle_mentor_lens:
+        detailed['oracle_length'] = {
+            'mentor_mean': np.mean(oracle_mentor_lens),
+            'intern_mean': np.mean(oracle_intern_lens),
+        }
+    if data and cascade_mentor_lens:
+        detailed['cascade_length'] = {
+            'mentor_mean': np.mean(cascade_mentor_lens),
+            'intern_mean': np.mean(cascade_intern_lens),
+        }
 
     return best_acc, best_thresholds, detailed
 
@@ -769,7 +829,7 @@ def main():
 
             # Cascade evaluation on val (unfiltered) for threshold search
             logger.info("Running cascade evaluation on val (unfiltered)...")
-            cascade_acc, thresholds, detailed = eval_cascade(clf, scaler, X_val, y_val)
+            cascade_acc, thresholds, detailed = eval_cascade(clf, scaler, X_val, y_val, val_data)
             logger.info(f"Val Cascade Accuracy: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
         else:
             # No val: train on all train data, use train for threshold search
@@ -780,7 +840,7 @@ def main():
 
             # Cascade evaluation on train for threshold search
             logger.info("Running cascade evaluation on train (for threshold search)...")
-            cascade_acc, thresholds, detailed = eval_cascade(clf, scaler, X_train, y_train)
+            cascade_acc, thresholds, detailed = eval_cascade(clf, scaler, X_train, y_train, train_data)
             logger.info(f"Train Cascade Accuracy: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
 
         logger.info(f"Thresholds: {thresholds}")
@@ -836,7 +896,7 @@ def main():
             )
 
             # Evaluate
-            test_cascade_acc, _, test_detailed = eval_cascade(clf, scaler, X_test, y_test)
+            test_cascade_acc, _, test_detailed = eval_cascade(clf, scaler, X_test, y_test, test_data)
 
             logger.info(f"  Test Cascade Accuracy: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
 
@@ -845,6 +905,8 @@ def main():
                 'oracle_acc': test_detailed['oracle'],
                 'per_stage_auc': test_detailed['auc'],
                 'per_stage_baseline_acc': test_detailed['baseline'],
+                'oracle_length': test_detailed.get('oracle_length', {}),
+                'cascade_length': test_detailed.get('cascade_length', {}),
             }
 
         # Add test results to main results
