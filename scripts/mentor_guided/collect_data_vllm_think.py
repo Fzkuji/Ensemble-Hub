@@ -464,38 +464,58 @@ def worker_process_all_tasks(
     mentor_max_len = mentor_max_model_len if mentor_max_model_len is not None else max_model_len
     intern_max_len = intern_max_model_len if intern_max_model_len is not None else max_model_len
     
+    # If using different GPUs, use default memory utilization (0.9) since they don't share memory
+    # If using same GPU, use the specified memory utilization values
+    using_different_gpus = (mentor_gpu != intern_gpu)
+    if using_different_gpus:
+        mentor_mem_util = 0.9  # Default when using separate GPU
+        intern_mem_util = 0.9  # Default when using separate GPU
+        logger.info(f"[Worker {rank}] Using different GPUs - memory utilization set to default (0.9) for both models")
+    else:
+        mentor_mem_util = mentor_memory_util
+        intern_mem_util = intern_memory_util
+        logger.info(f"[Worker {rank}] Using same GPU - memory utilization: mentor={mentor_mem_util}, intern={intern_mem_util}")
+    
     logger.info(f"[Worker {rank}] Initializing models (mentor on GPU {mentor_gpu}, intern on GPU {intern_gpu})...")
 
     # Initialize mentor model (large model)
-    logger.info(f"[Worker {rank}] Loading mentor model: {mentor_model_name} on GPU {mentor_gpu} (memory_util={mentor_memory_util}, max_len={mentor_max_len})...")
+    logger.info(f"[Worker {rank}] Loading mentor model: {mentor_model_name} on GPU {mentor_gpu} (memory_util={mentor_mem_util}, max_len={mentor_max_len})...")
     try:
         mentor_model = VLLMInference(
             model_name=mentor_model_name,
             gpu_id=mentor_gpu,
             max_model_len=mentor_max_len,
-            gpu_memory_utilization=mentor_memory_util,
+            gpu_memory_utilization=mentor_mem_util,
         )
     except Exception as e:
         logger.error(f"[Worker {rank}] Failed to load mentor model: {e}")
-        logger.error(f"[Worker {rank}] Try: 1) Lower --mentor-memory-util (current: {mentor_memory_util})")
-        logger.error(f"[Worker {rank}]     2) Use separate GPU with --mentor-gpus")
-        logger.error(f"[Worker {rank}]     3) Reduce --mentor-max-model-len (current: {mentor_max_len})")
+        if using_different_gpus:
+            logger.error(f"[Worker {rank}] Try: 1) Reduce --mentor-max-model-len (current: {mentor_max_len})")
+            logger.error(f"[Worker {rank}]     2) Check if GPU {mentor_gpu} has enough free memory")
+        else:
+            logger.error(f"[Worker {rank}] Try: 1) Lower --mentor-memory-util (current: {mentor_mem_util})")
+            logger.error(f"[Worker {rank}]     2) Use separate GPU with --mentor-gpus")
+            logger.error(f"[Worker {rank}]     3) Reduce --mentor-max-model-len (current: {mentor_max_len})")
         raise
 
     # Initialize intern model (small model)
-    logger.info(f"[Worker {rank}] Loading intern model: {intern_model_name} on GPU {intern_gpu} (memory_util={intern_memory_util}, max_len={intern_max_len})...")
+    logger.info(f"[Worker {rank}] Loading intern model: {intern_model_name} on GPU {intern_gpu} (memory_util={intern_mem_util}, max_len={intern_max_len})...")
     try:
         intern_model = VLLMInference(
             model_name=intern_model_name,
             gpu_id=intern_gpu,
             max_model_len=intern_max_len,
-            gpu_memory_utilization=intern_memory_util,
+            gpu_memory_utilization=intern_mem_util,
         )
     except Exception as e:
         logger.error(f"[Worker {rank}] Failed to load intern model: {e}")
-        logger.error(f"[Worker {rank}] Try: 1) Lower --intern-memory-util (current: {intern_memory_util})")
-        logger.error(f"[Worker {rank}]     2) Use separate GPU with --intern-gpus")
-        logger.error(f"[Worker {rank}]     3) Reduce --intern-max-model-len (current: {intern_max_len})")
+        if using_different_gpus:
+            logger.error(f"[Worker {rank}] Try: 1) Reduce --intern-max-model-len (current: {intern_max_len})")
+            logger.error(f"[Worker {rank}]     2) Check if GPU {intern_gpu} has enough free memory")
+        else:
+            logger.error(f"[Worker {rank}] Try: 1) Lower --intern-memory-util (current: {intern_mem_util})")
+            logger.error(f"[Worker {rank}]     2) Use separate GPU with --intern-gpus")
+            logger.error(f"[Worker {rank}]     3) Reduce --intern-max-model-len (current: {intern_max_len})")
         raise
 
     logger.info(f"[Worker {rank}] Models loaded, processing {len(all_tasks)} subsets × {len(token_levels)} token levels")
