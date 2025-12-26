@@ -845,7 +845,8 @@ def main():
             logger.info(f"Total samples across all subsets: {sum(len(t[2]) for t in all_tasks)}")
 
             collect_all_parallel(
-                model_name=args.model,
+                mentor_model_name=mentor_model,
+                intern_model_name=intern_model,
                 max_model_len=args.max_model_len,
                 batch_size=args.batch_size,
                 all_tasks=all_tasks,
