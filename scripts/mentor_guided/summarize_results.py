@@ -35,10 +35,7 @@ W_TOKEN_GROUP = W_ACC + W_LEN + W_LEN  # acc + m_len + i_len = 24
 W_ORACLE = 8
 W_CASCADE = 8
 W_GAP = 8
-# Oracle/Cascade 完整列宽（包含 acc + m_len + i_len）
-W_ORACLE_FULL = W_ACC + W_LEN + W_LEN  # 24
-W_CASCADE_FULL = W_ACC + W_LEN + W_LEN  # 24
-LINE_WIDTH = W_SUBSET + W_N + W_TOKEN_GROUP * 4 + W_ORACLE_FULL + W_CASCADE_FULL + W_GAP + 10
+LINE_WIDTH = W_SUBSET + W_N + W_TOKEN_GROUP * 4 + W_ORACLE + W_CASCADE + W_GAP + 10  # 约180
 
 
 def compute_mentor_only_stats(data_dir: str, subset: str, split: str = "test"):
@@ -131,9 +128,9 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
         show_length: 是否显示长度统计
         model_source: 模型来源 - "individual" (各子集单独训练), "all" (合并训练)
     """
-    # 计算实际行宽
+    # 计算实际行宽 (T0-T1000 各 24, Oracle/Cascade 各 24)
     if show_length:
-        line_width = W_SUBSET + W_N + W_TOKEN_GROUP * 4 + W_ORACLE_FULL + W_CASCADE_FULL + W_GAP + 10
+        line_width = W_SUBSET + W_N + W_TOKEN_GROUP * 6 + W_GAP + 10
     else:
         line_width = 110
 
@@ -147,7 +144,7 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
         print(f"{'Subset':<{W_SUBSET}} {'N':<{W_N}} "
               f"{'T0':<{W_TOKEN_GROUP}} {'T100':<{W_TOKEN_GROUP}} "
               f"{'T500':<{W_TOKEN_GROUP}} {'T1000':<{W_TOKEN_GROUP}} "
-              f"{'Oracle':<{W_ORACLE_FULL}} {'Cascade':<{W_CASCADE_FULL}} {'Gap':<{W_GAP}}")
+              f"{'Oracle':<{W_TOKEN_GROUP}} {'Cascade':<{W_TOKEN_GROUP}} {'Gap':<{W_GAP}}")
         # 表头第二行：acc, m_len, i_len
         print(f"{'':<{W_SUBSET}} {'':<{W_N}} "
               f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}} "
@@ -174,6 +171,11 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
     total_mentor_len = {0: 0, 100: 0, 500: 0, 1000: 0}
     total_intern_len = {0: 0, 100: 0, 500: 0, 1000: 0}
     total_len_count = {0: 0, 100: 0, 500: 0, 1000: 0}
+    # Oracle/Cascade 长度累计
+    total_oracle_m_len = 0
+    total_oracle_i_len = 0
+    total_cascade_m_len = 0
+    total_cascade_i_len = 0
 
     # Collect gap data for later analysis
     collected_gaps = []  # [(subset, gap, n, oracle, cascade)]
@@ -228,6 +230,8 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
                         'baseline': subset_results.get('per_stage_baseline_acc', {}),
                         'oracle': subset_results.get('oracle_acc', 0),
                         'cascade_accuracy': subset_results.get('cascade_acc', 0),
+                        'oracle_length': subset_results.get('oracle_length', {}),
+                        'cascade_length': subset_results.get('cascade_length', {}),
                     }
             
             # 检查 all/mlp_model 的 per-subset 结果文件
@@ -243,6 +247,8 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
                             'baseline': subset_results.get('per_stage_baseline_acc', {}),
                             'oracle': subset_results.get('oracle_acc', 0),
                             'cascade_accuracy': subset_results.get('cascade_acc', 0),
+                            'oracle_length': subset_results.get('oracle_length', {}),
+                            'cascade_length': subset_results.get('cascade_length', {}),
                         }
                     else:
                         r = {
@@ -250,6 +256,8 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
                             'baseline': subset_mlp.get('test_per_stage_baseline_acc', subset_mlp.get('per_stage_baseline_acc', {})),
                             'oracle': subset_mlp.get('test_oracle_acc', subset_mlp.get('oracle_acc', 0)),
                             'cascade_accuracy': subset_mlp.get('test_best_cascade_acc', subset_mlp.get('best_cascade_acc', 0)),
+                            'oracle_length': subset_mlp.get('oracle_length', {}),
+                            'cascade_length': subset_mlp.get('cascade_length', {}),
                         }
 
         if r is None:
@@ -287,19 +295,20 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
             l100 = length_stats.get(100)
             l500 = length_stats.get(500)
             l1000 = length_stats.get(1000)
-
-            # Oracle/Cascade 长度：使用 T1000 作为 Oracle 的近似（最大 token 通常是 Oracle 选择）
-            # Cascade 长度需要根据阈值计算，这里暂时使用 T500 作为近似
-            oracle_m = l1000['mentor']['mean'] if l1000 and l1000.get('mentor', {}).get('mean') else 0
-            oracle_i = l1000['intern']['mean'] if l1000 and l1000.get('intern', {}).get('mean') else 0
-            cascade_m = l500['mentor']['mean'] if l500 and l500.get('mentor', {}).get('mean') else 0
-            cascade_i = l500['intern']['mean'] if l500 and l500.get('intern', {}).get('mean') else 0
+            
+            # 获取 Oracle/Cascade 长度（从结果文件中读取）
+            oracle_len = r.get('oracle_length', {})
+            cascade_len = r.get('cascade_length', {})
+            oracle_m = oracle_len.get('mentor_mean', 0)
+            oracle_i = oracle_len.get('intern_mean', 0)
+            cascade_m = cascade_len.get('mentor_mean', 0)
+            cascade_i = cascade_len.get('intern_mean', 0)
             
             oracle_m_str = f"{oracle_m:<{W_LEN}.1f}" if oracle_m else f"{'-':<{W_LEN}}"
             oracle_i_str = f"{oracle_i:<{W_LEN}.1f}" if oracle_i else f"{'-':<{W_LEN}}"
             cascade_m_str = f"{cascade_m:<{W_LEN}.1f}" if cascade_m else f"{'-':<{W_LEN}}"
             cascade_i_str = f"{cascade_i:<{W_LEN}.1f}" if cascade_i else f"{'-':<{W_LEN}}"
-            
+
             print(f"{subset:<{W_SUBSET}} {n:<{W_N}} "
                   f"{fmt_token_group(t0, l0)} {fmt_token_group(t100, l100)} "
                   f"{fmt_token_group(t500, l500)} {fmt_token_group(t1000, l1000)} "
@@ -314,6 +323,16 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
                     if l_stat.get('intern', {}).get('mean'):
                         total_intern_len[tokens] += l_stat['intern']['mean'] * n
                     total_len_count[tokens] += n
+            
+            # 累计 Oracle/Cascade 长度
+            if oracle_m:
+                total_oracle_m_len += oracle_m * n
+            if oracle_i:
+                total_oracle_i_len += oracle_i * n
+            if cascade_m:
+                total_cascade_m_len += cascade_m * n
+            if cascade_i:
+                total_cascade_i_len += cascade_i * n
         else:
             print(f"{subset:<{W_SUBSET}} {n:<{W_N}} {t0:<{W_ACC}.4f} {t100:<{W_ACC}.4f} "
                   f"{t500:<{W_ACC}.4f} {t1000:<{W_ACC}.4f} {oracle:<{W_ORACLE}.4f} "
@@ -354,17 +373,11 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
                 i_str = f"{i_len:<{W_LEN}.1f}" if i_len else f"{'-':<{W_LEN}}"
                 return f"{acc:<{W_ACC}.4f}{m_str}{i_str}"
 
-            # Oracle/Cascade 平均长度（使用 T1000/T500 近似）
-            if total_len_count[1000] > 0:
-                avg_oracle_m = total_mentor_len[1000] / total_len_count[1000]
-                avg_oracle_i = total_intern_len[1000] / total_len_count[1000]
-            else:
-                avg_oracle_m = avg_oracle_i = 0
-            if total_len_count[500] > 0:
-                avg_cascade_m = total_mentor_len[500] / total_len_count[500]
-                avg_cascade_i = total_intern_len[500] / total_len_count[500]
-            else:
-                avg_cascade_m = avg_cascade_i = 0
+            # Oracle/Cascade 平均长度
+            avg_oracle_m = total_oracle_m_len / total_n if total_n > 0 else 0
+            avg_oracle_i = total_oracle_i_len / total_n if total_n > 0 else 0
+            avg_cascade_m = total_cascade_m_len / total_n if total_n > 0 else 0
+            avg_cascade_i = total_cascade_i_len / total_n if total_n > 0 else 0
             
             oracle_m_str = f"{avg_oracle_m:<{W_LEN}.1f}" if avg_oracle_m else f"{'-':<{W_LEN}}"
             oracle_i_str = f"{avg_oracle_i:<{W_LEN}.1f}" if avg_oracle_i else f"{'-':<{W_LEN}}"

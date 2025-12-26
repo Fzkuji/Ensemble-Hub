@@ -487,13 +487,45 @@ def eval_cascade_on_val(
                 best_acc = acc
                 best_thresholds = thresholds
 
+    # Compute Oracle accuracy and length stats
     oracle_correct = 0
+    oracle_mentor_lens = []
+    oracle_intern_lens = []
     for i in range(n_samples):
         for tokens in TOKEN_LEVELS:
             if gt[tokens][i] == 1:
                 oracle_correct += 1
+                # Get length for this oracle choice
+                item = val_data[tokens][i]
+                m_len = item.get('mentor_length', 0)
+                i_len = item.get('intern_length', item.get('num_tokens', 0))
+                oracle_mentor_lens.append(m_len)
+                oracle_intern_lens.append(i_len)
                 break
     oracle_acc = oracle_correct / n_samples
+    
+    # Compute Cascade length stats using best thresholds
+    cascade_mentor_lens = []
+    cascade_intern_lens = []
+    for i in range(n_samples):
+        decided = False
+        for stage_idx, tokens in enumerate(TOKEN_LEVELS):
+            prob = all_probs[tokens][i]
+            if prob >= best_thresholds[stage_idx]:
+                item = val_data[tokens][i]
+                m_len = item.get('mentor_length', 0)
+                i_len = item.get('intern_length', item.get('num_tokens', 0))
+                cascade_mentor_lens.append(m_len)
+                cascade_intern_lens.append(i_len)
+                decided = True
+                break
+        if not decided:
+            # Use last stage
+            item = val_data[TOKEN_LEVELS[-1]][i]
+            m_len = item.get('mentor_length', 0)
+            i_len = item.get('intern_length', item.get('num_tokens', 0))
+            cascade_mentor_lens.append(m_len)
+            cascade_intern_lens.append(i_len)
 
     stage_auc = {}
     for tokens in TOKEN_LEVELS:
@@ -507,6 +539,14 @@ def eval_cascade_on_val(
         'oracle': oracle_acc,
         'baseline': {tokens: sum(gt[tokens]) / n_samples for tokens in TOKEN_LEVELS},
         'auc': stage_auc,
+        'oracle_length': {
+            'mentor_mean': sum(oracle_mentor_lens) / len(oracle_mentor_lens) if oracle_mentor_lens else 0,
+            'intern_mean': sum(oracle_intern_lens) / len(oracle_intern_lens) if oracle_intern_lens else 0,
+        },
+        'cascade_length': {
+            'mentor_mean': sum(cascade_mentor_lens) / len(cascade_mentor_lens) if cascade_mentor_lens else 0,
+            'intern_mean': sum(cascade_intern_lens) / len(cascade_intern_lens) if cascade_intern_lens else 0,
+        },
     }
 
     return best_acc, best_thresholds, detailed
@@ -995,6 +1035,8 @@ def main():
             'per_stage_auc': test_detailed['auc'],
             'per_stage_baseline_acc': test_detailed['baseline'],
             'n_test': n_test,
+            'oracle_length': test_detailed.get('oracle_length', {}),
+            'cascade_length': test_detailed.get('cascade_length', {}),
         }
 
         if is_main_process():
