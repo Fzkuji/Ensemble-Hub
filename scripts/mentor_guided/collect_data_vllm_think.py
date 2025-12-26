@@ -433,8 +433,10 @@ def worker_process_all_tasks(
     use_think: bool = True,
     mentor_gpu_id: int = None,
     intern_gpu_id: int = None,
-    mentor_memory_util: float = 0.6,
+    mentor_memory_util: float = 0.5,
     intern_memory_util: float = 0.3,
+    mentor_max_model_len: int = None,
+    intern_max_model_len: int = None,
 ):
     """Worker process that processes ALL subsets and token levels with TWO model inits.
 
@@ -458,25 +460,43 @@ def worker_process_all_tasks(
     mentor_gpu = mentor_gpu_id if mentor_gpu_id is not None else gpu_id
     intern_gpu = intern_gpu_id if intern_gpu_id is not None else gpu_id
     
+    # Determine max_model_len for each model
+    mentor_max_len = mentor_max_model_len if mentor_max_model_len is not None else max_model_len
+    intern_max_len = intern_max_model_len if intern_max_model_len is not None else max_model_len
+    
     logger.info(f"[Worker {rank}] Initializing models (mentor on GPU {mentor_gpu}, intern on GPU {intern_gpu})...")
 
     # Initialize mentor model (large model)
-    logger.info(f"[Worker {rank}] Loading mentor model: {mentor_model_name} on GPU {mentor_gpu} (memory_util={mentor_memory_util})...")
-    mentor_model = VLLMInference(
-        model_name=mentor_model_name,
-        gpu_id=mentor_gpu,
-        max_model_len=max_model_len,
-        gpu_memory_utilization=mentor_memory_util,
-    )
+    logger.info(f"[Worker {rank}] Loading mentor model: {mentor_model_name} on GPU {mentor_gpu} (memory_util={mentor_memory_util}, max_len={mentor_max_len})...")
+    try:
+        mentor_model = VLLMInference(
+            model_name=mentor_model_name,
+            gpu_id=mentor_gpu,
+            max_model_len=mentor_max_len,
+            gpu_memory_utilization=mentor_memory_util,
+        )
+    except Exception as e:
+        logger.error(f"[Worker {rank}] Failed to load mentor model: {e}")
+        logger.error(f"[Worker {rank}] Try: 1) Lower --mentor-memory-util (current: {mentor_memory_util})")
+        logger.error(f"[Worker {rank}]     2) Use separate GPU with --mentor-gpus")
+        logger.error(f"[Worker {rank}]     3) Reduce --mentor-max-model-len (current: {mentor_max_len})")
+        raise
 
     # Initialize intern model (small model)
-    logger.info(f"[Worker {rank}] Loading intern model: {intern_model_name} on GPU {intern_gpu} (memory_util={intern_memory_util})...")
-    intern_model = VLLMInference(
-        model_name=intern_model_name,
-        gpu_id=intern_gpu,
-        max_model_len=max_model_len,
-        gpu_memory_utilization=intern_memory_util,
-    )
+    logger.info(f"[Worker {rank}] Loading intern model: {intern_model_name} on GPU {intern_gpu} (memory_util={intern_memory_util}, max_len={intern_max_len})...")
+    try:
+        intern_model = VLLMInference(
+            model_name=intern_model_name,
+            gpu_id=intern_gpu,
+            max_model_len=intern_max_len,
+            gpu_memory_utilization=intern_memory_util,
+        )
+    except Exception as e:
+        logger.error(f"[Worker {rank}] Failed to load intern model: {e}")
+        logger.error(f"[Worker {rank}] Try: 1) Lower --intern-memory-util (current: {intern_memory_util})")
+        logger.error(f"[Worker {rank}]     2) Use separate GPU with --intern-gpus")
+        logger.error(f"[Worker {rank}]     3) Reduce --intern-max-model-len (current: {intern_max_len})")
+        raise
 
     logger.info(f"[Worker {rank}] Models loaded, processing {len(all_tasks)} subsets × {len(token_levels)} token levels")
 
@@ -554,8 +574,10 @@ def collect_parallel(
     use_think: bool = True,
     mentor_gpu_ids: List[int] = None,
     intern_gpu_ids: List[int] = None,
-    mentor_memory_util: float = 0.6,
+    mentor_memory_util: float = 0.5,
     intern_memory_util: float = 0.3,
+    mentor_max_model_len: int = None,
+    intern_max_model_len: int = None,
 ) -> Dict[int, Dict[str, Any]]:
     """Collect data for a single dataset in parallel.
 
@@ -576,6 +598,8 @@ def collect_parallel(
         intern_gpu_ids=intern_gpu_ids,
         mentor_memory_util=mentor_memory_util,
         intern_memory_util=intern_memory_util,
+        mentor_max_model_len=mentor_max_model_len,
+        intern_max_model_len=intern_max_model_len,
     )
     return results.get("single", {})
 
@@ -618,8 +642,10 @@ def collect_all_parallel(
     use_think: bool = True,
     mentor_gpu_ids: List[int] = None,
     intern_gpu_ids: List[int] = None,
-    mentor_memory_util: float = 0.6,
+    mentor_memory_util: float = 0.5,
     intern_memory_util: float = 0.3,
+    mentor_max_model_len: int = None,
+    intern_max_model_len: int = None,
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """Collect data for ALL subsets in parallel with TWO model inits per GPU.
 
@@ -683,7 +709,7 @@ def collect_all_parallel(
         intern_gpu = intern_gpu_ids[rank]
         p = mp.Process(
             target=worker_process_all_tasks,
-            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util)
+            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len)
         )
         p.start()
         processes.append(p)
@@ -740,10 +766,14 @@ def main():
                         help="Comma-separated list of GPUs for mentor models (if None, uses --gpus)")
     parser.add_argument("--intern-gpus", type=str, default=None,
                         help="Comma-separated list of GPUs for intern models (if None, uses --gpus)")
-    parser.add_argument("--mentor-memory-util", type=float, default=0.6,
-                        help="GPU memory utilization for mentor model (default: 0.6)")
+    parser.add_argument("--mentor-memory-util", type=float, default=0.5,
+                        help="GPU memory utilization for mentor model (default: 0.5, recommended: 0.4-0.6 for 32B models)")
     parser.add_argument("--intern-memory-util", type=float, default=0.3,
-                        help="GPU memory utilization for intern model (default: 0.3)")
+                        help="GPU memory utilization for intern model (default: 0.3, recommended: 0.2-0.4 for 7B models)")
+    parser.add_argument("--mentor-max-model-len", type=int, default=None,
+                        help="Max model length for mentor model (if None, uses --max-model-len)")
+    parser.add_argument("--intern-max-model-len", type=int, default=None,
+                        help="Max model length for intern model (if None, uses --max-model-len)")
     # Think mode control
     parser.add_argument("--no-think", action="store_true",
                         help="Disable structured thinking prompt (use standard prompt)")
@@ -831,6 +861,8 @@ def main():
                 intern_gpu_ids=intern_gpu_ids,
                 mentor_memory_util=args.mentor_memory_util,
                 intern_memory_util=args.intern_memory_util,
+                mentor_max_model_len=args.mentor_max_model_len,
+                intern_max_model_len=args.intern_max_model_len,
             )
             for token_level in token_levels:
                 token_stats = stats.get(token_level)
@@ -936,6 +968,8 @@ def main():
                 intern_gpu_ids=intern_gpu_ids,
                 mentor_memory_util=args.mentor_memory_util,
                 intern_memory_util=args.intern_memory_util,
+                mentor_max_model_len=args.mentor_max_model_len,
+                intern_max_model_len=args.intern_max_model_len,
             )
         else:
             # Sequential mode or single subset
