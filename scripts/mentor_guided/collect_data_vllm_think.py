@@ -934,6 +934,27 @@ def main():
         # hendrycks_math by subset
         subsets = [args.subset] if args.subset else MATH_SUBSETS
 
+        # Check if all data files already exist (before loading data and initializing models)
+        if not args.force:
+            all_exist = True
+            missing_files = []
+            for subset in subsets:
+                output_subdir = os.path.join(args.output_dir, subset, args.split)
+                for token_level in token_levels:
+                    merged_file = os.path.join(output_subdir, f"tokens{token_level}.json")
+                    if not os.path.exists(merged_file):
+                        all_exist = False
+                        missing_files.append(f"{subset}/{args.split}/tokens{token_level}.json")
+            
+            if all_exist:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"All data files already exist for split={args.split}")
+                logger.info(f"Subsets: {subsets}")
+                logger.info(f"Token levels: {token_levels}")
+                logger.info(f"Skipping data collection. Use --force to re-collect.")
+                logger.info(f"{'='*60}\n")
+                return
+
         # Always use parallel mode: load all subsets and process together (ONE model init per GPU)
         logger.info(f"\n{'='*60}")
         logger.info(f"Loading all {len(subsets)} subsets for parallel processing...")
