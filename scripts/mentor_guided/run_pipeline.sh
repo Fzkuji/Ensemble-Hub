@@ -173,7 +173,7 @@ elif [ -n "$INTERN_MODEL" ]; then
     MODEL_NAME="m${MENTOR_SHORT}_i${INTERN_SHORT}"
 else
     # Same model for both: use single model name
-    MODEL_NAME=$(echo $MODEL | sed 's|.*/||')
+MODEL_NAME=$(echo $MODEL | sed 's|.*/||')
 fi
 
 # Set data directory based on think mode
@@ -299,7 +299,7 @@ if [ "$TRAIN_EXISTS" = true ]; then
     echo "Train data already exists, skipping collection..."
 else
     echo "Collecting train data..."
-    python collect_data_vllm_think.py $MODEL_ARGS --split train --parallel --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG
+    python collect_data_vllm_think.py $MODEL_ARGS --split train --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG
 fi
 
 # Check if test data already exists
@@ -315,7 +315,7 @@ if [ "$TEST_EXISTS" = true ]; then
     echo "Test data already exists, skipping collection..."
 else
     echo "Collecting test data..."
-    python collect_data_vllm_think.py $MODEL_ARGS --split test --parallel --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG
+    python collect_data_vllm_think.py $MODEL_ARGS --split test --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG
 fi
 
 echo ""
