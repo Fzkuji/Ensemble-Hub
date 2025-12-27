@@ -437,6 +437,7 @@ def worker_process_all_tasks(
     intern_memory_util: float = 0.3,
     mentor_max_model_len: int = None,
     intern_max_model_len: int = None,
+    force: bool = False,
 ):
     """Worker process that processes ALL subsets and token levels with TWO model inits.
 
@@ -532,11 +533,15 @@ def worker_process_all_tasks(
         logger.info(f"[Worker {rank}] Processing subset {subset_name}: {len(shard_data)} samples")
 
         for token_level in token_levels:
-            # Check if merged file already exists (skip if it does)
+            # Check if merged file already exists (skip if it does, unless force is True)
             merged_file = os.path.join(output_dir, f"tokens{token_level}.json")
-            if os.path.exists(merged_file):
+            if os.path.exists(merged_file) and not force:
                 logger.info(f"[Worker {rank}] {subset_name} tokens={token_level} already exists, skipping...")
                 continue
+            elif os.path.exists(merged_file) and force:
+                logger.info(f"[Worker {rank}] {subset_name} tokens={token_level} already exists, but --force is set, re-collecting...")
+                # Remove existing file to force re-collection
+                os.remove(merged_file)
             
             logger.info(f"[Worker {rank}] {subset_name} tokens={token_level}...")
             try:
@@ -590,14 +595,15 @@ def collect_parallel(
     data: List[Dict[str, Any]],
     token_levels: List[int],
     gpus: List[int],
+    mentor_gpu_ids: List[int],
+    intern_gpu_ids: List[int],
     output_dir: str,
     use_think: bool = True,
-    mentor_gpu_ids: List[int] = None,
-    intern_gpu_ids: List[int] = None,
     mentor_memory_util: float = 0.5,
     intern_memory_util: float = 0.3,
     mentor_max_model_len: int = None,
     intern_max_model_len: int = None,
+    force: bool = False,
 ) -> Dict[int, Dict[str, Any]]:
     """Collect data for a single dataset in parallel.
 
@@ -613,13 +619,14 @@ def collect_parallel(
         all_tasks=all_tasks,
         token_levels=token_levels,
         gpus=gpus,
-        use_think=use_think,
         mentor_gpu_ids=mentor_gpu_ids,
         intern_gpu_ids=intern_gpu_ids,
+        use_think=use_think,
         mentor_memory_util=mentor_memory_util,
         intern_memory_util=intern_memory_util,
         mentor_max_model_len=mentor_max_model_len,
         intern_max_model_len=intern_max_model_len,
+        force=force,
     )
     return results.get("single", {})
 
@@ -659,13 +666,14 @@ def collect_all_parallel(
     all_tasks: List[Tuple[str, str, List[Dict[str, Any]]]],
     token_levels: List[int],
     gpus: List[int],
+    mentor_gpu_ids: List[int],
+    intern_gpu_ids: List[int],
     use_think: bool = True,
-    mentor_gpu_ids: List[int] = None,
-    intern_gpu_ids: List[int] = None,
     mentor_memory_util: float = 0.5,
     intern_memory_util: float = 0.3,
     mentor_max_model_len: int = None,
     intern_max_model_len: int = None,
+    force: bool = False,
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """Collect data for ALL subsets in parallel with TWO model inits per GPU.
 
@@ -679,17 +687,11 @@ def collect_all_parallel(
     """
     world_size = len(gpus)
     
-    # If separate GPU lists not provided, use same GPUs for both
-    if mentor_gpu_ids is None:
-        mentor_gpu_ids = gpus
-    if intern_gpu_ids is None:
-        intern_gpu_ids = gpus
-    
-    # Ensure GPU lists match world_size
+    # Validate GPU list lengths (should already be validated in main(), but double-check)
     if len(mentor_gpu_ids) != world_size:
-        mentor_gpu_ids = mentor_gpu_ids[:world_size] if len(mentor_gpu_ids) > world_size else mentor_gpu_ids + [mentor_gpu_ids[-1]] * (world_size - len(mentor_gpu_ids))
+        raise ValueError(f"mentor_gpu_ids length ({len(mentor_gpu_ids)}) must match gpus length ({world_size})")
     if len(intern_gpu_ids) != world_size:
-        intern_gpu_ids = intern_gpu_ids[:world_size] if len(intern_gpu_ids) > world_size else intern_gpu_ids + [intern_gpu_ids[-1]] * (world_size - len(intern_gpu_ids))
+        raise ValueError(f"intern_gpu_ids length ({len(intern_gpu_ids)}) must match gpus length ({world_size})")
 
     print(f"\n{'='*60}", flush=True)
     print(f"[MAIN] Starting parallel collection", flush=True)
@@ -729,7 +731,7 @@ def collect_all_parallel(
         intern_gpu = intern_gpu_ids[rank]
         p = mp.Process(
             target=worker_process_all_tasks,
-            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len)
+            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force)
         )
         p.start()
         processes.append(p)
@@ -765,8 +767,6 @@ def main():
     parser.add_argument("--split", type=str, default="test",
                         choices=["train", "test"],
                         help="Split for hendrycks_math/hendrycks_math_all (ignored for math500)")
-    parser.add_argument("--gpu", type=int, default=0,
-                        help="GPU ID to use (single GPU mode)")
     parser.add_argument("--batch-size", type=int, default=8,
                         help="Batch size for inference")
     parser.add_argument("--max-model-len", type=int, default=8192,
@@ -777,15 +777,13 @@ def main():
                         help="Experiment name for output directory (e.g., R1_m32B_i7B). If not set, uses model name.")
     parser.add_argument("--token-levels", type=str, default="0,100,500,1000",
                         help="Comma-separated token levels to collect")
-    # Parallel mode arguments
-    parser.add_argument("--parallel", action="store_true",
-                        help="Enable parallel data collection with multiple GPUs")
-    parser.add_argument("--gpus", type=str, default="0,1,2,3,4,5,6,7",
-                        help="Comma-separated list of GPUs for parallel mode")
-    parser.add_argument("--mentor-gpus", type=str, default=None,
-                        help="Comma-separated list of GPUs for mentor models (if None, uses --gpus)")
-    parser.add_argument("--intern-gpus", type=str, default=None,
-                        help="Comma-separated list of GPUs for intern models (if None, uses --gpus)")
+    # Parallel mode arguments (always enabled)
+    parser.add_argument("--gpus", type=str, required=True,
+                        help="Comma-separated list of worker GPUs (e.g., '0,1,2,3'). Each worker processes a shard of data.")
+    parser.add_argument("--mentor-gpus", type=str, required=True,
+                        help="Comma-separated list of GPUs for mentor models (e.g., '0,1,2,3'). Must match --gpus length.")
+    parser.add_argument("--intern-gpus", type=str, required=True,
+                        help="Comma-separated list of GPUs for intern models (e.g., '4,5,6,7'). Must match --gpus length.")
     parser.add_argument("--mentor-memory-util", type=float, default=0.5,
                         help="GPU memory utilization for mentor model (default: 0.5, recommended: 0.4-0.6 for 32B models)")
     parser.add_argument("--intern-memory-util", type=float, default=0.3,
@@ -797,6 +795,8 @@ def main():
     # Think mode control
     parser.add_argument("--no-think", action="store_true",
                         help="Disable structured thinking prompt (use standard prompt)")
+    parser.add_argument("--force", action="store_true",
+                        help="Force re-collection even if data files already exist")
 
     args = parser.parse_args()
 
@@ -815,16 +815,16 @@ def main():
     # Parse token levels
     token_levels = [int(x) for x in args.token_levels.split(",")]
 
-    # Parse GPUs for parallel mode
+    # Parse GPUs for parallel mode (all required)
     gpus = [int(g.strip()) for g in args.gpus.split(",")]
+    mentor_gpu_ids = [int(g.strip()) for g in args.mentor_gpus.split(",")]
+    intern_gpu_ids = [int(g.strip()) for g in args.intern_gpus.split(",")]
     
-    # Parse mentor and intern GPU IDs
-    mentor_gpu_ids = None
-    intern_gpu_ids = None
-    if args.mentor_gpus:
-        mentor_gpu_ids = [int(g.strip()) for g in args.mentor_gpus.split(",")]
-    if args.intern_gpus:
-        intern_gpu_ids = [int(g.strip()) for g in args.intern_gpus.split(",")]
+    # Validate GPU list lengths match
+    if len(mentor_gpu_ids) != len(gpus):
+        raise ValueError(f"--mentor-gpus length ({len(mentor_gpu_ids)}) must match --gpus length ({len(gpus)})")
+    if len(intern_gpu_ids) != len(gpus):
+        raise ValueError(f"--intern-gpus length ({len(intern_gpu_ids)}) must match --gpus length ({len(gpus)})")
 
     # Set output directory (default: server path)
     # Build experiment name from models
@@ -866,75 +866,39 @@ def main():
         """Helper to collect data and save results."""
         os.makedirs(output_subdir, exist_ok=True)
 
-        if args.parallel:
-            stats = collect_parallel(
-                mentor_model_name=mentor_model,
-                intern_model_name=intern_model,
-                max_model_len=args.max_model_len,
-                batch_size=args.batch_size,
-                data=data,
-                token_levels=token_levels,
-                gpus=gpus,
-                output_dir=output_subdir,
-                use_think=use_think,
-                mentor_gpu_ids=mentor_gpu_ids,
-                intern_gpu_ids=intern_gpu_ids,
-                mentor_memory_util=args.mentor_memory_util,
-                intern_memory_util=args.intern_memory_util,
-                mentor_max_model_len=args.mentor_max_model_len,
-                intern_max_model_len=args.intern_max_model_len,
-            )
-            for token_level in token_levels:
-                token_stats = stats.get(token_level)
-                if token_stats:
-                    logger.info(
-                        "  tokens=%s: %.4f (%d/%d) saved to %s",
-                        token_level,
-                        token_stats['accuracy'],
-                        token_stats['correct'],
-                        token_stats['total'],
-                        token_stats['output_file'],
-                    )
-                else:
-                    logger.warning("  tokens=%s: no merged results found", token_level)
-            return
-        else:
-            # Non-parallel mode: initialize both models
-            logger.info(f"Loading mentor model: {mentor_model}...")
-            mentor_model_instance = VLLMInference(
-                model_name=mentor_model,
-                gpu_id=args.gpu,
-                max_model_len=args.max_model_len,
-            )
-            logger.info(f"Loading intern model: {intern_model}...")
-            intern_model_instance = VLLMInference(
-                model_name=intern_model,
-                gpu_id=args.gpu,
-                max_model_len=args.max_model_len,
-            )
-            all_results = {}
-            for token_level in token_levels:
-                logger.info(f"\nCollecting data for tokens={token_level}...")
-                results = collect_data_for_token_level(mentor_model_instance, intern_model_instance, data, token_level, args.batch_size, use_think=use_think)
-                all_results[token_level] = results
-
-        # Save results (sequential mode)
+        stats = collect_parallel(
+            mentor_model_name=mentor_model,
+            intern_model_name=intern_model,
+            max_model_len=args.max_model_len,
+            batch_size=args.batch_size,
+            data=data,
+            token_levels=token_levels,
+            gpus=gpus,
+            mentor_gpu_ids=mentor_gpu_ids,
+            intern_gpu_ids=intern_gpu_ids,
+            output_dir=output_subdir,
+            use_think=use_think,
+            mentor_memory_util=args.mentor_memory_util,
+            intern_memory_util=args.intern_memory_util,
+            mentor_max_model_len=args.mentor_max_model_len,
+            intern_max_model_len=args.intern_max_model_len,
+            force=args.force,
+        )
         for token_level in token_levels:
-            results = all_results.get(token_level, [])
-            correct = sum(1 for r in results if r['is_correct'])
-            accuracy = correct / len(results) if results else 0
-            logger.info(f"  tokens={token_level}: {accuracy:.4f} ({correct}/{len(results)})")
+            token_stats = stats.get(token_level)
+            if token_stats:
+                logger.info(
+                    "  tokens=%s: %.4f (%d/%d) saved to %s",
+                    token_level,
+                    token_stats['accuracy'],
+                    token_stats['correct'],
+                    token_stats['total'],
+                    token_stats['output_file'],
+                )
+            else:
+                logger.warning("  tokens=%s: no merged results found", token_level)
 
-            output_file = os.path.join(output_subdir, f"tokens{token_level}.json")
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(results, f, indent=2, ensure_ascii=False)
-            logger.info(f"  Saved to {output_file}")
-
-    if args.parallel:
-        logger.info(f"Parallel mode with {len(gpus)} GPUs: {gpus}")
-    else:
-        logger.info(f"Single GPU mode on GPU {args.gpu}")
-
+    logger.info(f"Parallel mode with {len(gpus)} GPUs: {gpus}")
     logger.info(f"Prompt mode: {'THINK (structured)' if use_think else 'STANDARD (no think)'}")
 
     if args.dataset == "math500":
@@ -961,46 +925,36 @@ def main():
         # hendrycks_math by subset
         subsets = [args.subset] if args.subset else MATH_SUBSETS
 
-        if args.parallel and len(subsets) > 1:
-            # Parallel mode: load all subsets and process together (ONE model init per GPU)
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Loading all {len(subsets)} subsets for parallel processing...")
-            logger.info(f"{'='*60}")
+        # Always use parallel mode: load all subsets and process together (ONE model init per GPU)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Loading all {len(subsets)} subsets for parallel processing...")
+        logger.info(f"{'='*60}")
 
-            all_tasks = []
-            for subset in subsets:
-                data = load_hendrycks_math_subset(subset, args.split)
-                output_subdir = os.path.join(args.output_dir, subset, args.split)
-                all_tasks.append((subset, output_subdir, data))
+        all_tasks = []
+        for subset in subsets:
+            data = load_hendrycks_math_subset(subset, args.split)
+            output_subdir = os.path.join(args.output_dir, subset, args.split)
+            all_tasks.append((subset, output_subdir, data))
 
-            logger.info(f"Total samples across all subsets: {sum(len(t[2]) for t in all_tasks)}")
+        logger.info(f"Total samples across all subsets: {sum(len(t[2]) for t in all_tasks)}")
 
-            collect_all_parallel(
-                mentor_model_name=mentor_model,
-                intern_model_name=intern_model,
-                max_model_len=args.max_model_len,
-                batch_size=args.batch_size,
-                all_tasks=all_tasks,
-                token_levels=token_levels,
-                gpus=gpus,
-                use_think=use_think,
-                mentor_gpu_ids=mentor_gpu_ids,
-                intern_gpu_ids=intern_gpu_ids,
-                mentor_memory_util=args.mentor_memory_util,
-                intern_memory_util=args.intern_memory_util,
-                mentor_max_model_len=args.mentor_max_model_len,
-                intern_max_model_len=args.intern_max_model_len,
-            )
-        else:
-            # Sequential mode or single subset
-            for subset in subsets:
-                logger.info(f"\n{'='*60}")
-                logger.info(f"Processing subset: {subset}")
-                logger.info(f"{'='*60}")
-
-                data = load_hendrycks_math_subset(subset, args.split)
-                output_subdir = os.path.join(args.output_dir, subset, args.split)
-                collect_and_save(data, output_subdir)
+        collect_all_parallel(
+            mentor_model_name=mentor_model,
+            intern_model_name=intern_model,
+            max_model_len=args.max_model_len,
+            batch_size=args.batch_size,
+            all_tasks=all_tasks,
+            token_levels=token_levels,
+            gpus=gpus,
+            mentor_gpu_ids=mentor_gpu_ids,
+            intern_gpu_ids=intern_gpu_ids,
+            use_think=use_think,
+            mentor_memory_util=args.mentor_memory_util,
+            intern_memory_util=args.intern_memory_util,
+            mentor_max_model_len=args.mentor_max_model_len,
+            intern_max_model_len=args.intern_max_model_len,
+            force=args.force,
+        )
 
     logger.info("\nData collection complete!")
 
