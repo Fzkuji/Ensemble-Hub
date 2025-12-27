@@ -438,6 +438,8 @@ def worker_process_all_tasks(
     mentor_max_model_len: int = None,
     intern_max_model_len: int = None,
     force: bool = False,
+    need_mentor: bool = True,
+    need_intern: bool = True,
 ):
     """Worker process that processes ALL subsets and token levels with TWO model inits.
 
@@ -477,47 +479,53 @@ def worker_process_all_tasks(
         intern_mem_util = intern_memory_util
         logger.info(f"[Worker {rank}] Using same GPU - memory utilization: mentor={mentor_mem_util}, intern={intern_mem_util}")
     
-    logger.info(f"[Worker {rank}] Initializing models (mentor on GPU {mentor_gpu}, intern on GPU {intern_gpu})...")
+    # Only load models that are needed
+    mentor_model = None
+    intern_model = None
 
-    # Initialize mentor model (large model)
-    logger.info(f"[Worker {rank}] Loading mentor model: {mentor_model_name} on GPU {mentor_gpu} (memory_util={mentor_mem_util}, max_len={mentor_max_len})...")
-    try:
-        mentor_model = VLLMInference(
-            model_name=mentor_model_name,
-            gpu_id=mentor_gpu,
-            max_model_len=mentor_max_len,
-            gpu_memory_utilization=mentor_mem_util,
-        )
-    except Exception as e:
-        logger.error(f"[Worker {rank}] Failed to load mentor model: {e}")
-        if using_different_gpus:
-            logger.error(f"[Worker {rank}] Try: 1) Reduce --mentor-max-model-len (current: {mentor_max_len})")
-            logger.error(f"[Worker {rank}]     2) Check if GPU {mentor_gpu} has enough free memory")
-        else:
-            logger.error(f"[Worker {rank}] Try: 1) Lower --mentor-memory-util (current: {mentor_mem_util})")
-            logger.error(f"[Worker {rank}]     2) Use separate GPU with --mentor-gpus")
-            logger.error(f"[Worker {rank}]     3) Reduce --mentor-max-model-len (current: {mentor_max_len})")
-        raise
+    if need_mentor:
+        logger.info(f"[Worker {rank}] Loading mentor model: {mentor_model_name} on GPU {mentor_gpu} (memory_util={mentor_mem_util}, max_len={mentor_max_len})...")
+        try:
+            mentor_model = VLLMInference(
+                model_name=mentor_model_name,
+                gpu_id=mentor_gpu,
+                max_model_len=mentor_max_len,
+                gpu_memory_utilization=mentor_mem_util,
+            )
+        except Exception as e:
+            logger.error(f"[Worker {rank}] Failed to load mentor model: {e}")
+            if using_different_gpus:
+                logger.error(f"[Worker {rank}] Try: 1) Reduce --mentor-max-model-len (current: {mentor_max_len})")
+                logger.error(f"[Worker {rank}]     2) Check if GPU {mentor_gpu} has enough free memory")
+            else:
+                logger.error(f"[Worker {rank}] Try: 1) Lower --mentor-memory-util (current: {mentor_mem_util})")
+                logger.error(f"[Worker {rank}]     2) Use separate GPU with --mentor-gpus")
+                logger.error(f"[Worker {rank}]     3) Reduce --mentor-max-model-len (current: {mentor_max_len})")
+            raise
+    else:
+        logger.info(f"[Worker {rank}] Skipping mentor model (not needed for token levels {token_levels})")
 
-    # Initialize intern model (small model)
-    logger.info(f"[Worker {rank}] Loading intern model: {intern_model_name} on GPU {intern_gpu} (memory_util={intern_mem_util}, max_len={intern_max_len})...")
-    try:
-        intern_model = VLLMInference(
-            model_name=intern_model_name,
-            gpu_id=intern_gpu,
-            max_model_len=intern_max_len,
-            gpu_memory_utilization=intern_mem_util,
-        )
-    except Exception as e:
-        logger.error(f"[Worker {rank}] Failed to load intern model: {e}")
-        if using_different_gpus:
-            logger.error(f"[Worker {rank}] Try: 1) Reduce --intern-max-model-len (current: {intern_max_len})")
-            logger.error(f"[Worker {rank}]     2) Check if GPU {intern_gpu} has enough free memory")
-        else:
-            logger.error(f"[Worker {rank}] Try: 1) Lower --intern-memory-util (current: {intern_mem_util})")
-            logger.error(f"[Worker {rank}]     2) Use separate GPU with --intern-gpus")
-            logger.error(f"[Worker {rank}]     3) Reduce --intern-max-model-len (current: {intern_max_len})")
-        raise
+    if need_intern:
+        logger.info(f"[Worker {rank}] Loading intern model: {intern_model_name} on GPU {intern_gpu} (memory_util={intern_mem_util}, max_len={intern_max_len})...")
+        try:
+            intern_model = VLLMInference(
+                model_name=intern_model_name,
+                gpu_id=intern_gpu,
+                max_model_len=intern_max_len,
+                gpu_memory_utilization=intern_mem_util,
+            )
+        except Exception as e:
+            logger.error(f"[Worker {rank}] Failed to load intern model: {e}")
+            if using_different_gpus:
+                logger.error(f"[Worker {rank}] Try: 1) Reduce --intern-max-model-len (current: {intern_max_len})")
+                logger.error(f"[Worker {rank}]     2) Check if GPU {intern_gpu} has enough free memory")
+            else:
+                logger.error(f"[Worker {rank}] Try: 1) Lower --intern-memory-util (current: {intern_mem_util})")
+                logger.error(f"[Worker {rank}]     2) Use separate GPU with --intern-gpus")
+                logger.error(f"[Worker {rank}]     3) Reduce --intern-max-model-len (current: {intern_max_len})")
+            raise
+    else:
+        logger.info(f"[Worker {rank}] Skipping intern model (not needed for token levels {token_levels})")
 
     logger.info(f"[Worker {rank}] Models loaded, processing {len(all_tasks)} subsets × {len(token_levels)} token levels")
 
@@ -604,6 +612,8 @@ def collect_parallel(
     mentor_max_model_len: int = None,
     intern_max_model_len: int = None,
     force: bool = False,
+    need_mentor: bool = True,
+    need_intern: bool = True,
 ) -> Dict[int, Dict[str, Any]]:
     """Collect data for a single dataset in parallel.
 
@@ -627,6 +637,8 @@ def collect_parallel(
         mentor_max_model_len=mentor_max_model_len,
         intern_max_model_len=intern_max_model_len,
         force=force,
+        need_mentor=need_mentor,
+        need_intern=need_intern,
     )
     return results.get("single", {})
 
@@ -674,29 +686,39 @@ def collect_all_parallel(
     mentor_max_model_len: int = None,
     intern_max_model_len: int = None,
     force: bool = False,
+    need_mentor: bool = True,
+    need_intern: bool = True,
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """Collect data for ALL subsets in parallel with TWO model inits per GPU.
 
     Workers merge results immediately after each (subset, token_level) completes.
-    
+
     Args:
-        mentor_gpu_ids: List of GPU IDs for mentor models (if None, uses gpus)
-        intern_gpu_ids: List of GPU IDs for intern models (if None, uses gpus)
+        mentor_gpu_ids: List of GPU IDs for mentor models (can be None if not needed)
+        intern_gpu_ids: List of GPU IDs for intern models (can be None if not needed)
         mentor_memory_util: GPU memory utilization for mentor model (default: 0.6)
         intern_memory_util: GPU memory utilization for intern model (default: 0.3)
+        need_mentor: Whether mentor model is needed (based on token levels)
+        need_intern: Whether intern model is needed (based on token levels)
     """
     world_size = len(gpus)
-    
-    # Validate GPU list lengths (should already be validated in main(), but double-check)
-    if len(mentor_gpu_ids) != world_size:
+
+    # Validate GPU list lengths (only for models that are needed)
+    if need_mentor and mentor_gpu_ids and len(mentor_gpu_ids) != world_size:
         raise ValueError(f"mentor_gpu_ids length ({len(mentor_gpu_ids)}) must match gpus length ({world_size})")
-    if len(intern_gpu_ids) != world_size:
+    if need_intern and intern_gpu_ids and len(intern_gpu_ids) != world_size:
         raise ValueError(f"intern_gpu_ids length ({len(intern_gpu_ids)}) must match gpus length ({world_size})")
 
     print(f"\n{'='*60}", flush=True)
     print(f"[MAIN] Starting parallel collection", flush=True)
-    print(f"[MAIN] Mentor model: {mentor_model_name} (GPU: {mentor_gpu_ids}, memory_util={mentor_memory_util})", flush=True)
-    print(f"[MAIN] Intern model: {intern_model_name} (GPU: {intern_gpu_ids}, memory_util={intern_memory_util})", flush=True)
+    if need_mentor:
+        print(f"[MAIN] Mentor model: {mentor_model_name} (GPU: {mentor_gpu_ids}, memory_util={mentor_memory_util})", flush=True)
+    else:
+        print(f"[MAIN] Mentor model: SKIPPED (not needed for token levels)", flush=True)
+    if need_intern:
+        print(f"[MAIN] Intern model: {intern_model_name} (GPU: {intern_gpu_ids}, memory_util={intern_memory_util})", flush=True)
+    else:
+        print(f"[MAIN] Intern model: SKIPPED (not needed for token levels)", flush=True)
     print(f"[MAIN] Workers: {world_size}", flush=True)
     print(f"[MAIN] Subsets: {len(all_tasks)}", flush=True)
     print(f"[MAIN] Token levels: {token_levels}", flush=True)
@@ -727,15 +749,20 @@ def collect_all_parallel(
     # Start all workers
     processes = []
     for rank, gpu_id in enumerate(gpus):
-        mentor_gpu = mentor_gpu_ids[rank]
-        intern_gpu = intern_gpu_ids[rank]
+        mentor_gpu = mentor_gpu_ids[rank] if mentor_gpu_ids else None
+        intern_gpu = intern_gpu_ids[rank] if intern_gpu_ids else None
         p = mp.Process(
             target=worker_process_all_tasks,
-            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force)
+            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern)
         )
         p.start()
         processes.append(p)
-        print(f"[MAIN] Started worker {rank} (mentor GPU {mentor_gpu}, intern GPU {intern_gpu}, PID: {p.pid})", flush=True)
+        gpu_info = []
+        if need_mentor:
+            gpu_info.append(f"mentor GPU {mentor_gpu}")
+        if need_intern:
+            gpu_info.append(f"intern GPU {intern_gpu}")
+        print(f"[MAIN] Started worker {rank} ({', '.join(gpu_info)}, PID: {p.pid})", flush=True)
 
     print(f"\n[MAIN] All {world_size} workers started. Waiting...\n", flush=True)
 
@@ -777,13 +804,13 @@ def main():
                         help="Experiment name for output directory (e.g., R1_m32B_i7B). If not set, uses model name.")
     parser.add_argument("--token-levels", type=str, default="0,100,500,1000",
                         help="Comma-separated token levels to collect")
-    # Parallel mode arguments (always enabled)
-    parser.add_argument("--gpus", type=str, required=True,
-                        help="Comma-separated list of worker GPUs (e.g., '0,1,2,3'). Each worker processes a shard of data.")
+    # Parallel mode arguments
+    parser.add_argument("--gpus", type=str, default=None,
+                        help="Comma-separated list of worker GPUs. Auto-inferred from --mentor-gpus/--intern-gpus if not specified.")
     parser.add_argument("--mentor-gpus", type=str, default=None,
-                        help="Comma-separated list of GPUs for mentor models (e.g., '0,1,2,3'). If not specified, uses --gpus.")
+                        help="Comma-separated list of GPUs for mentor model (e.g., '0,1,2,3,4,5,6,7').")
     parser.add_argument("--intern-gpus", type=str, default=None,
-                        help="Comma-separated list of GPUs for intern models (e.g., '4,5,6,7'). If not specified, uses --gpus.")
+                        help="Comma-separated list of GPUs for intern model (e.g., '0,1,2,3,4,5,6,7').")
     parser.add_argument("--mentor-memory-util", type=float, default=0.5,
                         help="GPU memory utilization for mentor model (default: 0.5, recommended: 0.4-0.6 for 32B models)")
     parser.add_argument("--intern-memory-util", type=float, default=0.3,
@@ -815,25 +842,71 @@ def main():
     # Parse token levels
     token_levels = [int(x) for x in args.token_levels.split(",")]
 
-    # Parse GPUs for parallel mode
-    gpus = [int(g.strip()) for g in args.gpus.split(",")]
-    
-    # Use --gpus as default if mentor/intern GPUs not specified
-    if args.mentor_gpus is None:
-        mentor_gpu_ids = gpus
+    # Determine which models are needed based on token levels
+    need_mentor = any(t == -1 or t > 0 for t in token_levels)  # -1 = mentor only, >0 = mentor + intern
+    need_intern = any(t == 0 or t > 0 for t in token_levels)   # 0 = intern only, >0 = mentor + intern
+
+    logger.info(f"Token levels {token_levels}: need_mentor={need_mentor}, need_intern={need_intern}")
+
+    # Parse GPU lists
+    # Parse --gpus if specified
+    gpus_from_arg = None
+    if args.gpus is not None and args.gpus.strip():
+        gpus_from_arg = [int(g.strip()) for g in args.gpus.split(",") if g.strip()]
+
+    # Parse mentor/intern GPU lists if specified
+    mentor_gpu_ids = None
+    intern_gpu_ids = None
+
+    if args.mentor_gpus is not None and args.mentor_gpus.strip():
+        mentor_gpu_ids = [int(g.strip()) for g in args.mentor_gpus.split(",") if g.strip()]
+    if args.intern_gpus is not None and args.intern_gpus.strip():
+        intern_gpu_ids = [int(g.strip()) for g in args.intern_gpus.split(",") if g.strip()]
+
+    # Determine worker GPUs based on what models are needed
+    if need_mentor and not need_intern:
+        # Only mentor needed
+        if mentor_gpu_ids:
+            gpus = mentor_gpu_ids
+            logger.info(f"Only mentor needed, using --mentor-gpus: {gpus}")
+        elif gpus_from_arg:
+            gpus = gpus_from_arg
+            mentor_gpu_ids = gpus
+            logger.info(f"Only mentor needed, using --gpus: {gpus}")
+        else:
+            raise ValueError("Must specify --mentor-gpus or --gpus when collecting mentor-only data (token_level=-1)")
+    elif need_intern and not need_mentor:
+        # Only intern needed
+        if intern_gpu_ids:
+            gpus = intern_gpu_ids
+            logger.info(f"Only intern needed, using --intern-gpus: {gpus}")
+        elif gpus_from_arg:
+            gpus = gpus_from_arg
+            intern_gpu_ids = gpus
+            logger.info(f"Only intern needed, using --gpus: {gpus}")
+        else:
+            raise ValueError("Must specify --intern-gpus or --gpus when collecting intern-only data (token_level=0)")
     else:
-        mentor_gpu_ids = [int(g.strip()) for g in args.mentor_gpus.split(",")]
-    
-    if args.intern_gpus is None:
-        intern_gpu_ids = gpus
-    else:
-        intern_gpu_ids = [int(g.strip()) for g in args.intern_gpus.split(",")]
-    
-    # Validate GPU list lengths match
-    if len(mentor_gpu_ids) != len(gpus):
-        raise ValueError(f"--mentor-gpus length ({len(mentor_gpu_ids)}) must match --gpus length ({len(gpus)})")
-    if len(intern_gpu_ids) != len(gpus):
-        raise ValueError(f"--intern-gpus length ({len(intern_gpu_ids)}) must match --gpus length ({len(gpus)})")
+        # Both models needed
+        if gpus_from_arg:
+            gpus = gpus_from_arg
+        elif mentor_gpu_ids and intern_gpu_ids and len(mentor_gpu_ids) == len(intern_gpu_ids):
+            # Infer from mentor/intern GPUs if they have same length
+            gpus = list(range(len(mentor_gpu_ids)))
+            logger.info(f"Inferred {len(gpus)} workers from --mentor-gpus and --intern-gpus")
+        else:
+            raise ValueError("Must specify --gpus when collecting data for both models, or ensure --mentor-gpus and --intern-gpus have same length")
+
+        if mentor_gpu_ids is None:
+            mentor_gpu_ids = gpus
+        if intern_gpu_ids is None:
+            intern_gpu_ids = gpus
+
+        # Validate GPU list lengths match
+        if len(mentor_gpu_ids) != len(gpus):
+            raise ValueError(f"--mentor-gpus length ({len(mentor_gpu_ids)}) must match worker count ({len(gpus)})")
+        if len(intern_gpu_ids) != len(gpus):
+            raise ValueError(f"--intern-gpus length ({len(intern_gpu_ids)}) must match worker count ({len(gpus)})")
 
     # Set output directory (default: server path)
     # Build experiment name from models
@@ -892,6 +965,8 @@ def main():
             mentor_max_model_len=args.mentor_max_model_len,
             intern_max_model_len=args.intern_max_model_len,
             force=args.force,
+            need_mentor=need_mentor,
+            need_intern=need_intern,
         )
         for token_level in token_levels:
             token_stats = stats.get(token_level)
@@ -990,6 +1065,8 @@ def main():
             mentor_max_model_len=args.mentor_max_model_len,
             intern_max_model_len=args.intern_max_model_len,
             force=args.force,
+            need_mentor=need_mentor,
+            need_intern=need_intern,
         )
 
     logger.info("\nData collection complete!")

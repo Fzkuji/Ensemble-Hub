@@ -189,12 +189,11 @@ collect_data_for_split() {
     
     echo "  [COLLECT] Split=$split, Token levels=$token_levels_str (all subsets)"
     
-    # Run data collection for all subsets at once (parallel mode)
+    # Run data collection for all subsets at once
     python collect_data_vllm_think.py \
         $MODEL_ARGS \
         --dataset hendrycks_math \
         --split "$split" \
-        --parallel \
         --gpus $GPUS \
         "--token-levels=$token_levels_str" \
         --output-dir "$DATA_DIR" \

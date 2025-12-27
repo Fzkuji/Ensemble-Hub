@@ -485,7 +485,7 @@ def eval_cascade(
         detailed['cascade_length'] = {
             'mentor_mean': np.mean(cascade_mentor_lens),
             'intern_mean': np.mean(cascade_intern_lens),
-        }
+    }
 
     return best_acc, best_thresholds, detailed
 
@@ -695,17 +695,17 @@ def main():
                 logger.error(f"Missing token levels: {missing_levels}")
                 logger.error("Please run data collection to generate missing data files.")
                 logger.error(f"Example command to collect missing data:")
-                logger.error(f"  python collect_data_vllm_think.py --split train --parallel --gpus 0,1,2,3,4,5,6,7 --token-levels \"{','.join(map(str, missing_levels))}\"")
+                logger.error(f"  python collect_data_vllm_think.py --split train --gpus 0,1,2,3,4,5,6,7 --token-levels \"{','.join(map(str, missing_levels))}\"")
         cleanup_distributed()
         return
-    
+
     if missing_levels:
         if is_main_process():
             logger.error(f"Missing required token levels: {missing_levels}")
             logger.error(f"Available levels: {available_levels}")
             logger.error("Training requires all token levels. Please collect missing data first.")
             logger.error(f"Example command to collect missing data:")
-            logger.error(f"  python collect_data_vllm_think.py --split train --parallel --gpus 0,1,2,3,4,5,6,7 --token-levels \"{','.join(map(str, missing_levels))}\"")
+            logger.error(f"  python collect_data_vllm_think.py --split train --gpus 0,1,2,3,4,5,6,7 --token-levels \"{','.join(map(str, missing_levels))}\"")
         cleanup_distributed()
         return
 

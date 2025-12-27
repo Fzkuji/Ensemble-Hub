@@ -39,7 +39,6 @@ echo "========== Step 1: Collect Training Data (hendrycks_math_all train) ======
 python collect_data_vllm_think.py \
     --dataset hendrycks_math_all \
     --split train \
-    --parallel \
     --gpus $GPUS \
     --no-think \
     --output-dir $DATA_DIR
@@ -48,7 +47,6 @@ echo ""
 echo "========== Step 2: Collect Test Data (MATH-500) =========="
 python collect_data_vllm_think.py \
     --dataset math500 \
-    --parallel \
     --gpus $GPUS \
     --no-think \
     --output-dir $DATA_DIR

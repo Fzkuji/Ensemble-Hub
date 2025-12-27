@@ -40,10 +40,10 @@ pip install torch transformers peft datasets scikit-learn tqdm numpy vllm
 cd /home/fzkuji/PycharmProjects/Ensemble-Hub/scripts/mentor_guided
 
 # 收集 train split（8 GPU 并行）
-python collect_data_vllm_think.py --split train --parallel --gpus 0,1,2,3,4,5,6,7
+python collect_data_vllm_think.py --split train --gpus 0,1,2,3,4,5,6,7
 
 # 收集 test split（8 GPU 并行）
-python collect_data_vllm_think.py --split test --parallel --gpus 0,1,2,3,4,5,6,7
+python collect_data_vllm_think.py --split test --gpus 0,1,2,3,4,5,6,7
 ```
 
 **输出目录**: `hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B/`
@@ -52,10 +52,10 @@ python collect_data_vllm_think.py --split test --parallel --gpus 0,1,2,3,4,5,6,7
 
 ```bash
 # 收集 train split（8 GPU 并行）
-python collect_data_vllm_think.py --split train --parallel --gpus 0,1,2,3,4,5,6,7 --no-think
+python collect_data_vllm_think.py --split train --gpus 0,1,2,3,4,5,6,7 --no-think
 
 # 收集 test split（8 GPU 并行）
-python collect_data_vllm_think.py --split test --parallel --gpus 0,1,2,3,4,5,6,7 --no-think
+python collect_data_vllm_think.py --split test --gpus 0,1,2,3,4,5,6,7 --no-think
 ```
 
 **输出目录**: `hendrycks_math_split_standard_DeepSeek-R1-Distill-Qwen-7B/`
@@ -76,8 +76,7 @@ python collect_data_vllm_think.py \
   --gpus 0,1,2,3 \
   --mentor-gpus 0,1,2,3 \
   --intern-gpus 4,5,6,7 \
-  --split train \
-  --parallel
+  --split train
 ```
 
 **优点**：
@@ -97,7 +96,6 @@ python collect_data_vllm_think.py \
   --mentor-memory-util 0.4 \
   --intern-memory-util 0.25 \
   --split train \
-  --parallel \
   --gpus 0,1,2,3,4,5,6,7
 ```
 
@@ -118,7 +116,6 @@ python collect_data_vllm_think.py \
   --intern-max-model-len 8192 \
   --mentor-memory-util 0.4 \
   --split train \
-  --parallel \
   --gpus 0,1,2,3,4,5,6,7
 ```
 
@@ -127,7 +124,6 @@ python collect_data_vllm_think.py \
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--split` | 数据集划分 | `test` |
-| `--parallel` | 启用多 GPU 并行 | - |
 | `--gpus` | GPU 列表 | `0,1,2,3,4,5,6,7` |
 | `--no-think` | 禁用思考（标准 prompt） | - |
 | `--model` | 模型名称（legacy，建议使用 --mentor-model 和 --intern-model） | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` |
@@ -434,7 +430,6 @@ TOTAL (weighted)          5000   0.5538  -       278.3   0.5723  81.2    234.6  
 python collect_data_vllm_think.py \
     --dataset math500 \
     --exp-name R1_m32B_i7B \
-    --parallel \
     --gpus 0,1,2,3,4,5,6,7
 
 # 输出目录将会是:
