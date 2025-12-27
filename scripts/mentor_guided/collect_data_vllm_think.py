@@ -954,6 +954,12 @@ def main():
                 logger.info(f"Skipping data collection. Use --force to re-collect.")
                 logger.info(f"{'='*60}\n")
                 return
+            else:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Some data files are missing for split={args.split}")
+                logger.info(f"Missing files ({len(missing_files)}): {missing_files[:5]}{'...' if len(missing_files) > 5 else ''}")
+                logger.info(f"Proceeding with data collection...")
+                logger.info(f"{'='*60}\n")
 
         # Always use parallel mode: load all subsets and process together (ONE model init per GPU)
         logger.info(f"\n{'='*60}")

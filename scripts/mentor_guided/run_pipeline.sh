@@ -256,15 +256,20 @@ echo "Eval subset: ${EVAL_SUBSET:-same as train}"
 echo "============================================================"
 
 # Helper function to check if data collection is complete for a subset/split
+# Checks all token levels: -1, 0, 100, 500, 1000
 check_data_exists() {
     local subset=$1
     local split=$2
-    local data_file="$DATA_DIR/$subset/$split/tokens0.json"
-    if [ -f "$data_file" ]; then
-        return 0  # exists
-    else
-        return 1  # not exists
-    fi
+    local subset_dir="$DATA_DIR/$subset/$split"
+    
+    # Check all required token levels
+    for token_level in -1 0 100 500 1000; do
+        local data_file="$subset_dir/tokens${token_level}.json"
+        if [ ! -f "$data_file" ]; then
+            return 1  # not exists
+        fi
+    done
+    return 0  # all exist
 }
 
 # Helper function to check if model already trained (from run_compare_classifier.sh)
