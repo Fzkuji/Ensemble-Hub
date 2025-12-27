@@ -780,10 +780,10 @@ def main():
     # Parallel mode arguments (always enabled)
     parser.add_argument("--gpus", type=str, required=True,
                         help="Comma-separated list of worker GPUs (e.g., '0,1,2,3'). Each worker processes a shard of data.")
-    parser.add_argument("--mentor-gpus", type=str, required=True,
-                        help="Comma-separated list of GPUs for mentor models (e.g., '0,1,2,3'). Must match --gpus length.")
-    parser.add_argument("--intern-gpus", type=str, required=True,
-                        help="Comma-separated list of GPUs for intern models (e.g., '4,5,6,7'). Must match --gpus length.")
+    parser.add_argument("--mentor-gpus", type=str, default=None,
+                        help="Comma-separated list of GPUs for mentor models (e.g., '0,1,2,3'). If not specified, uses --gpus.")
+    parser.add_argument("--intern-gpus", type=str, default=None,
+                        help="Comma-separated list of GPUs for intern models (e.g., '4,5,6,7'). If not specified, uses --gpus.")
     parser.add_argument("--mentor-memory-util", type=float, default=0.5,
                         help="GPU memory utilization for mentor model (default: 0.5, recommended: 0.4-0.6 for 32B models)")
     parser.add_argument("--intern-memory-util", type=float, default=0.3,
@@ -815,10 +815,19 @@ def main():
     # Parse token levels
     token_levels = [int(x) for x in args.token_levels.split(",")]
 
-    # Parse GPUs for parallel mode (all required)
+    # Parse GPUs for parallel mode
     gpus = [int(g.strip()) for g in args.gpus.split(",")]
-    mentor_gpu_ids = [int(g.strip()) for g in args.mentor_gpus.split(",")]
-    intern_gpu_ids = [int(g.strip()) for g in args.intern_gpus.split(",")]
+    
+    # Use --gpus as default if mentor/intern GPUs not specified
+    if args.mentor_gpus is None:
+        mentor_gpu_ids = gpus
+    else:
+        mentor_gpu_ids = [int(g.strip()) for g in args.mentor_gpus.split(",")]
+    
+    if args.intern_gpus is None:
+        intern_gpu_ids = gpus
+    else:
+        intern_gpu_ids = [int(g.strip()) for g in args.intern_gpus.split(",")]
     
     # Validate GPU list lengths match
     if len(mentor_gpu_ids) != len(gpus):
