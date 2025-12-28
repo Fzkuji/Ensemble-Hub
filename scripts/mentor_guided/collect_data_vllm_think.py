@@ -836,7 +836,7 @@ def main():
                         help="Split for hendrycks_math/hendrycks_math_all (ignored for math500)")
     parser.add_argument("--batch-size", type=int, default=8,
                         help="Batch size for inference")
-    parser.add_argument("--max-model-len", type=int, default=8192,
+    parser.add_argument("--max-model-len", type=int, default=4096,
                         help="Maximum model context length")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory")
