@@ -888,6 +888,27 @@ def main():
 
     logger.info(f"Token levels {token_levels}: need_mentor={need_mentor}, need_intern={need_intern}")
 
+    # Auto-calculate mentor max_model_len if not specified
+    # When mentor only generates partial tokens (not full answer), it needs much less context
+    if args.mentor_max_model_len is None and need_mentor:
+        mentor_only_mode = -1 in token_levels  # -1 means mentor generates full answer
+        if mentor_only_mode:
+            # Mentor generates full answer, use default max_model_len
+            args.mentor_max_model_len = args.max_model_len
+            logger.info(f"Mentor in full-generation mode, using max_model_len={args.mentor_max_model_len}")
+        else:
+            # Mentor only generates partial tokens, calculate optimal length
+            # max_tokens needed = max(token_levels) for generation
+            # plus ~1024 buffer for prompt (question + system prompt + chat template)
+            max_mentor_tokens = max(t for t in token_levels if t > 0)
+            # Buffer for prompt: ~512 tokens for question, ~256 for system/template
+            prompt_buffer = 1024
+            optimal_mentor_len = max_mentor_tokens + prompt_buffer
+            # Round up to nearest power of 2 for efficiency, min 2048
+            optimal_mentor_len = max(2048, 2 ** (optimal_mentor_len - 1).bit_length())
+            args.mentor_max_model_len = optimal_mentor_len
+            logger.info(f"Mentor in partial-generation mode (max {max_mentor_tokens} tokens), auto-set max_model_len={args.mentor_max_model_len}")
+
     # Parse GPU lists
     # Parse --gpus if specified
     gpus_from_arg = None
