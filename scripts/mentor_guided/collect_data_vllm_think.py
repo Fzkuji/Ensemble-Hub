@@ -48,8 +48,105 @@ logger = logging.getLogger(__name__)
 TOKEN_LEVELS = [0, 100, 500, 1000]
 MENTOR_ONLY_LEVEL = -1  # Special level for mentor-only baseline
 
+# =============================================================================
+# Dataset Configurations
+# =============================================================================
+# Each dataset config specifies:
+#   - hf_path: HuggingFace dataset path
+#   - hf_subset: HuggingFace subset name (None if not applicable)
+#   - splits: Available splits (train, test, etc.)
+#   - question_field: Field name for the question/problem
+#   - answer_field: Field name for the answer/solution
+#   - answer_parser: How to parse the answer (None = use as-is, 'gsm8k' = extract from ####)
+#   - subsets: List of subsets (for datasets with multiple subjects)
+#   - extra_fields: Additional fields to preserve (e.g., 'type', 'level')
+#
+DATASET_CONFIGS = {
+    "hendrycks_math": {
+        "hf_path": "hendrycks/competition_math",
+        "hf_subset": None,  # subset is specified via 'type' field
+        "splits": ["train", "test"],
+        "question_field": "problem",
+        "answer_field": "solution",
+        "answer_parser": None,  # Use solution directly with grader
+        "subsets": [
+            "algebra",
+            "counting_and_probability",
+            "geometry",
+            "intermediate_algebra",
+            "number_theory",
+            "prealgebra",
+            "precalculus",
+        ],
+        "extra_fields": ["type", "level"],
+    },
+    "math500": {
+        "hf_path": "HuggingFaceH4/MATH-500",
+        "hf_subset": None,
+        "splits": ["test"],  # Only test split available
+        "question_field": "problem",
+        "answer_field": "solution",
+        "answer_parser": None,
+        "subsets": ["math500"],  # Single subset
+        "extra_fields": ["type", "level"],
+    },
+    "gsm8k": {
+        "hf_path": "openai/gsm8k",
+        "hf_subset": "main",
+        "splits": ["train", "test"],
+        "question_field": "question",
+        "answer_field": "answer",
+        "answer_parser": "gsm8k",  # Extract number after ####
+        "subsets": ["gsm8k"],  # Single subset
+        "extra_fields": [],
+    },
+    # Future datasets can be added here:
+    # "aime": {
+    #     "hf_path": "...",
+    #     "hf_subset": None,
+    #     "splits": ["train", "test"],
+    #     "question_field": "problem",
+    #     "answer_field": "answer",
+    #     "answer_parser": None,
+    #     "subsets": ["aime"],
+    #     "extra_fields": ["year", "problem_number"],
+    # },
+}
+
 # Simple system prompt (ACT-E uses simple prompts)
 SYSTEM_PROMPT = """Please reason step by step, and put your final answer within \\boxed{}."""
+
+
+def parse_answer(raw_answer: str, parser_type: Optional[str] = None) -> str:
+    """Parse answer based on dataset-specific format.
+
+    Args:
+        raw_answer: Raw answer string from dataset
+        parser_type: Parser type from DATASET_CONFIGS['answer_parser']
+                    None = use as-is
+                    'gsm8k' = extract number after ####
+
+    Returns:
+        Parsed answer string
+    """
+    import re
+
+    if parser_type is None:
+        return raw_answer
+
+    if parser_type == "gsm8k":
+        # GSM8K format: "... #### 42" -> extract "42"
+        match = re.search(r'####\s*(.+)$', raw_answer)
+        if match:
+            final_answer = match.group(1).strip()
+            # Remove commas from numbers (e.g., "1,234" -> "1234")
+            final_answer = final_answer.replace(',', '')
+            return final_answer
+        return raw_answer
+
+    # Unknown parser type, return as-is
+    logger.warning(f"Unknown answer parser type: {parser_type}")
+    return raw_answer
 
 
 def extract_boxed_answer(text: str) -> str:
@@ -303,6 +400,119 @@ def load_math500() -> List[Dict[str, Any]]:
         })
 
     logger.info(f"  Loaded {len(data)} problems from MATH-500")
+    return data
+
+
+def load_gsm8k(split: str = "test") -> List[Dict[str, Any]]:
+    """Load GSM8K dataset from openai/gsm8k.
+
+    Args:
+        split: "train" or "test"
+
+    Returns:
+        List of GSM8K problems
+    """
+    from datasets import load_dataset
+    import re
+
+    logger.info(f"Loading openai/gsm8k main ({split})...")
+    dataset = load_dataset("openai/gsm8k", "main", split=split)
+
+    data = []
+    for item in dataset:
+        question = item['question']
+        answer_raw = item['answer']
+        # Extract final answer from "#### <number>" format
+        match = re.search(r'####\s*(.+)$', answer_raw)
+        if match:
+            final_answer = match.group(1).strip()
+            # Remove commas from numbers (e.g., "1,234" -> "1234")
+            final_answer = final_answer.replace(',', '')
+        else:
+            final_answer = answer_raw
+
+        data.append({
+            'question': question,
+            'ground_truth': final_answer,
+            'full_solution': answer_raw,
+            'subset': 'gsm8k',
+        })
+
+    logger.info(f"  Loaded {len(data)} problems from GSM8K ({split})")
+    return data
+
+
+def load_dataset_generic(dataset_name: str, split: str = "test", subset: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Generic dataset loader using DATASET_CONFIGS.
+
+    This function can load any dataset defined in DATASET_CONFIGS.
+    For datasets with multiple subsets (like hendrycks_math), specify the subset parameter.
+
+    Args:
+        dataset_name: Name of dataset (key in DATASET_CONFIGS)
+        split: Data split ("train" or "test")
+        subset: Specific subset for multi-subset datasets (e.g., "algebra" for hendrycks_math)
+
+    Returns:
+        List of problem dictionaries with 'question', 'ground_truth', 'subset' fields
+    """
+    from datasets import load_dataset as hf_load_dataset
+
+    if dataset_name not in DATASET_CONFIGS:
+        raise ValueError(f"Unknown dataset: {dataset_name}. Available: {list(DATASET_CONFIGS.keys())}")
+
+    config = DATASET_CONFIGS[dataset_name]
+
+    # Validate split
+    if split not in config["splits"]:
+        raise ValueError(f"Split '{split}' not available for {dataset_name}. Available: {config['splits']}")
+
+    # Load from HuggingFace
+    hf_path = config["hf_path"]
+    hf_subset = config["hf_subset"]
+
+    logger.info(f"Loading {hf_path} (subset={hf_subset}, split={split})...")
+    if hf_subset:
+        dataset = hf_load_dataset(hf_path, hf_subset, split=split)
+    else:
+        dataset = hf_load_dataset(hf_path, split=split)
+
+    # Parse each item
+    data = []
+    question_field = config["question_field"]
+    answer_field = config["answer_field"]
+    answer_parser = config.get("answer_parser")
+    extra_fields = config.get("extra_fields", [])
+
+    for item in dataset:
+        # Filter by subset if specified (for multi-subset datasets like hendrycks_math)
+        if subset and "type" in item:
+            item_type = item["type"].lower().replace(" ", "_")
+            if item_type != subset.lower().replace(" ", "_"):
+                continue
+
+        question = item[question_field]
+        raw_answer = item[answer_field]
+        ground_truth = parse_answer(raw_answer, answer_parser)
+
+        entry = {
+            'question': question,
+            'ground_truth': ground_truth,
+            'subset': subset if subset else config["subsets"][0],
+        }
+
+        # Preserve full solution for GSM8K-like datasets
+        if answer_parser:
+            entry['full_solution'] = raw_answer
+
+        # Add extra fields
+        for field in extra_fields:
+            if field in item:
+                entry[field] = item[field]
+
+        data.append(entry)
+
+    logger.info(f"  Loaded {len(data)} problems from {dataset_name} ({split})")
     return data
 
 
@@ -858,8 +1068,8 @@ def main():
     parser.add_argument("--intern-model", type=str, default=None,
                         help="Intern model name (small model, e.g., 7B). If not set, uses --model")
     parser.add_argument("--dataset", type=str, default="hendrycks_math",
-                        choices=["hendrycks_math", "math500", "hendrycks_math_all"],
-                        help="Dataset: hendrycks_math (by subset), math500 (MATH-500), hendrycks_math_all (all subsets merged)")
+                        choices=["hendrycks_math", "math500", "hendrycks_math_all", "gsm8k"],
+                        help="Dataset: hendrycks_math (by subset), math500 (MATH-500), hendrycks_math_all (all subsets merged), gsm8k (GSM8K)")
     parser.add_argument("--subset", type=str, default=None,
                         help="Specific subset for hendrycks_math (e.g., algebra). If None, process all subsets")
     parser.add_argument("--split", type=str, default="test",
@@ -1210,6 +1420,16 @@ def main():
 
         data = load_hendrycks_math_all(args.split)
         output_subdir = os.path.join(args.output_dir, "all", args.split)
+        collect_and_save(data, output_subdir)
+
+    elif args.dataset == "gsm8k":
+        # GSM8K dataset
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing GSM8K ({args.split})")
+        logger.info(f"{'='*60}")
+
+        data = load_gsm8k(args.split)
+        output_subdir = os.path.join(args.output_dir, "gsm8k", args.split)
         collect_and_save(data, output_subdir)
 
     else:

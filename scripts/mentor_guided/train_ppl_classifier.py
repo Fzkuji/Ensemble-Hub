@@ -46,7 +46,8 @@ _memory_lock_tensors = {}
 
 TOKEN_LEVELS = [0, 100, 500, 1000]
 
-SUBSETS = [
+# Default subsets for hendrycks_math (used as fallback)
+DEFAULT_SUBSETS = [
     "algebra",
     "counting_and_probability",
     "geometry",
@@ -55,6 +56,23 @@ SUBSETS = [
     "prealgebra",
     "precalculus",
 ]
+
+
+def detect_subsets(data_dir: str, split: str = "test") -> List[str]:
+    """Auto-detect subsets from data directory."""
+    subsets = []
+    if not os.path.exists(data_dir):
+        return DEFAULT_SUBSETS
+
+    for name in os.listdir(data_dir):
+        subset_dir = os.path.join(data_dir, name, split)
+        # Check if it's a valid subset directory (has tokens*.json files)
+        if os.path.isdir(subset_dir):
+            token_file = os.path.join(subset_dir, "tokens0.json")
+            if os.path.exists(token_file):
+                subsets.append(name)
+
+    return sorted(subsets) if subsets else DEFAULT_SUBSETS
 
 
 def setup_distributed():
@@ -497,14 +515,11 @@ def main():
                         help="Base directory with subset folders")
     # Support both old --subset and new --train-subset for compatibility
     parser.add_argument("--subset", type=str, default=None,
-                        choices=SUBSETS + ["all"],
                         help="(Legacy) Same as --train-subset")
     parser.add_argument("--train-subset", type=str, default=None,
-                        choices=SUBSETS + ["all"],
-                        help="Training subset. 'all' merges all subsets.")
+                        help="Training subset. 'all' merges all subsets. Auto-detected from data-dir.")
     parser.add_argument("--eval-subset", type=str, default=None,
-                        choices=SUBSETS + ["all"],
-                        help="Evaluation subset. 'all' evaluates each separately. Default: same as train.")
+                        help="Evaluation subset. 'all' evaluates each separately. Auto-detected from data-dir.")
     parser.add_argument("--model-path", type=str,
                         default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
     parser.add_argument("--output-dir", type=str, default=None)
@@ -585,7 +600,7 @@ def main():
 
     # Determine training subsets
     if args.train_subset == "all":
-        train_subsets = SUBSETS
+        train_subsets = detect_subsets(args.data_dir, "train")
         output_base = os.path.join(args.data_dir, "all")
     else:
         train_subsets = [args.train_subset]
@@ -593,7 +608,7 @@ def main():
 
     # Determine evaluation subsets
     if args.eval_subset == "all":
-        eval_subsets = SUBSETS
+        eval_subsets = detect_subsets(args.data_dir, "test")
     else:
         eval_subsets = [args.eval_subset]
 

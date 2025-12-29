@@ -7,6 +7,7 @@
 #   --think               Enable thinking mode (default)
 #   --no-think            Disable thinking mode (standard prompt)
 #   --model MODEL         Model name (default: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B)
+#   --dataset DATASET     Dataset: hendrycks_math, math500, gsm8k (default: hendrycks_math)
 #   --subset SUBSET       (Legacy) Sets both train and eval subset
 #   --train-subset SUBSET Which subset(s) for training. 'all' merges all subsets.
 #   --eval-subset SUBSET  Which subset(s) for eval. 'all' tests each subset separately.
@@ -29,6 +30,7 @@
 #   ./run_pipeline.sh --train-subset all --eval-subset algebra   # Train on all, test on algebra
 #   ./run_pipeline.sh --train-subset all --eval-subset all       # Train on all, test each separately
 #   ./run_pipeline.sh --subset algebra                           # Train & test on algebra only
+#   ./run_pipeline.sh --dataset gsm8k                            # Run on GSM8K dataset
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +42,7 @@ USE_THINK=true
 MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 MENTOR_MODEL=""
 INTERN_MODEL=""
+DATASET="hendrycks_math"
 SUBSET=""
 TRAIN_SUBSET=""
 EVAL_SUBSET=""
@@ -82,6 +85,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --intern-model)
             INTERN_MODEL="$2"
+            shift 2
+            ;;
+        --dataset)
+            DATASET="$2"
             shift 2
             ;;
         --subset)
@@ -185,10 +192,31 @@ else
     THINK_FLAG="--no-think"
 fi
 
-DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_${MODE}_${MODEL_NAME}"
+# Set data directory and subsets based on dataset
+case "$DATASET" in
+    hendrycks_math)
+        DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_${MODE}_${MODEL_NAME}"
+        ALL_SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
+        DATASET_FLAG=""
+        ;;
+    math500)
+        DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/math500_${MODE}_${MODEL_NAME}"
+        ALL_SUBSETS=(math500)
+        DATASET_FLAG="--dataset math500"
+        ;;
+    gsm8k)
+        DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/gsm8k_${MODE}_${MODEL_NAME}"
+        ALL_SUBSETS=(gsm8k)
+        DATASET_FLAG="--dataset gsm8k"
+        ;;
+    *)
+        echo "Unknown dataset: $DATASET"
+        echo "Supported datasets: hendrycks_math, math500, gsm8k"
+        exit 1
+        ;;
+esac
 
 # Handle subset arguments: --subset sets both, individual args override
-ALL_SUBSETS=(algebra counting_and_probability geometry intermediate_algebra number_theory prealgebra precalculus)
 
 # If --subset is set, use it as default for both train and eval
 if [ -n "$SUBSET" ]; then
@@ -241,6 +269,7 @@ fi
 echo "============================================================"
 echo "DeepSeek R1 vLLM Pipeline"
 echo "============================================================"
+echo "Dataset: $DATASET"
 echo "Mode: $MODE"
 echo "Model: $MODEL"
 if [ -n "$MENTOR_MODEL" ]; then
@@ -304,7 +333,7 @@ if [ ${#TRAIN_MISSING[@]} -eq 0 ]; then
 else
     echo "Missing train data for: ${TRAIN_MISSING[*]}"
     echo "Collecting train data (existing files will be skipped)..."
-    python collect_data_vllm_think.py $MODEL_ARGS --split train --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG
+    python collect_data_vllm_think.py $MODEL_ARGS --split train --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $DATASET_FLAG
 fi
 
 # Check if test data already exists (show which subsets are missing)
@@ -320,7 +349,7 @@ if [ ${#TEST_MISSING[@]} -eq 0 ]; then
 else
     echo "Missing test data for: ${TEST_MISSING[*]}"
     echo "Collecting test data (existing files will be skipped)..."
-    python collect_data_vllm_think.py $MODEL_ARGS --split test --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG
+    python collect_data_vllm_think.py $MODEL_ARGS --split test --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $DATASET_FLAG
 fi
 
 echo ""

@@ -14,7 +14,8 @@ from typing import Dict, List
 
 TOKEN_LEVELS = [0, 100, 500, 1000]
 
-SUBSETS = [
+# Default subsets for hendrycks_math (used as fallback)
+DEFAULT_SUBSETS = [
     "algebra",
     "counting_and_probability",
     "geometry",
@@ -23,6 +24,23 @@ SUBSETS = [
     "prealgebra",
     "precalculus",
 ]
+
+
+def detect_subsets(data_dir: str, split: str = "test") -> List[str]:
+    """Auto-detect subsets from data directory."""
+    subsets = []
+    if not os.path.exists(data_dir):
+        return DEFAULT_SUBSETS
+
+    for name in os.listdir(data_dir):
+        subset_dir = os.path.join(data_dir, name, split)
+        # Check if it's a valid subset directory (has tokens*.json files)
+        if os.path.isdir(subset_dir):
+            token_file = os.path.join(subset_dir, "tokens0.json")
+            if os.path.exists(token_file):
+                subsets.append(name)
+
+    return sorted(subsets) if subsets else DEFAULT_SUBSETS
 
 
 def load_json_data(filepath: str) -> List[Dict]:
@@ -106,7 +124,11 @@ def main():
 
     results = {}
 
-    for subset in SUBSETS:
+    # Auto-detect subsets from data directory
+    subsets = detect_subsets(args.data_dir, args.split)
+    print(f"Detected subsets: {subsets}")
+
+    for subset in subsets:
         stats = compute_stats(args.data_dir, subset, args.split)
         if stats:
             results[subset] = stats
@@ -128,7 +150,7 @@ def main():
     total_n = 0
     total_oracle_correct = 0
 
-    for subset in SUBSETS:
+    for subset in subsets:
         if subset in results:
             s = results[subset]
             total_n += s['n_samples']

@@ -10,9 +10,11 @@ Usage:
 import argparse
 import json
 import os
+from typing import List
 import numpy as np
 
-SUBSETS = [
+# Default subsets for hendrycks_math (used as fallback)
+DEFAULT_SUBSETS = [
     "algebra",
     "counting_and_probability",
     "geometry",
@@ -21,6 +23,23 @@ SUBSETS = [
     "prealgebra",
     "precalculus",
 ]
+
+
+def detect_subsets(data_dir: str, split: str = "test") -> List[str]:
+    """Auto-detect subsets from data directory."""
+    subsets = []
+    if not os.path.exists(data_dir):
+        return DEFAULT_SUBSETS
+
+    for name in os.listdir(data_dir):
+        subset_dir = os.path.join(data_dir, name, split)
+        # Check if it's a valid subset directory (has tokens*.json files)
+        if os.path.isdir(subset_dir):
+            token_file = os.path.join(subset_dir, "tokens0.json")
+            if os.path.exists(token_file):
+                subsets.append(name)
+
+    return sorted(subsets) if subsets else DEFAULT_SUBSETS
 
 # Token levels: -1 = mentor only, 0 = intern only, others = mentor hint + intern
 TOKEN_LEVELS = [0, 100, 500, 1000]
@@ -122,12 +141,16 @@ def compute_length_stats(data_dir: str, subset: str, split: str = "test"):
 
 def summarize(data_dir: str, show_length: bool = True, model_source: str = "individual"):
     """汇总所有子集的结果
-    
+
     Args:
         data_dir: 数据目录
         show_length: 是否显示长度统计
         model_source: 模型来源 - "individual" (各子集单独训练), "all" (合并训练)
     """
+    # Auto-detect subsets from data directory
+    SUBSETS = detect_subsets(data_dir, "test")
+    print(f"Detected subsets: {SUBSETS}")
+
     # Mentor 列宽度 (acc + len)
     W_MENTOR = W_ACC + W_LEN
     # 计算实际行宽 (T0-T1000 各 24, Mentor 16, Oracle/Cascade 各 24)
