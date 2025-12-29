@@ -291,35 +291,35 @@ check_model_exists() {
 echo ""
 echo "========== Step 1: Collect Data (${NUM_GPUS} GPUs parallel) =========="
 
-# Check if train data already exists
-TRAIN_EXISTS=true
+# Check if train data already exists (show which subsets are missing)
+TRAIN_MISSING=()
 for subset in "${DATA_SUBSETS[@]}"; do
     if ! check_data_exists "$subset" "train"; then
-        TRAIN_EXISTS=false
-        break
+        TRAIN_MISSING+=("$subset")
     fi
 done
 
-if [ "$TRAIN_EXISTS" = true ]; then
-    echo "Train data already exists, skipping collection..."
+if [ ${#TRAIN_MISSING[@]} -eq 0 ]; then
+    echo "Train data already exists for all subsets, skipping collection..."
 else
-    echo "Collecting train data..."
+    echo "Missing train data for: ${TRAIN_MISSING[*]}"
+    echo "Collecting train data (existing files will be skipped)..."
     python collect_data_vllm_think.py $MODEL_ARGS --split train --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG
 fi
 
-# Check if test data already exists
-TEST_EXISTS=true
+# Check if test data already exists (show which subsets are missing)
+TEST_MISSING=()
 for subset in "${DATA_SUBSETS[@]}"; do
     if ! check_data_exists "$subset" "test"; then
-        TEST_EXISTS=false
-        break
+        TEST_MISSING+=("$subset")
     fi
 done
 
-if [ "$TEST_EXISTS" = true ]; then
-    echo "Test data already exists, skipping collection..."
+if [ ${#TEST_MISSING[@]} -eq 0 ]; then
+    echo "Test data already exists for all subsets, skipping collection..."
 else
-    echo "Collecting test data..."
+    echo "Missing test data for: ${TEST_MISSING[*]}"
+    echo "Collecting test data (existing files will be skipped)..."
     python collect_data_vllm_think.py $MODEL_ARGS --split test --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG
 fi
 
