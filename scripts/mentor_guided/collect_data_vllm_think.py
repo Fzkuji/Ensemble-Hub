@@ -922,6 +922,27 @@ def main():
     if args.intern_gpus is not None and args.intern_gpus.strip():
         intern_gpu_ids = [int(g.strip()) for g in args.intern_gpus.split(",") if g.strip()]
 
+    # Auto-detect available GPUs if none specified
+    def get_available_gpus():
+        """Detect available GPUs from CUDA_VISIBLE_DEVICES or nvidia-smi."""
+        import subprocess
+        # First check CUDA_VISIBLE_DEVICES
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if cuda_visible:
+            return [int(g.strip()) for g in cuda_visible.split(",") if g.strip()]
+        # Otherwise use nvidia-smi to count GPUs
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                return [int(line.strip()) for line in result.stdout.strip().split("\n") if line.strip()]
+        except Exception:
+            pass
+        # Default to GPU 0
+        return [0]
+
     # Determine worker GPUs based on what models are needed
     if need_mentor and not need_intern:
         # Only mentor needed
@@ -933,7 +954,10 @@ def main():
             mentor_gpu_ids = gpus
             logger.info(f"Only mentor needed, using --gpus: {gpus}")
         else:
-            raise ValueError("Must specify --mentor-gpus or --gpus when collecting mentor-only data (token_level=-1)")
+            # Auto-detect GPUs
+            gpus = get_available_gpus()
+            mentor_gpu_ids = gpus
+            logger.info(f"Only mentor needed, auto-detected GPUs: {gpus}")
     elif need_intern and not need_mentor:
         # Only intern needed
         if intern_gpu_ids:
@@ -944,28 +968,51 @@ def main():
             intern_gpu_ids = gpus
             logger.info(f"Only intern needed, using --gpus: {gpus}")
         else:
-            raise ValueError("Must specify --intern-gpus or --gpus when collecting intern-only data (token_level=0)")
+            # Auto-detect GPUs
+            gpus = get_available_gpus()
+            intern_gpu_ids = gpus
+            logger.info(f"Only intern needed, auto-detected GPUs: {gpus}")
     else:
         # Both models needed
-        if gpus_from_arg:
-            gpus = gpus_from_arg
-        elif mentor_gpu_ids and intern_gpu_ids and len(mentor_gpu_ids) == len(intern_gpu_ids):
-            # Infer from mentor/intern GPUs if they have same length
+        if mentor_gpu_ids and intern_gpu_ids:
+            # Both explicitly specified
             gpus = list(range(len(mentor_gpu_ids)))
-            logger.info(f"Inferred {len(gpus)} workers from --mentor-gpus and --intern-gpus")
+            logger.info(f"Using explicit GPU assignment: mentor={mentor_gpu_ids}, intern={intern_gpu_ids}")
+        elif gpus_from_arg:
+            # Auto-split GPUs in half for mentor and intern
+            gpus = gpus_from_arg
+            num_gpus = len(gpus)
+            if num_gpus >= 2:
+                half = num_gpus // 2
+                mentor_gpu_ids = gpus[:half]
+                intern_gpu_ids = gpus[half:]
+                logger.info(f"Auto-split {num_gpus} GPUs: mentor={mentor_gpu_ids}, intern={intern_gpu_ids}")
+            else:
+                # Single GPU: both models share it
+                mentor_gpu_ids = gpus
+                intern_gpu_ids = gpus
+                logger.info(f"Single GPU mode: both models on GPU {gpus}")
         else:
-            raise ValueError("Must specify --gpus when collecting data for both models, or ensure --mentor-gpus and --intern-gpus have same length")
+            # Auto-detect and split
+            available_gpus = get_available_gpus()
+            num_gpus = len(available_gpus)
+            if num_gpus >= 2:
+                half = num_gpus // 2
+                mentor_gpu_ids = available_gpus[:half]
+                intern_gpu_ids = available_gpus[half:]
+                gpus = list(range(half))  # Worker count = half (each worker has one mentor GPU + one intern GPU)
+                logger.info(f"Auto-detected {num_gpus} GPUs, split: mentor={mentor_gpu_ids}, intern={intern_gpu_ids}")
+            else:
+                # Single GPU: both models share it
+                gpus = available_gpus
+                mentor_gpu_ids = available_gpus
+                intern_gpu_ids = available_gpus
+                logger.info(f"Auto-detected single GPU: both models on GPU {gpus}")
 
-        if mentor_gpu_ids is None:
-            mentor_gpu_ids = gpus
-        if intern_gpu_ids is None:
-            intern_gpu_ids = gpus
-
-        # Validate GPU list lengths match
-        if len(mentor_gpu_ids) != len(gpus):
-            raise ValueError(f"--mentor-gpus length ({len(mentor_gpu_ids)}) must match worker count ({len(gpus)})")
-        if len(intern_gpu_ids) != len(gpus):
-            raise ValueError(f"--intern-gpus length ({len(intern_gpu_ids)}) must match worker count ({len(gpus)})")
+        # Validate GPU list lengths match for data parallelism
+        if len(mentor_gpu_ids) != len(intern_gpu_ids):
+            raise ValueError(f"mentor_gpu_ids length ({len(mentor_gpu_ids)}) must match intern_gpu_ids length ({len(intern_gpu_ids)})")
+        gpus = list(range(len(mentor_gpu_ids)))
 
     # Set output directory (default: server path)
     # Build experiment name from models
