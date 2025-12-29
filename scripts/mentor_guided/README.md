@@ -304,11 +304,16 @@ TOTAL (weighted)          5000   0.5538  -       278.3   0.5723  81.2    234.6  
 # 使用不同的 Mentor 和 Intern 模型（推荐）
 ./run_pipeline.sh \
   --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
-  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
-  --think
+  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 
 # 使用同一个模型
-./run_pipeline.sh --model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" --think
+./run_pipeline.sh --model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+
+# 禁用 think 模式
+./run_pipeline.sh \
+  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
+  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
+  --no-think
 ```
 
 ### 7.2 参数说明
