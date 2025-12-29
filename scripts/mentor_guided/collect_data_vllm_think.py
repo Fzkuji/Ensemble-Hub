@@ -126,6 +126,30 @@ class VLLMInference:
         self.SamplingParams = SamplingParams
         logger.info("Model loaded successfully")
 
+    def cleanup(self):
+        """Clean up vLLM resources."""
+        if hasattr(self, 'model') and self.model is not None:
+            try:
+                # vLLM's LLM class doesn't have a built-in cleanup method
+                # but we can delete the model to trigger garbage collection
+                del self.model
+                self.model = None
+                import gc
+                gc.collect()
+                # Try to clean up CUDA memory
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Error during cleanup: {e}")
+
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        self.cleanup()
+
     def build_chat_prompt(
         self,
         question: str,
@@ -586,6 +610,14 @@ def worker_process_all_tasks(
                     pass
 
     logger.info(f"[Worker {rank}] All tasks completed")
+
+    # Clean up models before exit
+    if mentor_model is not None:
+        mentor_model.cleanup()
+    if intern_model is not None:
+        intern_model.cleanup()
+
+    # Use os._exit to avoid hanging on multiprocessing cleanup
     os._exit(0)
 
 
@@ -1245,6 +1277,10 @@ def main():
         )
 
     logger.info("\nData collection complete!")
+
+    # Force exit to avoid hanging on cleanup
+    import sys
+    sys.exit(0)
 
 
 if __name__ == "__main__":
