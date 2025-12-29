@@ -82,29 +82,7 @@ python collect_data_vllm_think.py \
   --split train --no-think
 ```
 
-### 2.4 手动指定 GPU（可选）
-
-如果需要精确控制 GPU 分配：
-
-```bash
-# 方式 1：指定总 GPU 列表（自动分半）
-python collect_data_vllm_think.py \
-  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
-  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
-  --gpus 0,1,2,3,4,5,6,7 \
-  --split train
-# 结果：mentor=[0,1,2,3], intern=[4,5,6,7]
-
-# 方式 2：分别指定（完全控制）
-python collect_data_vllm_think.py \
-  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
-  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
-  --mentor-gpus 0,1,2,3 \
-  --intern-gpus 4,5,6,7 \
-  --split train
-```
-
-### 2.5 参数说明
+### 2.4 参数说明
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
@@ -124,7 +102,7 @@ python collect_data_vllm_think.py \
 | `--token-levels` | Token 级别列表 | `-1,0,100,500,1000` |
 | `--max-model-len` | 最大模型长度 | `4096` |
 
-### 2.6 自动优化功能
+### 2.5 自动优化功能
 
 1. **GPU 自动检测与分配**：无需手动指定，自动检测并分半
 2. **Mentor max_model_len 自动优化**：当只生成部分 token 时，自动减少 KV cache 大小
