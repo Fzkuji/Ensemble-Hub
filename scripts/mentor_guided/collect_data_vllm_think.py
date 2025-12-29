@@ -750,16 +750,13 @@ def collect_all_parallel(
     except RuntimeError:
         pass
 
-    # Clean up old temporary files (but NOT merged results!)
+    # Only clean up lock files, keep all data files for recovery
     for subset_name, output_dir, _ in all_tasks:
         os.makedirs(output_dir, exist_ok=True)
         for token_level in token_levels:
-            # Only clean up temporary rank files and lock files
-            # Keep merged results (tokens{level}.json) - they will be skipped if they exist
-            for rank in range(world_size):
-                temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
+            # Only remove lock files to prevent deadlock
+            # Keep rank files (tokens{level}_rank{rank}.json) for recovery
+            # Keep merged files (tokens{level}.json) - they will be skipped if they exist
             lock_file = os.path.join(output_dir, f".lock_tokens{token_level}")
             if os.path.exists(lock_file):
                 os.remove(lock_file)
