@@ -1090,6 +1090,8 @@ def main():
             'oracle_acc': final_detailed['oracle'],
             'per_stage_auc': final_detailed['auc'],
             'per_stage_baseline_acc': final_detailed['baseline'],
+            'oracle_length': final_detailed.get('oracle_length', {}),
+            'cascade_length': final_detailed.get('cascade_length', {}),
             'args': vars(args),
         }
 
@@ -1103,6 +1105,8 @@ def main():
                 results['test_oracle_acc'] = single_result['oracle_acc']
                 results['test_per_stage_auc'] = single_result['per_stage_auc']
                 results['test_per_stage_baseline_acc'] = single_result['per_stage_baseline_acc']
+                results['test_oracle_length'] = single_result.get('oracle_length', {})
+                results['test_cascade_length'] = single_result.get('cascade_length', {})
             else:
                 # Multiple subsets: compute averages
                 results['test_best_cascade_acc'] = sum(r['cascade_acc'] for r in test_results_per_subset.values()) / len(test_results_per_subset)

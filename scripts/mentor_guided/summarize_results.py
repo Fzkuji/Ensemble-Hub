@@ -210,6 +210,8 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
                     'baseline': mlp_r.get('test_per_stage_baseline_acc', mlp_r.get('per_stage_baseline_acc', {})),
                     'oracle': mlp_r.get('test_oracle_acc', mlp_r.get('oracle_acc', 0)),
                     'cascade_accuracy': mlp_r.get('test_best_cascade_acc', mlp_r.get('best_cascade_acc', 0)),
+                    'oracle_length': mlp_r.get('test_oracle_length', mlp_r.get('oracle_length', {})),
+                    'cascade_length': mlp_r.get('test_cascade_length', mlp_r.get('cascade_length', {})),
                 }
 
             # 2. 然后检查各子集的 LoRA 结果
@@ -645,28 +647,45 @@ def get_classifier_results(data_dir: str, subset: str, model_type: str, model_so
     return None
 
 
+def get_subset_n_test(data_dir: str, subset: str) -> int:
+    """获取子集的测试样本数"""
+    # 从 tokens0.json 获取样本数
+    test_file = os.path.join(data_dir, subset, "test", "tokens0.json")
+    if os.path.exists(test_file):
+        with open(test_file, 'r') as f:
+            data = json.load(f)
+        return len(data)
+    return 0
+
+
 def print_classifier_comparison(data_dir: str, model_source: str = "individual"):
     """打印分类器对比表格"""
     source_label = "[individual]" if model_source == "individual" else "[all]"
     print("\n" + "=" * 130)
     print(f"                                   CLASSIFIER COMPARISON {source_label}")
     print("=" * 130)
-    print(f"{'Subset':<25} {'LoRA':>12} {'MLP':>12} {'PPL':>12} {'Ensemble':>12} {'Oracle':>12} {'Best':>12}")
+    print(f"{'Subset':<25} {'N':>6} {'LoRA':>12} {'MLP':>12} {'PPL':>12} {'Ensemble':>12} {'Oracle':>12} {'Best':>12}")
     print("-" * 130)
-    
-    totals = {'lora': [], 'mlp': [], 'ppl': [], 'ensemble': []}
-    
+
+    # 加权平均统计
+    totals = {'lora': 0, 'mlp': 0, 'ppl': 0, 'ensemble': 0}
+    counts = {'lora': 0, 'mlp': 0, 'ppl': 0, 'ensemble': 0}
+    total_n = 0
+
     for subset in SUBSETS:
+        n = get_subset_n_test(data_dir, subset)
+        total_n += n
+
         lora_r = get_classifier_results(data_dir, subset, "lora", model_source)
         mlp_r = get_classifier_results(data_dir, subset, "mlp", model_source)
         ppl_r = get_classifier_results(data_dir, subset, "ppl", model_source)
         ens_r = get_classifier_results(data_dir, subset, "ensemble", model_source)
-        
+
         lora_acc = lora_r['cascade_acc'] if lora_r else None
         mlp_acc = mlp_r['cascade_acc'] if mlp_r else None
         ppl_acc = ppl_r['cascade_acc'] if ppl_r else None
         ens_acc = ens_r['cascade_acc'] if ens_r else None
-        
+
         # Oracle (优先使用 PPL 的，因为它在原始测试数据上评估)
         oracle = None
         if ppl_r and ppl_r.get('oracle_acc'):
@@ -677,42 +696,46 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual")
             oracle = lora_r['oracle_acc']
         elif ens_r and ens_r.get('oracle_acc'):
             oracle = ens_r['oracle_acc']
-        
+
         # 格式化输出
         lora_str = f"{lora_acc:.4f}" if lora_acc is not None else "-"
         mlp_str = f"{mlp_acc:.4f}" if mlp_acc is not None else "-"
         ppl_str = f"{ppl_acc:.4f}" if ppl_acc is not None else "-"
         ens_str = f"{ens_acc:.4f}" if ens_acc is not None else "-"
         oracle_str = f"{oracle:.4f}" if oracle is not None else "-"
-        
-        # 找最佳
+
+        # 找最佳并累计加权统计
         accs = []
         if lora_acc is not None and lora_acc > 0:
             accs.append(('LoRA', lora_acc))
-            totals['lora'].append(lora_acc)
+            totals['lora'] += lora_acc * n
+            counts['lora'] += n
         if mlp_acc is not None and mlp_acc > 0:
             accs.append(('MLP', mlp_acc))
-            totals['mlp'].append(mlp_acc)
+            totals['mlp'] += mlp_acc * n
+            counts['mlp'] += n
         if ppl_acc is not None and ppl_acc > 0:
             accs.append(('PPL', ppl_acc))
-            totals['ppl'].append(ppl_acc)
+            totals['ppl'] += ppl_acc * n
+            counts['ppl'] += n
         if ens_acc is not None and ens_acc > 0:
             accs.append(('Ens', ens_acc))
-            totals['ensemble'].append(ens_acc)
-        
+            totals['ensemble'] += ens_acc * n
+            counts['ensemble'] += n
+
         best = max(accs, key=lambda x: x[1])[0] if accs else "-"
-        
-        print(f"{subset:<25} {lora_str:>12} {mlp_str:>12} {ppl_str:>12} {ens_str:>12} {oracle_str:>12} {best:>12}")
-    
+
+        print(f"{subset:<25} {n:>6} {lora_str:>12} {mlp_str:>12} {ppl_str:>12} {ens_str:>12} {oracle_str:>12} {best:>12}")
+
     print("-" * 130)
-    
-    # 计算平均值
-    lora_avg = f"{np.mean(totals['lora']):.4f}" if totals['lora'] else "-"
-    mlp_avg = f"{np.mean(totals['mlp']):.4f}" if totals['mlp'] else "-"
-    ppl_avg = f"{np.mean(totals['ppl']):.4f}" if totals['ppl'] else "-"
-    ens_avg = f"{np.mean(totals['ensemble']):.4f}" if totals['ensemble'] else "-"
-    
-    print(f"{'AVERAGE':<25} {lora_avg:>12} {mlp_avg:>12} {ppl_avg:>12} {ens_avg:>12}")
+
+    # 计算加权平均
+    lora_avg = f"{totals['lora'] / counts['lora']:.4f}" if counts['lora'] > 0 else "-"
+    mlp_avg = f"{totals['mlp'] / counts['mlp']:.4f}" if counts['mlp'] > 0 else "-"
+    ppl_avg = f"{totals['ppl'] / counts['ppl']:.4f}" if counts['ppl'] > 0 else "-"
+    ens_avg = f"{totals['ensemble'] / counts['ensemble']:.4f}" if counts['ensemble'] > 0 else "-"
+
+    print(f"{'TOTAL (weighted)':<25} {total_n:>6} {lora_avg:>12} {mlp_avg:>12} {ppl_avg:>12} {ens_avg:>12}")
     print("=" * 130)
 
 
