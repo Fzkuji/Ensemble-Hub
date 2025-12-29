@@ -1272,12 +1272,16 @@ def main():
     
     mode_suffix = "think" if use_think else "standard"
     if args.output_dir is None:
+        base_dir = "/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected"
         if args.dataset == "math500":
-            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/math500_{mode_suffix}_{exp_name}"
+            args.output_dir = f"{base_dir}/math500_{mode_suffix}_{exp_name}"
         elif args.dataset == "hendrycks_math_all":
-            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_all_{mode_suffix}_{exp_name}"
+            args.output_dir = f"{base_dir}/hendrycks_math_all_{mode_suffix}_{exp_name}"
+        elif args.dataset == "gsm8k":
+            args.output_dir = f"{base_dir}/gsm8k_{mode_suffix}_{exp_name}"
         else:
-            args.output_dir = f"/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/hendrycks_math_split_{mode_suffix}_{exp_name}"
+            # Default: hendrycks_math
+            args.output_dir = f"{base_dir}/hendrycks_math_split_{mode_suffix}_{exp_name}"
 
     os.makedirs(args.output_dir, exist_ok=True)
     logger.info(f"Output directory: {args.output_dir}")
