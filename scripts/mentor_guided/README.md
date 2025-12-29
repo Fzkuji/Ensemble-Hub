@@ -296,49 +296,45 @@ TOTAL (weighted)          5000   0.5538  -       278.3   0.5723  81.2    234.6  
 
 ## 7. 一键运行
 
-使用统一的 `run_pipeline.sh` 脚本，通过参数控制模式：
+使用统一的 `run_pipeline.sh` 脚本，自动完成数据收集、训练、评估的全流程。
 
-### 7.1 Think 模式（结构化思考）
-
-```bash
-# 默认 8 GPU
-./run_pipeline.sh --think
-
-# 指定 GPU
-./run_pipeline.sh --think --gpus 0,1,2,3,4,5,6,7
-```
-
-**输出目录**: `hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B/`
-
-### 7.2 Standard 模式（无思考）
+### 7.1 基本用法
 
 ```bash
-# 默认 8 GPU
-./run_pipeline.sh --no-think
+# 使用不同的 Mentor 和 Intern 模型（推荐）
+./run_pipeline.sh \
+  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
+  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
+  --think
 
-# 跳过 GPU 0
-./run_pipeline.sh --no-think --gpus 1,2,3,4,5,6,7
+# 使用同一个模型
+./run_pipeline.sh --model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" --think
 ```
 
-**输出目录**: `hendrycks_math_split_standard_DeepSeek-R1-Distill-Qwen-7B/`
-
-### 7.3 脚本参数说明
+### 7.2 参数说明
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
+| `--mentor-model` | Mentor 模型（大模型） | 同 `--model` |
+| `--intern-model` | Intern 模型（小模型） | 同 `--model` |
+| `--model` | 单模型模式（mentor 和 intern 相同） | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` |
 | `--think` | 启用结构化思考模式 | 默认 |
 | `--no-think` | 禁用思考（标准 prompt） | - |
 | `--gpus` | 指定 GPU 列表 | `0,1,2,3,4,5,6,7` |
-| `--model` | 指定模型 | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` |
+| `--train-subset` | 训练子集，`all` 合并所有 | 每个子集单独 |
+| `--eval-subset` | 评估子集，`all` 分别测试 | 同 train |
+| `--force` | 强制重新训练（覆盖已有结果） | - |
 
-### 7.4 Pipeline 流程
+### 7.3 Pipeline 流程
 
 脚本自动执行以下步骤：
-1. **数据收集** - 多 GPU 并行收集 train/test 数据
+1. **数据收集** - 收集 train/test 数据（自动跳过已存在的文件）
 2. **数据统计** - 计算 Oracle/Baseline 统计
-3. **LoRA 训练** - 训练所有子集的分类器
-4. **Cascade 评估** - 评估 cascade 性能
-5. **结果汇总** - 生成汇总报告
+3. **MLP 训练** - 训练 MLP 分类器
+4. **PPL 训练** - 训练 PPL 分类器
+5. **Ensemble 训练** - 训练 Ensemble 分类器
+6. **LoRA 训练** - 训练 LoRA 分类器
+7. **结果汇总** - 生成汇总报告
 
 ---
 
