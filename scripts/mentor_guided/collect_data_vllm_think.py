@@ -578,7 +578,7 @@ def worker_process_all_tasks(
                     os.close(fd)
                     # We got the lock - do the merge (overwrite if force=True)
                     if not os.path.exists(merged_file) or force:
-                        total, correct_cnt, acc = merge_rank_files(output_dir, token_level, world_size, force=force)
+                        total, correct_cnt, acc = merge_rank_files(output_dir, token_level, world_size)
                         print(f"[MERGED] {subset_name} tokens={token_level}: {total} samples, acc={acc:.4f}", flush=True)
                     os.remove(lock_file)
                 except FileExistsError:
@@ -637,26 +637,23 @@ def collect_parallel(
     return results.get("single", {})
 
 
-def merge_rank_files(output_dir: str, token_level: int, world_size: int, force: bool = False) -> Tuple[int, int, float]:
+def merge_rank_files(output_dir: str, token_level: int, world_size: int) -> Tuple[int, int, float]:
     """Merge all rank files for a single token level.
 
     Args:
         output_dir: Directory containing rank files
         token_level: Token level being merged
         world_size: Number of workers/ranks
-        force: If True, delete rank files after merging
 
     Returns: (total_samples, correct_samples, accuracy)
     """
     merged = []
-    rank_files = []
     for rank in range(world_size):
         temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
         if os.path.exists(temp_file):
             with open(temp_file, 'r', encoding='utf-8') as f:
                 results = json.load(f)
             merged.extend(results)
-            rank_files.append(temp_file)
             print(f"  [MERGE] Loaded {len(results)} samples from rank {rank}", flush=True)
 
     if merged:
@@ -667,11 +664,7 @@ def merge_rank_files(output_dir: str, token_level: int, world_size: int, force: 
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(merged, f, indent=2, ensure_ascii=False)
 
-        # Only delete rank files if --force is set
-        if force:
-            for temp_file in rank_files:
-                os.remove(temp_file)
-                print(f"  [CLEANUP] Deleted {os.path.basename(temp_file)}", flush=True)
+        # Keep rank files for recovery (they get overwritten on re-collection)
 
         return len(merged), correct, accuracy
     return 0, 0, 0.0
