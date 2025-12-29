@@ -34,114 +34,103 @@ pip install torch transformers peft datasets scikit-learn tqdm numpy vllm
 
 使用 `collect_data_vllm_think.py`，支持 Think 和 Standard 两种模式。
 
-### 2.1 Think 模式（结构化思考）
+### 2.1 最简单用法（推荐）
+
+脚本会自动检测所有可用 GPU 并智能分配：
 
 ```bash
 cd /home/fzkuji/PycharmProjects/Ensemble-Hub/scripts/mentor_guided
 
-# 收集 train split（8 GPU 并行）
-python collect_data_vllm_think.py --split train --gpus 0,1,2,3,4,5,6,7
-
-# 收集 test split（8 GPU 并行）
-python collect_data_vllm_think.py --split test --gpus 0,1,2,3,4,5,6,7
-```
-
-**输出目录**: `hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B/`
-
-### 2.2 Standard 模式（无思考）
-
-```bash
-# 收集 train split（8 GPU 并行）
-python collect_data_vllm_think.py --split train --gpus 0,1,2,3,4,5,6,7 --no-think
-
-# 收集 test split（8 GPU 并行）
-python collect_data_vllm_think.py --split test --gpus 0,1,2,3,4,5,6,7 --no-think
-```
-
-**输出目录**: `hendrycks_math_split_standard_DeepSeek-R1-Distill-Qwen-7B/`
-
-### 2.3 Mentor/Intern 模型分离（大-小模型协作）
-
-支持使用不同大小的模型分别作为 Mentor（大模型）和 Intern（小模型）。
-
-#### 方案 1：使用不同 GPU（推荐）
-
-当 Mentor 和 Intern 使用不同的 GPU 时，会自动使用默认内存利用率（0.9），因为它们不共享内存。
-
-```bash
-# Mentor 使用 GPU 0-3，Intern 使用 GPU 4-7
+# 使用不同的 Mentor 和 Intern 模型（自动检测 GPU 并分配）
 python collect_data_vllm_think.py \
   --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
   --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
-  --gpus 0,1,2,3 \
+  --split train
+```
+
+**自动行为**：
+- 自动检测所有可用 GPU（通过 `CUDA_VISIBLE_DEVICES` 或 `nvidia-smi`）
+- 自动将 GPU 分成两半：前半给 Mentor，后半给 Intern
+- 例如 8 卡机器：Mentor 用 `[0,1,2,3]`，Intern 用 `[4,5,6,7]`
+- 自动为不同 token levels 选择最优并行模式
+
+### 2.2 智能 Token Level 处理
+
+脚本会自动根据 token level 类型选择最优的并行策略：
+
+| Token Level | 模式 | 说明 |
+|-------------|------|------|
+| `-1` (mentor only) | Tensor Parallelism | 所有 GPU 给一个 worker，大模型张量并行 |
+| `0` (intern only) | Tensor Parallelism | 所有 GPU 给一个 worker |
+| `>0` (both models) | Data Parallelism | 每个 worker 一对 GPU（一个 mentor + 一个 intern） |
+
+这意味着运行 `--token-levels="-1,0,100,500,1000"` 时，会自动分三批处理，无需手动指定。
+
+### 2.3 Think/Standard 模式
+
+```bash
+# Think 模式（默认，结构化思考）
+python collect_data_vllm_think.py \
+  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
+  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
+  --split train
+
+# Standard 模式（无思考）
+python collect_data_vllm_think.py \
+  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
+  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
+  --split train --no-think
+```
+
+### 2.4 手动指定 GPU（可选）
+
+如果需要精确控制 GPU 分配：
+
+```bash
+# 方式 1：指定总 GPU 列表（自动分半）
+python collect_data_vllm_think.py \
+  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
+  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --split train
+# 结果：mentor=[0,1,2,3], intern=[4,5,6,7]
+
+# 方式 2：分别指定（完全控制）
+python collect_data_vllm_think.py \
+  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
+  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
   --mentor-gpus 0,1,2,3 \
   --intern-gpus 4,5,6,7 \
   --split train
 ```
 
-**优点**：
-- 两个模型互不干扰，内存充足
-- 自动使用默认内存利用率（0.9），无需手动设置
-- 性能稳定，推荐使用
-
-#### 方案 2：使用相同 GPU（需要合理分配内存）
-
-当 Mentor 和 Intern 使用相同的 GPU 时，需要手动设置内存利用率，避免内存冲突。
-
-```bash
-# 两个模型都在 GPU 0-7 上，需要设置内存利用率
-python collect_data_vllm_think.py \
-  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
-  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
-  --mentor-memory-util 0.4 \
-  --intern-memory-util 0.25 \
-  --split train \
-  --gpus 0,1,2,3,4,5,6,7
-```
-
-**内存利用率建议**：
-- **32B Mentor 模型**：0.4-0.5（根据 GPU 显存调整）
-- **7B Intern 模型**：0.2-0.3（根据 GPU 显存调整）
-- 如果仍然内存不足，可以进一步降低或使用方案 1
-
-#### 方案 3：调整模型长度（减少内存使用）
-
-如果内存仍然不足，可以降低 `max_model_len`：
-
-```bash
-python collect_data_vllm_think.py \
-  --mentor-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" \
-  --intern-model "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
-  --mentor-max-model-len 4096 \
-  --intern-max-model-len 8192 \
-  --mentor-memory-util 0.4 \
-  --split train \
-  --gpus 0,1,2,3,4,5,6,7
-```
-
-### 2.4 参数说明
+### 2.5 参数说明
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--split` | 数据集划分 | `test` |
-| `--gpus` | GPU 列表 | `0,1,2,3,4,5,6,7` |
+| `--gpus` | GPU 列表（可选，自动检测） | 自动检测所有 GPU |
 | `--no-think` | 禁用思考（标准 prompt） | - |
 | `--model` | 模型名称（legacy，建议使用 --mentor-model 和 --intern-model） | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` |
 | `--mentor-model` | Mentor 模型名称（大模型，如 32B） | 同 `--model` |
 | `--intern-model` | Intern 模型名称（小模型，如 7B） | 同 `--model` |
-| `--mentor-gpus` | Mentor 模型使用的 GPU 列表 | 同 `--gpus` |
-| `--intern-gpus` | Intern 模型使用的 GPU 列表 | 同 `--gpus` |
-| `--mentor-memory-util` | Mentor 模型 GPU 内存利用率（仅当使用相同 GPU 时生效） | `0.5` |
-| `--intern-memory-util` | Intern 模型 GPU 内存利用率（仅当使用相同 GPU 时生效） | `0.3` |
-| `--mentor-max-model-len` | Mentor 模型最大长度 | 同 `--max-model-len` |
+| `--mentor-gpus` | Mentor 模型使用的 GPU 列表（可选） | 自动分配 |
+| `--intern-gpus` | Intern 模型使用的 GPU 列表（可选） | 自动分配 |
+| `--mentor-memory-util` | Mentor 模型 GPU 内存利用率 | `0.5` |
+| `--intern-memory-util` | Intern 模型 GPU 内存利用率 | `0.3` |
+| `--mentor-max-model-len` | Mentor 模型最大长度（自动优化） | 根据 token levels 自动计算 |
 | `--intern-max-model-len` | Intern 模型最大长度 | 同 `--max-model-len` |
-| `--batch-size` | 批量大小 | `8` |
-| `--token-levels` | Token 级别列表 | `0,100,500,1000` |
-| `--max-model-len` | 最大模型长度 | `8192` |
+| `--batch-size` | 批量大小 | `16` |
+| `--token-levels` | Token 级别列表 | `-1,0,100,500,1000` |
+| `--max-model-len` | 最大模型长度 | `4096` |
 
-**注意**：
-- 当 `--mentor-gpus` 和 `--intern-gpus` 不同时，会自动使用默认内存利用率（0.9），忽略 `--mentor-memory-util` 和 `--intern-memory-util`
-- 当使用相同 GPU 时，必须合理设置内存利用率，否则可能出现内存不足错误
+### 2.6 自动优化功能
+
+1. **GPU 自动检测与分配**：无需手动指定，自动检测并分半
+2. **Mentor max_model_len 自动优化**：当只生成部分 token 时，自动减少 KV cache 大小
+   - 例如 `--token-levels=100,500,1000` 时，mentor 只需 `max(1000) + buffer`，自动设为 2048
+3. **智能并行模式选择**：根据 token level 类型自动选择 tensor/data parallelism
+4. **增量数据收集**：已存在的数据文件会自动跳过，不会被覆盖
 
 ---
 
@@ -447,7 +436,8 @@ python collect_data_vllm_think.py \
 ├── hendrycks_math_split/                    # 标准数据
 │   ├── algebra/
 │   │   ├── train/
-│   │   │   ├── tokens0.json
+│   │   │   ├── tokens-1.json               # Mentor only (baseline)
+│   │   │   ├── tokens0.json                # Intern only (baseline)
 │   │   │   ├── tokens100.json
 │   │   │   ├── tokens500.json
 │   │   │   └── tokens1000.json
@@ -474,21 +464,24 @@ python collect_data_vllm_think.py \
 |------|------|------|
 | `question` | str | 问题文本 |
 | `ground_truth` | str | 标准答案 |
-| `mentor_tokens` | int | mentor token 数量 (0/100/500/1000) |
+| `mentor_tokens` | int | mentor token 数量 (-1/0/100/500/1000)，-1 表示 mentor only |
 | `mentor_response` | str | mentor 的推理过程 |
 | `response` | str | 完整推理响应 |
 | `is_correct` | bool | 答案是否正确 |
+| `mentor_length` | int | mentor 生成的实际 token 数 |
+| `intern_length` | int | intern 生成的实际 token 数 |
 
 ### C. 评估结果说明
 
 | 指标 | 说明 |
 |------|------|
-| T0 | 无 mentor token 时的准确率 |
+| T-1 | Mentor only 准确率（大模型独立生成） |
+| T0 | Intern only 准确率（小模型独立生成） |
 | T100 | 100 mentor tokens 时的准确率 |
 | T500 | 500 mentor tokens 时的准确率 |
 | T1000 | 1000 mentor tokens 时的准确率 |
 | Oracle | 理论最优（任一 token level 正确即正确） |
-| Cascade | LoRA 分类器 cascade 准确率 |
+| Cascade | 分类器 cascade 准确率 |
 | Gap | Cascade - Best Baseline（提升） |
 
 ### D. 文件说明
