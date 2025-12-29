@@ -750,21 +750,19 @@ def collect_all_parallel(
     except RuntimeError:
         pass
 
-    # Clean up old files
+    # Clean up old temporary files (but NOT merged results!)
     for subset_name, output_dir, _ in all_tasks:
         os.makedirs(output_dir, exist_ok=True)
         for token_level in token_levels:
+            # Only clean up temporary rank files and lock files
+            # Keep merged results (tokens{level}.json) - they will be skipped if they exist
             for rank in range(world_size):
                 temp_file = os.path.join(output_dir, f"tokens{token_level}_rank{rank}.json")
                 if os.path.exists(temp_file):
                     os.remove(temp_file)
-            # Also clean lock files and merged files
             lock_file = os.path.join(output_dir, f".lock_tokens{token_level}")
-            merged_file = os.path.join(output_dir, f"tokens{token_level}.json")
             if os.path.exists(lock_file):
                 os.remove(lock_file)
-            if os.path.exists(merged_file):
-                os.remove(merged_file)
 
     # Start workers
     processes = []
@@ -1006,31 +1004,99 @@ def main():
     ]
 
     def collect_and_save(data: List[Dict[str, Any]], output_subdir: str):
-        """Helper to collect data and save results."""
+        """Helper to collect data and save results.
+
+        Intelligently batches token levels by their GPU requirements:
+        - Mentor-only (-1): tensor parallelism with all GPUs
+        - Intern-only (0): tensor parallelism with all GPUs
+        - Both models (>0): data parallelism with each GPU running both models
+        """
         os.makedirs(output_subdir, exist_ok=True)
 
-        stats = collect_parallel(
-            mentor_model_name=mentor_model,
-            intern_model_name=intern_model,
-            max_model_len=args.max_model_len,
-            batch_size=args.batch_size,
-            data=data,
-            token_levels=token_levels,
-            gpus=gpus,
-            mentor_gpu_ids=mentor_gpu_ids,
-            intern_gpu_ids=intern_gpu_ids,
-            output_dir=output_subdir,
-            use_think=use_think,
-            mentor_memory_util=args.mentor_memory_util,
-            intern_memory_util=args.intern_memory_util,
-            mentor_max_model_len=args.mentor_max_model_len,
-            intern_max_model_len=args.intern_max_model_len,
-            force=args.force,
-            need_mentor=need_mentor,
-            need_intern=need_intern,
-        )
+        all_stats = {}
+
+        # Split token levels by mode
+        mentor_only_levels = [t for t in token_levels if t == -1]
+        intern_only_levels = [t for t in token_levels if t == 0]
+        both_models_levels = [t for t in token_levels if t > 0]
+
+        # Process mentor-only levels (tensor parallelism)
+        if mentor_only_levels:
+            logger.info(f"Processing mentor-only levels {mentor_only_levels} with tensor parallelism...")
+            stats = collect_parallel(
+                mentor_model_name=mentor_model,
+                intern_model_name=intern_model,
+                max_model_len=args.max_model_len,
+                batch_size=args.batch_size,
+                data=data,
+                token_levels=mentor_only_levels,
+                gpus=gpus,
+                mentor_gpu_ids=mentor_gpu_ids,
+                intern_gpu_ids=intern_gpu_ids,
+                output_dir=output_subdir,
+                use_think=use_think,
+                mentor_memory_util=args.mentor_memory_util,
+                intern_memory_util=args.intern_memory_util,
+                mentor_max_model_len=args.mentor_max_model_len,
+                intern_max_model_len=args.intern_max_model_len,
+                force=args.force,
+                need_mentor=True,
+                need_intern=False,
+            )
+            all_stats.update(stats)
+
+        # Process intern-only levels (tensor parallelism)
+        if intern_only_levels:
+            logger.info(f"Processing intern-only levels {intern_only_levels} with tensor parallelism...")
+            stats = collect_parallel(
+                mentor_model_name=mentor_model,
+                intern_model_name=intern_model,
+                max_model_len=args.max_model_len,
+                batch_size=args.batch_size,
+                data=data,
+                token_levels=intern_only_levels,
+                gpus=gpus,
+                mentor_gpu_ids=mentor_gpu_ids,
+                intern_gpu_ids=intern_gpu_ids,
+                output_dir=output_subdir,
+                use_think=use_think,
+                mentor_memory_util=args.mentor_memory_util,
+                intern_memory_util=args.intern_memory_util,
+                mentor_max_model_len=args.mentor_max_model_len,
+                intern_max_model_len=args.intern_max_model_len,
+                force=args.force,
+                need_mentor=False,
+                need_intern=True,
+            )
+            all_stats.update(stats)
+
+        # Process both-models levels (data parallelism)
+        if both_models_levels:
+            logger.info(f"Processing both-models levels {both_models_levels} with data parallelism...")
+            stats = collect_parallel(
+                mentor_model_name=mentor_model,
+                intern_model_name=intern_model,
+                max_model_len=args.max_model_len,
+                batch_size=args.batch_size,
+                data=data,
+                token_levels=both_models_levels,
+                gpus=gpus,
+                mentor_gpu_ids=mentor_gpu_ids,
+                intern_gpu_ids=intern_gpu_ids,
+                output_dir=output_subdir,
+                use_think=use_think,
+                mentor_memory_util=args.mentor_memory_util,
+                intern_memory_util=args.intern_memory_util,
+                mentor_max_model_len=args.mentor_max_model_len,
+                intern_max_model_len=args.intern_max_model_len,
+                force=args.force,
+                need_mentor=True,
+                need_intern=True,
+            )
+            all_stats.update(stats)
+
         for token_level in token_levels:
-            token_stats = stats.get(token_level)
+            token_stats = all_stats.get(token_level)
             if token_stats:
                 logger.info(
                     "  tokens=%s: %.4f (%d/%d) saved to %s",
