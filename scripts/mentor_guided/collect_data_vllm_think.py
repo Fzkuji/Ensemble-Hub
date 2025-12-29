@@ -842,7 +842,7 @@ def main():
                         help="Output directory")
     parser.add_argument("--exp-name", type=str, default=None,
                         help="Experiment name for output directory (e.g., R1_m32B_i7B). If not set, uses model name.")
-    parser.add_argument("--token-levels", type=str, default="0,100,500,1000",
+    parser.add_argument("--token-levels", type=str, default="-1,0,100,500,1000",
                         help="Comma-separated token levels to collect")
     # Parallel mode arguments
     parser.add_argument("--gpus", type=str, default=None,
