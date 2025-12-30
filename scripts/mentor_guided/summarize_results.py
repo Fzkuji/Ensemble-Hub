@@ -485,87 +485,7 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
         for subset, gap, n in oracle_gaps:
             print(f"  {subset:<{W_SUBSET}}: {gap:.4f} ({gap*100:.2f}%)")
 
-    # 长度统计汇总
-    if show_length:
-        print("\n" + "=" * 90)
-        print("Generation Length Statistics (avg tokens)")
-        print("=" * 90)
-        print(f"{'Subset':<{W_SUBSET}} {'T0':<16} {'T100':<16} {'T500':<16} {'T1000':<16}")
-        print(f"{'':<{W_SUBSET}} {'m':<8}{'i':<8} {'m':<8}{'i':<8} {'m':<8}{'i':<8} {'m':<8}{'i':<8}")
-        print("-" * 90)
-
-        for subset in SUBSETS:
-            length_stats = compute_length_stats(data_dir, subset)
-            if any(length_stats.get(t) for t in TOKEN_LEVELS):
-                row = f"{subset:<{W_SUBSET}}"
-                for tokens in TOKEN_LEVELS:
-                    l_stat = length_stats.get(tokens)
-                    if l_stat:
-                        m_len = l_stat.get('mentor', {}).get('mean', 0)
-                        i_len = l_stat.get('intern', {}).get('mean', 0)
-                        m_str = f"{m_len:<8.1f}" if m_len else f"{'-':<8}"
-                        i_str = f"{i_len:<8.1f}" if i_len else f"{'-':<8}"
-                        row += f" {m_str}{i_str}"
-                    else:
-                        row += f" {'-':<8}{'-':<8}"
-                print(row)
-
-        # Total average
-        print("-" * 90)
-        row = f"{'TOTAL (weighted)':<{W_SUBSET}}"
-        for tokens in TOKEN_LEVELS:
-            if total_len_count[tokens] > 0:
-                m_len = total_mentor_len[tokens] / total_len_count[tokens]
-                i_len = total_intern_len[tokens] / total_len_count[tokens]
-                m_str = f"{m_len:<8.1f}" if m_len else f"{'-':<8}"
-                i_str = f"{i_len:<8.1f}" if i_len else f"{'-':<8}"
-                row += f" {m_str}{i_str}"
-            else:
-                row += f" {'-':<8}{'-':<8}"
-        print(row)
-
-        print("\n  m = mentor (大模型), i = intern (小模型)")
-
-    # Mentor Only 结果
-    print("\n" + "=" * 70)
-    print("Mentor Only Results (baseline: mentor model without intern)")
-    print("=" * 70)
-    print(f"{'Subset':<{W_SUBSET}} {'N':<{W_N}} {'Acc':<10} {'Len (avg)':<12}")
-    print("-" * 70)
-
-    mentor_only_total_n = 0
-    mentor_only_total_correct = 0
-    mentor_only_total_len = 0
-    mentor_only_count = 0
-
-    for subset in SUBSETS:
-        mentor_stats = compute_mentor_only_stats(data_dir, subset)
-        if mentor_stats:
-            acc = mentor_stats['accuracy']
-            n = mentor_stats['n_samples']
-            m_len = mentor_stats['mentor_length_mean']
-            print(f"{subset:<{W_SUBSET}} {n:<{W_N}} {acc:<10.4f} {m_len:<12.1f}")
-            mentor_only_total_n += n
-            mentor_only_total_correct += mentor_stats['n_correct']
-            mentor_only_total_len += m_len * n
-            mentor_only_count += n
-        else:
-            print(f"{subset:<{W_SUBSET}} (no mentor-only data)")
-
-    if mentor_only_total_n > 0:
-        print("-" * 70)
-        avg_acc = mentor_only_total_correct / mentor_only_total_n
-        avg_len = mentor_only_total_len / mentor_only_count if mentor_only_count > 0 else 0
-        print(f"{'TOTAL (weighted)':<{W_SUBSET}} {mentor_only_total_n:<{W_N}} {avg_acc:<10.4f} {avg_len:<12.1f}")
-
-        # 比较 mentor only vs cascade
-        if total_n > 0:
-            print("\n" + "-" * 70)
-            avg_cascade = total_cascade / total_n
-            cascade_vs_mentor = avg_cascade - avg_acc
-            print(f"Cascade vs Mentor-Only: {cascade_vs_mentor:+.4f} ({cascade_vs_mentor*100:+.2f}%)")
-
-    # 分类器对比表格
+    # 分类器对比表格 (LoRA vs MLP vs PPL vs Ensemble)
     print_classifier_comparison(data_dir, model_source, SUBSETS)
 
     print()
@@ -718,42 +638,38 @@ def get_subset_n_test(data_dir: str, subset: str) -> int:
     return 0
 
 
-def compute_baseline_acc(data_dir: str, subset: str, tokens: int, split: str = "test") -> float:
-    """计算指定 token level 的 baseline 准确率"""
-    data_file = os.path.join(data_dir, subset, split, f"tokens{tokens}.json")
-    if not os.path.exists(data_file):
-        return 0
-    with open(data_file, 'r') as f:
-        data = json.load(f)
-    if not data:
-        return 0
-    correct = sum(1 for item in data if item.get('is_correct', False))
-    return correct / len(data)
-
-
 def print_classifier_comparison(data_dir: str, model_source: str = "individual", subsets: list = None):
-    """打印分类器对比表格（包含各 token level 的准确率和长度）"""
+    """打印分类器对比表格（LoRA vs MLP vs PPL vs Ensemble，包含准确率和长度）"""
     if subsets is None:
         subsets = detect_subsets(data_dir, "test")
 
     source_label = "[individual]" if model_source == "individual" else "[all]"
 
-    # 打印表头
-    W = 200  # 总宽度
+    # 列宽定义
+    W_SUBSET = 25
+    W_N = 8
+    W_METHOD = 20  # 每个方法的列宽 (acc + m_len + i_len)
+    W_ORACLE = 8
+    W_BEST = 10
+
+    # 方法列表
+    methods = ["LoRA", "MLP", "PPL", "Ensemble"]
+
+    # 计算总宽度
+    W = W_SUBSET + W_N + W_METHOD * len(methods) + W_ORACLE + W_BEST + 10
+
     print("\n" + "=" * W)
-    print(f"CLASSIFIER COMPARISON {source_label}")
+    print(f"{'CLASSIFIER COMPARISON':^{W}} {source_label}")
     print("=" * W)
 
     # 两行表头
-    header1 = f"{'Subset':<22} {'N':>6}  "
-    header2 = f"{'':<22} {'':>6}  "
-
-    for tokens in [0, 100, 500, 1000]:
-        header1 += f"{'T' + str(tokens):^24} "
-        header2 += f"{'acc':>7} {'m_len':>7} {'i_len':>8} "
-
-    header1 += f"{'Mentor':^16} {'Oracle':^24} {'Cascade':^24} {'Gap':>8}"
-    header2 += f"{'acc':>7} {'len':>7}  {'acc':>7} {'m_len':>7} {'i_len':>8} {'acc':>7} {'m_len':>7} {'i_len':>8} {'':<8}"
+    header1 = f"{'Subset':<{W_SUBSET}} {'N':>{W_N}}"
+    header2 = f"{'':<{W_SUBSET}} {'':>{W_N}}"
+    for method in methods:
+        header1 += f"  {method:^{W_METHOD-2}}"
+        header2 += f"  {'acc':>6} {'m_len':>6} {'i_len':>6}"
+    header1 += f"  {'Oracle':>{W_ORACLE}} {'Best':>{W_BEST}}"
+    header2 += f"  {'':>{W_ORACLE}} {'':>{W_BEST}}"
 
     print(header1)
     print(header2)
@@ -761,160 +677,96 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
 
     # 统计变量
     total_n = 0
-    totals = {t: {'acc': 0, 'm_len': 0, 'i_len': 0, 'cnt': 0, 'm_cnt': 0, 'i_cnt': 0} for t in [0, 100, 500, 1000, -1]}
-    oracle_totals = {'acc': 0, 'm_len': 0, 'i_len': 0, 'cnt': 0, 'm_cnt': 0, 'i_cnt': 0}
-    cascade_totals = {'acc': 0, 'm_len': 0, 'i_len': 0, 'cnt': 0, 'm_cnt': 0, 'i_cnt': 0}
+    method_totals = {m: {'acc': 0, 'm_len': 0, 'i_len': 0, 'cnt': 0, 'm_cnt': 0, 'i_cnt': 0} for m in methods}
+    oracle_total = {'acc': 0, 'cnt': 0}
 
     for subset in subsets:
         n = get_subset_n_test(data_dir, subset)
         total_n += n
 
-        # 获取各 token level 的长度数据
-        length_stats = compute_length_stats(data_dir, subset, "test")
+        row = f"{subset:<{W_SUBSET}} {n:>{W_N}}"
 
-        # 获取分类器结果
-        mlp_r = get_classifier_results(data_dir, subset, "mlp", model_source)
+        # 获取每个分类器的结果
+        results = {}
+        best_acc = 0
+        best_method = "-"
 
-        # 构建行输出
-        row = f"{subset:<22} {n:>6}  "
+        for method in methods:
+            method_lower = method.lower()
+            r = get_classifier_results(data_dir, subset, method_lower, model_source)
+            if r:
+                acc = r.get('cascade_acc', 0)
+                results[method] = r
+                if acc > best_acc:
+                    best_acc = acc
+                    best_method = method
 
-        for tokens in [0, 100, 500, 1000]:
-            # 从数据文件直接计算准确率
-            acc = compute_baseline_acc(data_dir, subset, tokens, "test")
-            l_stat = length_stats.get(tokens)
-            m_len = l_stat.get('mentor', {}).get('mean', 0) if l_stat and tokens > 0 else 0
-            i_len = l_stat.get('intern', {}).get('mean', 0) if l_stat else 0
+        # 获取 Oracle（从任意可用的结果中）
+        oracle_acc = 0
+        for method in methods:
+            if method in results and results[method].get('oracle_acc', 0) > oracle_acc:
+                oracle_acc = results[method]['oracle_acc']
 
-            acc_str = f"{acc:.4f}" if acc else "-"
-            m_len_str = f"{m_len:.1f}" if m_len else "-"
-            i_len_str = f"{i_len:.1f}" if i_len else "-"
+        # 输出每个方法的结果
+        for method in methods:
+            if method in results:
+                r = results[method]
+                acc = r.get('cascade_acc', 0)
 
-            # 累计统计
-            if acc:
-                totals[tokens]['acc'] += acc * n
-                totals[tokens]['cnt'] += n
-            if m_len:
-                totals[tokens]['m_len'] += m_len * n
-                totals[tokens]['m_cnt'] += n
-            if i_len:
-                totals[tokens]['i_len'] += i_len * n
-                totals[tokens]['i_cnt'] += n
+                # 获取长度信息
+                m_len = i_len = 0
+                method_lower = method.lower()
+                result_file = os.path.join(data_dir, subset, f"{method_lower}_model", "results.json")
+                if os.path.exists(result_file):
+                    with open(result_file, 'r') as f:
+                        rj = json.load(f)
+                    cascade_len = rj.get('test_cascade_length', rj.get('cascade_length', {}))
+                    if isinstance(cascade_len, dict):
+                        m_len = cascade_len.get('mentor_mean', cascade_len.get('mentor', 0))
+                        i_len = cascade_len.get('intern_mean', cascade_len.get('intern', 0))
 
-            row += f"{acc_str:>7} {m_len_str:>7} {i_len_str:>8} "
+                acc_str = f"{acc:.4f}" if acc else "-"
+                m_len_str = f"{m_len:.1f}" if m_len else "-"
+                i_len_str = f"{i_len:.1f}" if i_len else "-"
 
-        # Mentor only (T-1)
-        mentor_acc = compute_baseline_acc(data_dir, subset, -1, "test")
-        mentor_stats = compute_mentor_only_stats(data_dir, subset, "test")
-        mentor_len = mentor_stats['mentor_length_mean'] if mentor_stats else 0
+                # 累计统计
+                if acc:
+                    method_totals[method]['acc'] += acc * n
+                    method_totals[method]['cnt'] += n
+                if m_len:
+                    method_totals[method]['m_len'] += m_len * n
+                    method_totals[method]['m_cnt'] += n
+                if i_len:
+                    method_totals[method]['i_len'] += i_len * n
+                    method_totals[method]['i_cnt'] += n
+            else:
+                acc_str = m_len_str = i_len_str = "-"
 
-        mentor_acc_str = f"{mentor_acc:.4f}" if mentor_acc else "-"
-        mentor_len_str = f"{mentor_len:.1f}" if mentor_len else "-"
-        if mentor_acc:
-            totals[-1]['acc'] += mentor_acc * n
-            totals[-1]['cnt'] += n
-        if mentor_len:
-            totals[-1]['m_len'] += mentor_len * n
-            totals[-1]['m_cnt'] += n
+            row += f"  {acc_str:>6} {m_len_str:>6} {i_len_str:>6}"
 
-        row += f"{mentor_acc_str:>7} {mentor_len_str:>7}  "
+        # Oracle 和 Best
+        oracle_str = f"{oracle_acc:.4f}" if oracle_acc else "-"
+        if oracle_acc:
+            oracle_total['acc'] += oracle_acc * n
+            oracle_total['cnt'] += n
 
-        # Oracle 和 Cascade (从分类器结果获取)
-        if mlp_r:
-            oracle_acc = mlp_r.get('oracle_acc', 0)
-            cascade_acc = mlp_r.get('cascade_acc', 0)
-
-            # 尝试从 results.json 获取详细长度
-            result_file = os.path.join(data_dir, subset, "mlp_model", "results.json")
-            oracle_m_len = oracle_i_len = cascade_m_len = cascade_i_len = 0
-            if os.path.exists(result_file):
-                with open(result_file, 'r') as f:
-                    r = json.load(f)
-                oracle_len = r.get('test_oracle_length', r.get('oracle_length', {}))
-                cascade_len = r.get('test_cascade_length', r.get('cascade_length', {}))
-                if isinstance(oracle_len, dict):
-                    oracle_m_len = oracle_len.get('mentor_mean', oracle_len.get('mentor', 0))
-                    oracle_i_len = oracle_len.get('intern_mean', oracle_len.get('intern', 0))
-                if isinstance(cascade_len, dict):
-                    cascade_m_len = cascade_len.get('mentor_mean', cascade_len.get('mentor', 0))
-                    cascade_i_len = cascade_len.get('intern_mean', cascade_len.get('intern', 0))
-
-            oracle_acc_str = f"{oracle_acc:.4f}" if oracle_acc else "-"
-            oracle_m_str = f"{oracle_m_len:.1f}" if oracle_m_len else "-"
-            oracle_i_str = f"{oracle_i_len:.1f}" if oracle_i_len else "-"
-            cascade_acc_str = f"{cascade_acc:.4f}" if cascade_acc else "-"
-            cascade_m_str = f"{cascade_m_len:.1f}" if cascade_m_len else "-"
-            cascade_i_str = f"{cascade_i_len:.1f}" if cascade_i_len else "-"
-
-            # Gap = cascade - T0
-            t0_acc = compute_baseline_acc(data_dir, subset, 0, "test")
-            gap = cascade_acc - t0_acc if cascade_acc and t0_acc else 0
-            gap_str = f"{gap:+.4f}" if gap else "-"
-
-            # 累计
-            if oracle_acc:
-                oracle_totals['acc'] += oracle_acc * n
-                oracle_totals['cnt'] += n
-            if oracle_m_len:
-                oracle_totals['m_len'] += oracle_m_len * n
-                oracle_totals['m_cnt'] += n
-            if oracle_i_len:
-                oracle_totals['i_len'] += oracle_i_len * n
-                oracle_totals['i_cnt'] += n
-            if cascade_acc:
-                cascade_totals['acc'] += cascade_acc * n
-                cascade_totals['cnt'] += n
-            if cascade_m_len:
-                cascade_totals['m_len'] += cascade_m_len * n
-                cascade_totals['m_cnt'] += n
-            if cascade_i_len:
-                cascade_totals['i_len'] += cascade_i_len * n
-                cascade_totals['i_cnt'] += n
-        else:
-            oracle_acc_str = oracle_m_str = oracle_i_str = "-"
-            cascade_acc_str = cascade_m_str = cascade_i_str = "-"
-            gap_str = "-"
-
-        row += f"{oracle_acc_str:>7} {oracle_m_str:>7} {oracle_i_str:>8} "
-        row += f"{cascade_acc_str:>7} {cascade_m_str:>7} {cascade_i_str:>8} {gap_str:>8}"
-
+        row += f"  {oracle_str:>{W_ORACLE}} {best_method:>{W_BEST}}"
         print(row)
 
     print("-" * W)
 
-    # 打印 TOTAL 行
-    row = f"{'TOTAL (weighted)':<22} {total_n:>6}  "
-
-    for tokens in [0, 100, 500, 1000]:
-        t = totals[tokens]
+    # TOTAL 行
+    row = f"{'TOTAL (weighted)':<{W_SUBSET}} {total_n:>{W_N}}"
+    for method in methods:
+        t = method_totals[method]
         acc_str = f"{t['acc']/t['cnt']:.4f}" if t['cnt'] > 0 else "-"
         m_len_str = f"{t['m_len']/t['m_cnt']:.1f}" if t['m_cnt'] > 0 else "-"
         i_len_str = f"{t['i_len']/t['i_cnt']:.1f}" if t['i_cnt'] > 0 else "-"
-        row += f"{acc_str:>7} {m_len_str:>7} {i_len_str:>8} "
+        row += f"  {acc_str:>6} {m_len_str:>6} {i_len_str:>6}"
 
-    # Mentor
-    t = totals[-1]
-    mentor_acc_str = f"{t['acc']/t['cnt']:.4f}" if t['cnt'] > 0 else "-"
-    mentor_len_str = f"{t['m_len']/t['m_cnt']:.1f}" if t['m_cnt'] > 0 else "-"
-    row += f"{mentor_acc_str:>7} {mentor_len_str:>7}  "
-
-    # Oracle
-    oracle_acc_str = f"{oracle_totals['acc']/oracle_totals['cnt']:.4f}" if oracle_totals['cnt'] > 0 else "-"
-    oracle_m_str = f"{oracle_totals['m_len']/oracle_totals['m_cnt']:.1f}" if oracle_totals['m_cnt'] > 0 else "-"
-    oracle_i_str = f"{oracle_totals['i_len']/oracle_totals['i_cnt']:.1f}" if oracle_totals['i_cnt'] > 0 else "-"
-    row += f"{oracle_acc_str:>7} {oracle_m_str:>7} {oracle_i_str:>8} "
-
-    # Cascade
-    cascade_acc_str = f"{cascade_totals['acc']/cascade_totals['cnt']:.4f}" if cascade_totals['cnt'] > 0 else "-"
-    cascade_m_str = f"{cascade_totals['m_len']/cascade_totals['m_cnt']:.1f}" if cascade_totals['m_cnt'] > 0 else "-"
-    cascade_i_str = f"{cascade_totals['i_len']/cascade_totals['i_cnt']:.1f}" if cascade_totals['i_cnt'] > 0 else "-"
-
-    # Gap
-    t0_avg = totals[0]['acc'] / totals[0]['cnt'] if totals[0]['cnt'] > 0 else 0
-    cascade_avg = cascade_totals['acc'] / cascade_totals['cnt'] if cascade_totals['cnt'] > 0 else 0
-    gap = cascade_avg - t0_avg if cascade_avg and t0_avg else 0
-    gap_str = f"{gap:+.4f}" if gap else "-"
-
-    row += f"{cascade_acc_str:>7} {cascade_m_str:>7} {cascade_i_str:>8} {gap_str:>8}"
+    oracle_avg = oracle_total['acc'] / oracle_total['cnt'] if oracle_total['cnt'] > 0 else 0
+    oracle_str = f"{oracle_avg:.4f}" if oracle_avg else "-"
+    row += f"  {oracle_str:>{W_ORACLE}} {'':>{W_BEST}}"
 
     print(row)
     print("=" * W)
