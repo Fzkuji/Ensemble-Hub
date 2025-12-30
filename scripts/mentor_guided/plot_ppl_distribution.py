@@ -39,6 +39,9 @@ def plot_distribution(
     entropy_only: bool = False,
 ):
     """Plot PPL and Entropy distribution comparison."""
+    # Map token levels to effort levels
+    effort_map = {100: 'Low', 500: 'Medium', 1000: 'High'}
+
     if entropy_only:
         # Single row for entropy only
         fig, axes = plt.subplots(1, len(token_levels), figsize=(4 * len(token_levels), 3.2))
@@ -58,7 +61,8 @@ def plot_distribution(
 
             if idx == 0:
                 ax.set_ylabel('Value', fontsize=12)
-            ax.set_title(f'Guidance = {tl} tokens', fontsize=13, fontweight='bold')
+            effort_label = effort_map.get(tl, str(tl))
+            ax.set_title(f'Effort Level: {effort_label}', fontsize=13, fontweight='bold')
             ax.set_xlabel('Average Token Entropy', fontsize=12)
             if idx == len(token_levels) - 1:
                 ax.legend(loc='upper right', fontsize=10)
