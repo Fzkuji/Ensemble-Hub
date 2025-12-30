@@ -26,10 +26,27 @@ from peft import PeftModel
 import torch.nn as nn
 
 TOKEN_LEVELS = [0, 100, 500, 1000]
-SUBSETS = [
+DEFAULT_SUBSETS = [
     "algebra", "counting_and_probability", "geometry",
     "intermediate_algebra", "number_theory", "prealgebra", "precalculus"
 ]
+
+
+def detect_subsets(data_dir: str, split: str = "test") -> List[str]:
+    """Auto-detect subsets from data directory."""
+    subsets = []
+    if not os.path.exists(data_dir):
+        return DEFAULT_SUBSETS
+
+    for name in os.listdir(data_dir):
+        subset_dir = os.path.join(data_dir, name, split)
+        if os.path.isdir(subset_dir):
+            # Check if it has token files
+            token_file = os.path.join(subset_dir, "tokens0.json")
+            if os.path.exists(token_file):
+                subsets.append(name)
+
+    return sorted(subsets) if subsets else DEFAULT_SUBSETS
 
 
 def load_json_data(data_dir: str, split: str = "train") -> Dict[int, List[Dict]]:
@@ -491,7 +508,8 @@ def search_thresholds(probs: np.ndarray, gt: np.ndarray) -> Tuple[float, List[fl
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, required=True)
-    parser.add_argument("--subset", type=str, default="algebra", choices=SUBSETS + ["all"])
+    parser.add_argument("--subset", type=str, default=None,
+                        help="Subset to train on (auto-detected if not specified, or 'all' for all subsets)")
     parser.add_argument("--base-model", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
                         help="Base model name for loading LoRA/MLP")
     parser.add_argument("--method", type=str, default="rf", choices=["rf", "gb", "lr"],
@@ -505,7 +523,15 @@ def main():
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    subsets = SUBSETS if args.subset == "all" else [args.subset]
+
+    # Auto-detect subsets from data directory
+    available_subsets = detect_subsets(args.data_dir)
+    print(f"Detected subsets: {available_subsets}")
+
+    if args.subset is None or args.subset == "all":
+        subsets = available_subsets
+    else:
+        subsets = [args.subset]
 
     for subset in subsets:
         print(f"\n{'='*60}")
