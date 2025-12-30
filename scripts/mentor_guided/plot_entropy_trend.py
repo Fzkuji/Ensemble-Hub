@@ -93,6 +93,7 @@ def plot_entropy_by_category(
     ax.set_title('Sufficient', fontsize=14)
     ax.set_xlabel('Token Position', fontsize=12)
     ax.set_ylabel('Average Entropy', fontsize=12)
+    ax.set_ylim(0, 0.3)  # Focus on main range
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -110,6 +111,7 @@ def plot_entropy_by_category(
     ax.set_title('Insufficient', fontsize=14)
     ax.set_xlabel('Token Position', fontsize=12)
     ax.set_ylabel('Average Entropy', fontsize=12)
+    ax.set_ylim(0, 0.3)  # Focus on main range
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -155,6 +157,7 @@ def plot_entropy_comparison(
         ax.set_title(f'T = {tl}', fontsize=14)
         ax.set_xlabel('Token Position', fontsize=12)
         ax.set_ylabel('Average Entropy', fontsize=12)
+        ax.set_ylim(0, 0.3)  # Focus on main range
         ax.legend()
         ax.grid(True, alpha=0.3)
 
