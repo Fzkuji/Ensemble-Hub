@@ -84,7 +84,8 @@ def plot_metric_trends(
         if not samples:
             continue
 
-        curve = compute_average_curve(samples, field=metric_field, max_length=max_length)
+        # Use token_level as max_length to truncate curve appropriately
+        curve = compute_average_curve(samples, field=metric_field, max_length=token_level)
 
         if len(curve) > 0:
             x = np.arange(1, len(curve) + 1)  # 从1开始，避免log10(0)
@@ -104,7 +105,8 @@ def plot_metric_trends(
         if not samples:
             continue
 
-        curve = compute_average_curve(samples, field=metric_field, max_length=max_length)
+        # Use token_level as max_length to truncate curve appropriately
+        curve = compute_average_curve(samples, field=metric_field, max_length=token_level)
 
         if len(curve) > 0:
             x = np.arange(1, len(curve) + 1)
@@ -132,7 +134,7 @@ def plot_metric_trends(
         # Sufficient
         suff_samples = all_sufficient[token_level]
         if suff_samples:
-            suff_curve = compute_average_curve(suff_samples, field=metric_field, max_length=max_length)
+            suff_curve = compute_average_curve(suff_samples, field=metric_field, max_length=token_level)
             if len(suff_curve) > 0:
                 x = np.arange(1, len(suff_curve) + 1)
                 ax.plot(x, suff_curve, color='green', label=f'Sufficient (n={len(suff_samples)})', linewidth=2)
@@ -140,7 +142,7 @@ def plot_metric_trends(
         # Insufficient
         non_suff_samples = all_non_sufficient[token_level]
         if non_suff_samples:
-            non_suff_curve = compute_average_curve(non_suff_samples, field=metric_field, max_length=max_length)
+            non_suff_curve = compute_average_curve(non_suff_samples, field=metric_field, max_length=token_level)
             if len(non_suff_curve) > 0:
                 x = np.arange(1, len(non_suff_curve) + 1)
                 ax.plot(x, non_suff_curve, color='red', label=f'Insufficient (n={len(non_suff_samples)})', linewidth=2)
