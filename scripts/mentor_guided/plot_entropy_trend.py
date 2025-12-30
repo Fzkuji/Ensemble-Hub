@@ -28,26 +28,28 @@ def load_ppl_data(data_dir: str, subset: str, token_level: int) -> List[Dict]:
         return json.load(f)
 
 
-def compute_average_entropy_curve(
+def compute_average_curve(
     samples: List[Dict],
+    field: str = 'per_token_entropy',
     max_length: int = None,
     normalize_length: bool = False,
     num_bins: int = 100,
 ) -> np.ndarray:
     """
-    计算平均 entropy 曲线
+    计算平均曲线
 
     Args:
-        samples: 样本列表，每个样本需要有 per_token_entropy 字段
+        samples: 样本列表
+        field: 要提取的字段名 ('per_token_entropy' 或 'per_token_nll')
         max_length: 最大长度（截断）
         normalize_length: 是否归一化长度到 [0, 1]
         num_bins: 归一化时的 bin 数量
 
     Returns:
-        average_entropy: 平均 entropy 曲线
+        average_curve: 平均曲线
     """
-    # 过滤出有 per_token_entropy 的样本
-    valid_samples = [s for s in samples if 'per_token_entropy' in s and s['per_token_entropy']]
+    # 过滤出有该字段的样本
+    valid_samples = [s for s in samples if field in s and s[field]]
 
     if not valid_samples:
         return np.array([])
@@ -56,18 +58,17 @@ def compute_average_entropy_curve(
         # 归一化到相同长度
         all_curves = []
         for s in valid_samples:
-            entropy = np.array(s['per_token_entropy'])
+            values = np.array(s[field])
             # 插值到 num_bins 个点
-            x_old = np.linspace(0, 1, len(entropy))
+            x_old = np.linspace(0, 1, len(values))
             x_new = np.linspace(0, 1, num_bins)
-            interpolated = np.interp(x_new, x_old, entropy)
+            interpolated = np.interp(x_new, x_old, values)
             all_curves.append(interpolated)
 
         return np.mean(all_curves, axis=0)
     else:
         # 按实际位置计算平均
-        # 找到最短长度
-        lengths = [len(s['per_token_entropy']) for s in valid_samples]
+        lengths = [len(s[field]) for s in valid_samples]
         if max_length:
             target_length = min(max_length, max(lengths))
         else:
@@ -76,61 +77,33 @@ def compute_average_entropy_curve(
         # 对齐并计算平均
         all_curves = []
         for s in valid_samples:
-            entropy = s['per_token_entropy'][:target_length]
+            values = s[field][:target_length]
             # 补齐到 target_length (用 nan)
-            if len(entropy) < target_length:
-                entropy = entropy + [np.nan] * (target_length - len(entropy))
-            all_curves.append(entropy)
+            if len(values) < target_length:
+                values = values + [np.nan] * (target_length - len(values))
+            all_curves.append(values)
 
         all_curves = np.array(all_curves)
         # 对每个位置计算平均（忽略 nan）
         return np.nanmean(all_curves, axis=0)
 
 
-def plot_entropy_trends(
-    data_dir: str,
-    subsets: List[str],
+def plot_metric_trends(
+    all_sufficient: Dict,
+    all_non_sufficient: Dict,
     token_levels: List[int],
     output_dir: str,
+    metric_field: str,
+    metric_name: str,
     normalize_length: bool = True,
     num_bins: int = 100,
     max_length: int = 2000,
 ):
-    """绘制 entropy 趋势曲线"""
-    os.makedirs(output_dir, exist_ok=True)
-
-    # 收集所有子集的数据
-    all_sufficient = {tl: [] for tl in token_levels}
-    all_non_sufficient = {tl: [] for tl in token_levels}
-
-    for subset in subsets:
-        for token_level in token_levels:
-            data = load_ppl_data(data_dir, subset, token_level)
-            if not data:
-                continue
-
-            for item in data:
-                if 'per_token_entropy' not in item:
-                    continue
-                if item.get('is_correct', False):
-                    all_sufficient[token_level].append(item)
-                else:
-                    all_non_sufficient[token_level].append(item)
-
-    # 检查是否有数据
-    has_per_token = any(
-        any('per_token_entropy' in s for s in all_sufficient[tl] + all_non_sufficient[tl])
-        for tl in token_levels
-    )
-
-    if not has_per_token:
-        print("No per-token entropy data found. Run compute_ppl_entropy.py with --save-per-token first.")
-        return
-
-    # 绘制两个图：Sufficient 和 Non-sufficient
+    """绘制单个指标的趋势曲线"""
     colors = {100: '#1f77b4', 500: '#ff7f0e', 1000: '#2ca02c'}
     labels = {100: 'T=100', 500: 'T=500', 1000: 'T=1000'}
 
+    # 绘制两个图：Sufficient 和 Non-sufficient
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     # Plot 1: Sufficient samples
@@ -140,8 +113,9 @@ def plot_entropy_trends(
         if not samples:
             continue
 
-        curve = compute_average_entropy_curve(
+        curve = compute_average_curve(
             samples,
+            field=metric_field,
             normalize_length=normalize_length,
             num_bins=num_bins,
             max_length=max_length,
@@ -154,9 +128,9 @@ def plot_entropy_trends(
             else:
                 ax.plot(curve, color=colors[token_level], label=f'{labels[token_level]} (n={len(samples)})', linewidth=2)
 
-    ax.set_title('Sufficient (SLM Correct with Guidance)', fontsize=12)
+    ax.set_title(f'Sufficient (SLM Correct)', fontsize=12)
     ax.set_xlabel('Position (%)' if normalize_length else 'Token Position', fontsize=11)
-    ax.set_ylabel('Average Entropy', fontsize=11)
+    ax.set_ylabel(f'Average {metric_name}', fontsize=11)
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -167,8 +141,9 @@ def plot_entropy_trends(
         if not samples:
             continue
 
-        curve = compute_average_entropy_curve(
+        curve = compute_average_curve(
             samples,
+            field=metric_field,
             normalize_length=normalize_length,
             num_bins=num_bins,
             max_length=max_length,
@@ -181,14 +156,14 @@ def plot_entropy_trends(
             else:
                 ax.plot(curve, color=colors[token_level], label=f'{labels[token_level]} (n={len(samples)})', linewidth=2)
 
-    ax.set_title('Non-sufficient (SLM Wrong with Guidance)', fontsize=12)
+    ax.set_title(f'Non-sufficient (SLM Wrong)', fontsize=12)
     ax.set_xlabel('Position (%)' if normalize_length else 'Token Position', fontsize=11)
-    ax.set_ylabel('Average Entropy', fontsize=11)
+    ax.set_ylabel(f'Average {metric_name}', fontsize=11)
     ax.legend()
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    output_file = os.path.join(output_dir, 'entropy_trend_by_category.png')
+    output_file = os.path.join(output_dir, f'{metric_field}_trend_by_category.png')
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {output_file}")
@@ -202,8 +177,9 @@ def plot_entropy_trends(
         # Sufficient
         suff_samples = all_sufficient[token_level]
         if suff_samples:
-            suff_curve = compute_average_entropy_curve(
+            suff_curve = compute_average_curve(
                 suff_samples,
+                field=metric_field,
                 normalize_length=normalize_length,
                 num_bins=num_bins,
                 max_length=max_length,
@@ -218,8 +194,9 @@ def plot_entropy_trends(
         # Non-sufficient
         non_suff_samples = all_non_sufficient[token_level]
         if non_suff_samples:
-            non_suff_curve = compute_average_entropy_curve(
+            non_suff_curve = compute_average_curve(
                 non_suff_samples,
+                field=metric_field,
                 normalize_length=normalize_length,
                 num_bins=num_bins,
                 max_length=max_length,
@@ -233,15 +210,76 @@ def plot_entropy_trends(
 
         ax.set_title(f'Token Level = {token_level}', fontsize=12)
         ax.set_xlabel('Position (%)' if normalize_length else 'Token Position', fontsize=11)
-        ax.set_ylabel('Average Entropy', fontsize=11)
+        ax.set_ylabel(f'Average {metric_name}', fontsize=11)
         ax.legend()
         ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    output_file = os.path.join(output_dir, 'entropy_trend_comparison.png')
+    output_file = os.path.join(output_dir, f'{metric_field}_trend_comparison.png')
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {output_file}")
+
+
+def plot_entropy_trends(
+    data_dir: str,
+    subsets: List[str],
+    token_levels: List[int],
+    output_dir: str,
+    normalize_length: bool = True,
+    num_bins: int = 100,
+    max_length: int = 2000,
+):
+    """绘制 entropy 和 NLL 趋势曲线"""
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 收集所有子集的数据
+    all_sufficient = {tl: [] for tl in token_levels}
+    all_non_sufficient = {tl: [] for tl in token_levels}
+
+    for subset in subsets:
+        for token_level in token_levels:
+            data = load_ppl_data(data_dir, subset, token_level)
+            if not data:
+                continue
+
+            for item in data:
+                if item.get('is_correct', False):
+                    all_sufficient[token_level].append(item)
+                else:
+                    all_non_sufficient[token_level].append(item)
+
+    # 检查是否有数据
+    has_entropy = any(
+        any('per_token_entropy' in s for s in all_sufficient[tl] + all_non_sufficient[tl])
+        for tl in token_levels
+    )
+    has_nll = any(
+        any('per_token_nll' in s for s in all_sufficient[tl] + all_non_sufficient[tl])
+        for tl in token_levels
+    )
+
+    if not has_entropy and not has_nll:
+        print("No per-token data found. Run compute_ppl_entropy.py with --save-per-token first.")
+        return
+
+    # 绘制 Entropy 趋势
+    if has_entropy:
+        print("\nPlotting Entropy trends...")
+        plot_metric_trends(
+            all_sufficient, all_non_sufficient, token_levels, output_dir,
+            'per_token_entropy', 'Entropy',
+            normalize_length, num_bins, max_length
+        )
+
+    # 绘制 NLL (负对数概率) 趋势
+    if has_nll:
+        print("\nPlotting NLL (Negative Log Prob) trends...")
+        plot_metric_trends(
+            all_sufficient, all_non_sufficient, token_levels, output_dir,
+            'per_token_nll', 'NLL (-log p)',
+            normalize_length, num_bins, max_length
+        )
 
     # 打印统计信息
     print("\n" + "=" * 60)

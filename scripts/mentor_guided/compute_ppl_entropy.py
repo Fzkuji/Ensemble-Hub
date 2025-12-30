@@ -76,7 +76,7 @@ def compute_ppl_and_entropy(
     response: str,
     max_length: int = 4096,
     return_per_token: bool = False,
-) -> Tuple[float, float, float, List[float]]:
+) -> Tuple[float, float, float, List[float], List[float]]:
     """
     计算给定 prompt 下生成 response 的 PPL 和 entropy
 
@@ -85,6 +85,7 @@ def compute_ppl_and_entropy(
         avg_entropy: 平均 entropy
         max_entropy: 最大 entropy
         per_token_entropy: 每个token位置的entropy列表 (if return_per_token=True)
+        per_token_nll: 每个token位置的negative log prob列表 (if return_per_token=True)
     """
     # 构建完整输入
     full_text = prompt + response
@@ -99,7 +100,7 @@ def compute_ppl_and_entropy(
 
     if prompt_len >= input_ids.shape[1]:
         # Response 被截断了
-        return float('inf'), float('inf'), float('inf'), []
+        return float('inf'), float('inf'), float('inf'), [], []
 
     # Forward pass
     with torch.no_grad():
@@ -129,10 +130,11 @@ def compute_ppl_and_entropy(
         avg_entropy = entropies.mean().item()
         max_entropy = entropies.max().item()
 
-        # 每个token的entropy
+        # 每个token的entropy和negative log prob
         per_token_entropy = entropies.cpu().tolist() if return_per_token else []
+        per_token_nll = (-token_log_probs).cpu().tolist() if return_per_token else []
 
-    return ppl, avg_entropy, max_entropy, per_token_entropy
+    return ppl, avg_entropy, max_entropy, per_token_entropy, per_token_nll
 
 
 def build_prompt(question: str, mentor_response: str, mentor_tokens: int) -> str:
@@ -196,13 +198,13 @@ def process_subset(
 
         # 计算 PPL 和 entropy
         try:
-            ppl, avg_entropy, max_entropy, per_token_entropy = compute_ppl_and_entropy(
+            ppl, avg_entropy, max_entropy, per_token_entropy, per_token_nll = compute_ppl_and_entropy(
                 model, tokenizer, prompt, intern_response, return_per_token=save_per_token
             )
         except Exception as e:
             if is_main_process():
                 print(f"Error computing PPL: {e}")
-            ppl, avg_entropy, max_entropy, per_token_entropy = float('inf'), float('inf'), float('inf'), []
+            ppl, avg_entropy, max_entropy, per_token_entropy, per_token_nll = float('inf'), float('inf'), float('inf'), [], []
 
         # 保存结果
         result = {
@@ -217,6 +219,8 @@ def process_subset(
         }
         if save_per_token and per_token_entropy:
             result['per_token_entropy'] = per_token_entropy
+        if save_per_token and per_token_nll:
+            result['per_token_nll'] = per_token_nll
         results.append(result)
 
     # DDP: 收集所有进程的结果
