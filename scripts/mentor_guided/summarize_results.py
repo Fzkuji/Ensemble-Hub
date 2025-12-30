@@ -718,6 +718,19 @@ def get_subset_n_test(data_dir: str, subset: str) -> int:
     return 0
 
 
+def compute_baseline_acc(data_dir: str, subset: str, tokens: int, split: str = "test") -> float:
+    """计算指定 token level 的 baseline 准确率"""
+    data_file = os.path.join(data_dir, subset, split, f"tokens{tokens}.json")
+    if not os.path.exists(data_file):
+        return 0
+    with open(data_file, 'r') as f:
+        data = json.load(f)
+    if not data:
+        return 0
+    correct = sum(1 for item in data if item.get('is_correct', False))
+    return correct / len(data)
+
+
 def print_classifier_comparison(data_dir: str, model_source: str = "individual", subsets: list = None):
     """打印分类器对比表格（包含各 token level 的准确率和长度）"""
     if subsets is None:
@@ -756,7 +769,7 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
         n = get_subset_n_test(data_dir, subset)
         total_n += n
 
-        # 获取各 token level 的数据
+        # 获取各 token level 的长度数据
         length_stats = compute_length_stats(data_dir, subset, "test")
 
         # 获取分类器结果
@@ -766,46 +779,42 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
         row = f"{subset:<22} {n:>6}  "
 
         for tokens in [0, 100, 500, 1000]:
+            # 从数据文件直接计算准确率
+            acc = compute_baseline_acc(data_dir, subset, tokens, "test")
             l_stat = length_stats.get(tokens)
-            if l_stat:
-                acc = l_stat.get('accuracy', 0)
-                m_len = l_stat.get('mentor', {}).get('mean', 0) if tokens > 0 else 0
-                i_len = l_stat.get('intern', {}).get('mean', 0)
+            m_len = l_stat.get('mentor', {}).get('mean', 0) if l_stat and tokens > 0 else 0
+            i_len = l_stat.get('intern', {}).get('mean', 0) if l_stat else 0
 
-                acc_str = f"{acc:.4f}" if acc else "-"
-                m_len_str = f"{m_len:.1f}" if m_len else "-"
-                i_len_str = f"{i_len:.1f}" if i_len else "-"
+            acc_str = f"{acc:.4f}" if acc else "-"
+            m_len_str = f"{m_len:.1f}" if m_len else "-"
+            i_len_str = f"{i_len:.1f}" if i_len else "-"
 
-                # 累计统计
-                if acc:
-                    totals[tokens]['acc'] += acc * n
-                    totals[tokens]['cnt'] += n
-                if m_len:
-                    totals[tokens]['m_len'] += m_len * n
-                    totals[tokens]['m_cnt'] += n
-                if i_len:
-                    totals[tokens]['i_len'] += i_len * n
-                    totals[tokens]['i_cnt'] += n
-            else:
-                acc_str = m_len_str = i_len_str = "-"
+            # 累计统计
+            if acc:
+                totals[tokens]['acc'] += acc * n
+                totals[tokens]['cnt'] += n
+            if m_len:
+                totals[tokens]['m_len'] += m_len * n
+                totals[tokens]['m_cnt'] += n
+            if i_len:
+                totals[tokens]['i_len'] += i_len * n
+                totals[tokens]['i_cnt'] += n
 
             row += f"{acc_str:>7} {m_len_str:>7} {i_len_str:>8} "
 
         # Mentor only (T-1)
-        mentor_stat = length_stats.get(-1)
-        if mentor_stat:
-            mentor_acc = mentor_stat.get('accuracy', 0)
-            mentor_len = mentor_stat.get('mentor', {}).get('mean', 0)
-            mentor_acc_str = f"{mentor_acc:.4f}" if mentor_acc else "-"
-            mentor_len_str = f"{mentor_len:.1f}" if mentor_len else "-"
-            if mentor_acc:
-                totals[-1]['acc'] += mentor_acc * n
-                totals[-1]['cnt'] += n
-            if mentor_len:
-                totals[-1]['m_len'] += mentor_len * n
-                totals[-1]['m_cnt'] += n
-        else:
-            mentor_acc_str = mentor_len_str = "-"
+        mentor_acc = compute_baseline_acc(data_dir, subset, -1, "test")
+        mentor_stats = compute_mentor_only_stats(data_dir, subset, "test")
+        mentor_len = mentor_stats['mentor_length_mean'] if mentor_stats else 0
+
+        mentor_acc_str = f"{mentor_acc:.4f}" if mentor_acc else "-"
+        mentor_len_str = f"{mentor_len:.1f}" if mentor_len else "-"
+        if mentor_acc:
+            totals[-1]['acc'] += mentor_acc * n
+            totals[-1]['cnt'] += n
+        if mentor_len:
+            totals[-1]['m_len'] += mentor_len * n
+            totals[-1]['m_cnt'] += n
 
         row += f"{mentor_acc_str:>7} {mentor_len_str:>7}  "
 
@@ -837,7 +846,7 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
             cascade_i_str = f"{cascade_i_len:.1f}" if cascade_i_len else "-"
 
             # Gap = cascade - T0
-            t0_acc = length_stats.get(0, {}).get('accuracy', 0) if length_stats.get(0) else 0
+            t0_acc = compute_baseline_acc(data_dir, subset, 0, "test")
             gap = cascade_acc - t0_acc if cascade_acc and t0_acc else 0
             gap_str = f"{gap:+.4f}" if gap else "-"
 
