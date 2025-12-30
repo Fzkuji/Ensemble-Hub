@@ -398,8 +398,8 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
     else:
         headers = ["Subset", "N", "T0", "T100", "T500", "T1000", "Mentor", "Oracle", "Cascade", "M-Gap", "O-Gap"]
 
-    # 使用 tabulate 输出表格
-    print(tabulate(table_data, headers=headers, tablefmt="simple", numalign="right", stralign="left"))
+    # 使用 tabulate 输出 Markdown 格式表格
+    print(tabulate(table_data, headers=headers, tablefmt="pipe", numalign="right", stralign="left"))
 
     # 分类器对比表格 (LoRA vs MLP vs PPL vs Ensemble)
     print_classifier_comparison(data_dir, model_source, SUBSETS)
@@ -670,8 +670,8 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
         headers.extend([f"{method}", f"Len"])
     headers.extend(["Oracle", "Best"])
 
-    # 使用 tabulate 输出表格
-    print(tabulate(table_data, headers=headers, tablefmt="simple", numalign="right", stralign="left"))
+    # 使用 tabulate 输出 Markdown 格式表格
+    print(tabulate(table_data, headers=headers, tablefmt="pipe", numalign="right", stralign="left"))
 
 
 def summarize_single(data_dir: str, subset: str, model_dir: str = None, show_length: bool = True):
