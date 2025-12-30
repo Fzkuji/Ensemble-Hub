@@ -344,7 +344,7 @@ def main():
         subsets,
         token_levels,
         args.output_dir,
-        normalize_length=not args.no_normalize,
+        normalize_length=False,  # 使用实际token位置
         num_bins=args.num_bins,
         max_length=args.max_length,
     )
