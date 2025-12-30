@@ -103,7 +103,7 @@ def plot_metric_trends(
     colors = {100: '#1f77b4', 500: '#ff7f0e', 1000: '#2ca02c'}
     labels = {100: 'T=100', 500: 'T=500', 1000: 'T=1000'}
 
-    # 绘制两个图：Sufficient 和 Non-sufficient
+    # 绘制两个图：Sufficient 和 Insufficient
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     # Plot 1: Sufficient samples
@@ -122,19 +122,17 @@ def plot_metric_trends(
         )
 
         if len(curve) > 0:
-            if normalize_length:
-                x = np.linspace(0, 100, len(curve))
-                ax.plot(x, curve, color=colors[token_level], label=f'{labels[token_level]} (n={len(samples)})', linewidth=2)
-            else:
-                ax.plot(curve, color=colors[token_level], label=f'{labels[token_level]} (n={len(samples)})', linewidth=2)
+            x = np.arange(1, len(curve) + 1)  # 从1开始，避免log10(0)
+            ax.plot(x, curve, color=colors[token_level], label=f'{labels[token_level]} (n={len(samples)})', linewidth=2)
 
-    ax.set_title(f'Sufficient (SLM Correct)', fontsize=12)
-    ax.set_xlabel('Position (%)' if normalize_length else 'Token Position', fontsize=11)
+    ax.set_title('Sufficient', fontsize=12)
+    ax.set_xlabel('Token Position (log scale)', fontsize=11)
+    ax.set_xscale('log')
     ax.set_ylabel(f'Average {metric_name}', fontsize=11)
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Plot 2: Non-sufficient samples
+    # Plot 2: Insufficient samples
     ax = axes[1]
     for token_level in token_levels:
         samples = all_non_sufficient[token_level]
@@ -150,14 +148,12 @@ def plot_metric_trends(
         )
 
         if len(curve) > 0:
-            if normalize_length:
-                x = np.linspace(0, 100, len(curve))
-                ax.plot(x, curve, color=colors[token_level], label=f'{labels[token_level]} (n={len(samples)})', linewidth=2)
-            else:
-                ax.plot(curve, color=colors[token_level], label=f'{labels[token_level]} (n={len(samples)})', linewidth=2)
+            x = np.arange(1, len(curve) + 1)
+            ax.plot(x, curve, color=colors[token_level], label=f'{labels[token_level]} (n={len(samples)})', linewidth=2)
 
-    ax.set_title(f'Non-sufficient (SLM Wrong)', fontsize=12)
-    ax.set_xlabel('Position (%)' if normalize_length else 'Token Position', fontsize=11)
+    ax.set_title('Insufficient', fontsize=12)
+    ax.set_xlabel('Token Position (log scale)', fontsize=11)
+    ax.set_xscale('log')
     ax.set_ylabel(f'Average {metric_name}', fontsize=11)
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -168,7 +164,7 @@ def plot_metric_trends(
     plt.close()
     print(f"Saved: {output_file}")
 
-    # 绘制对比图：同一 token level，比较 sufficient vs non-sufficient
+    # 绘制对比图：同一 token level，比较 sufficient vs insufficient
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
     for idx, token_level in enumerate(token_levels):
@@ -185,13 +181,10 @@ def plot_metric_trends(
                 max_length=max_length,
             )
             if len(suff_curve) > 0:
-                if normalize_length:
-                    x = np.linspace(0, 100, len(suff_curve))
-                    ax.plot(x, suff_curve, color='green', label=f'Sufficient (n={len(suff_samples)})', linewidth=2)
-                else:
-                    ax.plot(suff_curve, color='green', label=f'Sufficient (n={len(suff_samples)})', linewidth=2)
+                x = np.arange(1, len(suff_curve) + 1)
+                ax.plot(x, suff_curve, color='green', label=f'Sufficient (n={len(suff_samples)})', linewidth=2)
 
-        # Non-sufficient
+        # Insufficient
         non_suff_samples = all_non_sufficient[token_level]
         if non_suff_samples:
             non_suff_curve = compute_average_curve(
@@ -202,14 +195,12 @@ def plot_metric_trends(
                 max_length=max_length,
             )
             if len(non_suff_curve) > 0:
-                if normalize_length:
-                    x = np.linspace(0, 100, len(non_suff_curve))
-                    ax.plot(x, non_suff_curve, color='red', label=f'Non-sufficient (n={len(non_suff_samples)})', linewidth=2)
-                else:
-                    ax.plot(non_suff_curve, color='red', label=f'Non-sufficient (n={len(non_suff_samples)})', linewidth=2)
+                x = np.arange(1, len(non_suff_curve) + 1)
+                ax.plot(x, non_suff_curve, color='red', label=f'Insufficient (n={len(non_suff_samples)})', linewidth=2)
 
-        ax.set_title(f'Token Level = {token_level}', fontsize=12)
-        ax.set_xlabel('Position (%)' if normalize_length else 'Token Position', fontsize=11)
+        ax.set_title(f'T = {token_level}', fontsize=12)
+        ax.set_xlabel('Token Position (log scale)', fontsize=11)
+        ax.set_xscale('log')
         ax.set_ylabel(f'Average {metric_name}', fontsize=11)
         ax.legend()
         ax.grid(True, alpha=0.3)
