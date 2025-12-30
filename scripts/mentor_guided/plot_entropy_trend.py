@@ -95,7 +95,7 @@ def plot_metric_trends(
     output_dir: str,
     metric_field: str,
     metric_name: str,
-    normalize_length: bool = True,
+    normalize_length: bool = False,
     num_bins: int = 100,
     max_length: int = 2000,
 ):
