@@ -719,116 +719,196 @@ def get_subset_n_test(data_dir: str, subset: str) -> int:
 
 
 def print_classifier_comparison(data_dir: str, model_source: str = "individual", subsets: list = None):
-    """打印分类器对比表格（包含准确率和长度）"""
+    """打印分类器对比表格（包含各 token level 的准确率和长度）"""
     if subsets is None:
         subsets = detect_subsets(data_dir, "test")
 
     source_label = "[individual]" if model_source == "individual" else "[all]"
-    print("\n" + "=" * 160)
-    print(f"                                          CLASSIFIER COMPARISON {source_label}")
-    print("=" * 160)
-    print(f"{'Subset':<20} {'N':>5} {'LoRA Acc':>10} {'LoRA Len':>9} {'MLP Acc':>10} {'MLP Len':>9} {'PPL Acc':>10} {'PPL Len':>9} {'Ens Acc':>10} {'Oracle':>10} {'Best':>8}")
-    print("-" * 160)
 
-    # 加权平均统计
-    totals = {'lora': 0, 'mlp': 0, 'ppl': 0, 'ensemble': 0}
-    counts = {'lora': 0, 'mlp': 0, 'ppl': 0, 'ensemble': 0}
-    len_totals = {'lora': 0, 'mlp': 0, 'ppl': 0, 'ensemble': 0}
-    len_counts = {'lora': 0, 'mlp': 0, 'ppl': 0, 'ensemble': 0}
+    # 打印表头
+    W = 200  # 总宽度
+    print("\n" + "=" * W)
+    print(f"CLASSIFIER COMPARISON {source_label}")
+    print("=" * W)
+
+    # 两行表头
+    header1 = f"{'Subset':<22} {'N':>6}  "
+    header2 = f"{'':<22} {'':>6}  "
+
+    for tokens in [0, 100, 500, 1000]:
+        header1 += f"{'T' + str(tokens):^24} "
+        header2 += f"{'acc':>7} {'m_len':>7} {'i_len':>8} "
+
+    header1 += f"{'Mentor':^16} {'Oracle':^24} {'Cascade':^24} {'Gap':>8}"
+    header2 += f"{'acc':>7} {'len':>7}  {'acc':>7} {'m_len':>7} {'i_len':>8} {'acc':>7} {'m_len':>7} {'i_len':>8} {'':<8}"
+
+    print(header1)
+    print(header2)
+    print("-" * W)
+
+    # 统计变量
     total_n = 0
+    totals = {t: {'acc': 0, 'm_len': 0, 'i_len': 0, 'cnt': 0, 'm_cnt': 0, 'i_cnt': 0} for t in [0, 100, 500, 1000, -1]}
+    oracle_totals = {'acc': 0, 'm_len': 0, 'i_len': 0, 'cnt': 0, 'm_cnt': 0, 'i_cnt': 0}
+    cascade_totals = {'acc': 0, 'm_len': 0, 'i_len': 0, 'cnt': 0, 'm_cnt': 0, 'i_cnt': 0}
 
     for subset in subsets:
         n = get_subset_n_test(data_dir, subset)
         total_n += n
 
-        lora_r = get_classifier_results(data_dir, subset, "lora", model_source)
+        # 获取各 token level 的数据
+        length_stats = compute_length_stats(data_dir, subset, "test")
+
+        # 获取分类器结果
         mlp_r = get_classifier_results(data_dir, subset, "mlp", model_source)
-        ppl_r = get_classifier_results(data_dir, subset, "ppl", model_source)
-        ens_r = get_classifier_results(data_dir, subset, "ensemble", model_source)
 
-        lora_acc = lora_r['cascade_acc'] if lora_r else None
-        mlp_acc = mlp_r['cascade_acc'] if mlp_r else None
-        ppl_acc = ppl_r['cascade_acc'] if ppl_r else None
-        ens_acc = ens_r['cascade_acc'] if ens_r else None
+        # 构建行输出
+        row = f"{subset:<22} {n:>6}  "
 
-        lora_len = lora_r.get('cascade_length', 0) if lora_r else 0
-        mlp_len = mlp_r.get('cascade_length', 0) if mlp_r else 0
-        ppl_len = ppl_r.get('cascade_length', 0) if ppl_r else 0
-        ens_len = ens_r.get('cascade_length', 0) if ens_r else 0
+        for tokens in [0, 100, 500, 1000]:
+            l_stat = length_stats.get(tokens)
+            if l_stat:
+                acc = l_stat.get('accuracy', 0)
+                m_len = l_stat.get('mentor', {}).get('mean', 0) if tokens > 0 else 0
+                i_len = l_stat.get('intern', {}).get('mean', 0)
 
-        # Oracle (优先使用 PPL 的，因为它在原始测试数据上评估)
-        oracle = None
-        if ppl_r and ppl_r.get('oracle_acc'):
-            oracle = ppl_r['oracle_acc']
-        elif mlp_r and mlp_r.get('oracle_acc'):
-            oracle = mlp_r['oracle_acc']
-        elif lora_r and lora_r.get('oracle_acc'):
-            oracle = lora_r['oracle_acc']
-        elif ens_r and ens_r.get('oracle_acc'):
-            oracle = ens_r['oracle_acc']
+                acc_str = f"{acc:.4f}" if acc else "-"
+                m_len_str = f"{m_len:.1f}" if m_len else "-"
+                i_len_str = f"{i_len:.1f}" if i_len else "-"
 
-        # 格式化输出
-        lora_acc_str = f"{lora_acc:.4f}" if lora_acc is not None else "-"
-        mlp_acc_str = f"{mlp_acc:.4f}" if mlp_acc is not None else "-"
-        ppl_acc_str = f"{ppl_acc:.4f}" if ppl_acc is not None else "-"
-        ens_acc_str = f"{ens_acc:.4f}" if ens_acc is not None else "-"
-        oracle_str = f"{oracle:.4f}" if oracle is not None else "-"
+                # 累计统计
+                if acc:
+                    totals[tokens]['acc'] += acc * n
+                    totals[tokens]['cnt'] += n
+                if m_len:
+                    totals[tokens]['m_len'] += m_len * n
+                    totals[tokens]['m_cnt'] += n
+                if i_len:
+                    totals[tokens]['i_len'] += i_len * n
+                    totals[tokens]['i_cnt'] += n
+            else:
+                acc_str = m_len_str = i_len_str = "-"
 
-        lora_len_str = f"{lora_len:.0f}" if lora_len else "-"
-        mlp_len_str = f"{mlp_len:.0f}" if mlp_len else "-"
-        ppl_len_str = f"{ppl_len:.0f}" if ppl_len else "-"
-        ens_len_str = f"{ens_len:.0f}" if ens_len else "-"
+            row += f"{acc_str:>7} {m_len_str:>7} {i_len_str:>8} "
 
-        # 找最佳并累计加权统计
-        accs = []
-        if lora_acc is not None and lora_acc > 0:
-            accs.append(('LoRA', lora_acc))
-            totals['lora'] += lora_acc * n
-            counts['lora'] += n
-            if lora_len:
-                len_totals['lora'] += lora_len * n
-                len_counts['lora'] += n
-        if mlp_acc is not None and mlp_acc > 0:
-            accs.append(('MLP', mlp_acc))
-            totals['mlp'] += mlp_acc * n
-            counts['mlp'] += n
-            if mlp_len:
-                len_totals['mlp'] += mlp_len * n
-                len_counts['mlp'] += n
-        if ppl_acc is not None and ppl_acc > 0:
-            accs.append(('PPL', ppl_acc))
-            totals['ppl'] += ppl_acc * n
-            counts['ppl'] += n
-            if ppl_len:
-                len_totals['ppl'] += ppl_len * n
-                len_counts['ppl'] += n
-        if ens_acc is not None and ens_acc > 0:
-            accs.append(('Ens', ens_acc))
-            totals['ensemble'] += ens_acc * n
-            counts['ensemble'] += n
-            if ens_len:
-                len_totals['ensemble'] += ens_len * n
-                len_counts['ensemble'] += n
+        # Mentor only (T-1)
+        mentor_stat = length_stats.get(-1)
+        if mentor_stat:
+            mentor_acc = mentor_stat.get('accuracy', 0)
+            mentor_len = mentor_stat.get('mentor', {}).get('mean', 0)
+            mentor_acc_str = f"{mentor_acc:.4f}" if mentor_acc else "-"
+            mentor_len_str = f"{mentor_len:.1f}" if mentor_len else "-"
+            if mentor_acc:
+                totals[-1]['acc'] += mentor_acc * n
+                totals[-1]['cnt'] += n
+            if mentor_len:
+                totals[-1]['m_len'] += mentor_len * n
+                totals[-1]['m_cnt'] += n
+        else:
+            mentor_acc_str = mentor_len_str = "-"
 
-        best = max(accs, key=lambda x: x[1])[0] if accs else "-"
+        row += f"{mentor_acc_str:>7} {mentor_len_str:>7}  "
 
-        print(f"{subset:<20} {n:>5} {lora_acc_str:>10} {lora_len_str:>9} {mlp_acc_str:>10} {mlp_len_str:>9} {ppl_acc_str:>10} {ppl_len_str:>9} {ens_acc_str:>10} {oracle_str:>10} {best:>8}")
+        # Oracle 和 Cascade (从分类器结果获取)
+        if mlp_r:
+            oracle_acc = mlp_r.get('oracle_acc', 0)
+            cascade_acc = mlp_r.get('cascade_acc', 0)
 
-    print("-" * 160)
+            # 尝试从 results.json 获取详细长度
+            result_file = os.path.join(data_dir, subset, "mlp_model", "results.json")
+            oracle_m_len = oracle_i_len = cascade_m_len = cascade_i_len = 0
+            if os.path.exists(result_file):
+                with open(result_file, 'r') as f:
+                    r = json.load(f)
+                oracle_len = r.get('test_oracle_length', r.get('oracle_length', {}))
+                cascade_len = r.get('test_cascade_length', r.get('cascade_length', {}))
+                if isinstance(oracle_len, dict):
+                    oracle_m_len = oracle_len.get('mentor_mean', oracle_len.get('mentor', 0))
+                    oracle_i_len = oracle_len.get('intern_mean', oracle_len.get('intern', 0))
+                if isinstance(cascade_len, dict):
+                    cascade_m_len = cascade_len.get('mentor_mean', cascade_len.get('mentor', 0))
+                    cascade_i_len = cascade_len.get('intern_mean', cascade_len.get('intern', 0))
 
-    # 计算加权平均
-    lora_avg = f"{totals['lora'] / counts['lora']:.4f}" if counts['lora'] > 0 else "-"
-    mlp_avg = f"{totals['mlp'] / counts['mlp']:.4f}" if counts['mlp'] > 0 else "-"
-    ppl_avg = f"{totals['ppl'] / counts['ppl']:.4f}" if counts['ppl'] > 0 else "-"
-    ens_avg = f"{totals['ensemble'] / counts['ensemble']:.4f}" if counts['ensemble'] > 0 else "-"
+            oracle_acc_str = f"{oracle_acc:.4f}" if oracle_acc else "-"
+            oracle_m_str = f"{oracle_m_len:.1f}" if oracle_m_len else "-"
+            oracle_i_str = f"{oracle_i_len:.1f}" if oracle_i_len else "-"
+            cascade_acc_str = f"{cascade_acc:.4f}" if cascade_acc else "-"
+            cascade_m_str = f"{cascade_m_len:.1f}" if cascade_m_len else "-"
+            cascade_i_str = f"{cascade_i_len:.1f}" if cascade_i_len else "-"
 
-    lora_len_avg = f"{len_totals['lora'] / len_counts['lora']:.0f}" if len_counts['lora'] > 0 else "-"
-    mlp_len_avg = f"{len_totals['mlp'] / len_counts['mlp']:.0f}" if len_counts['mlp'] > 0 else "-"
-    ppl_len_avg = f"{len_totals['ppl'] / len_counts['ppl']:.0f}" if len_counts['ppl'] > 0 else "-"
-    ens_len_avg = f"{len_totals['ensemble'] / len_counts['ensemble']:.0f}" if len_counts['ensemble'] > 0 else "-"
+            # Gap = cascade - T0
+            t0_acc = length_stats.get(0, {}).get('accuracy', 0) if length_stats.get(0) else 0
+            gap = cascade_acc - t0_acc if cascade_acc and t0_acc else 0
+            gap_str = f"{gap:+.4f}" if gap else "-"
 
-    print(f"{'TOTAL (weighted)':<20} {total_n:>5} {lora_avg:>10} {lora_len_avg:>9} {mlp_avg:>10} {mlp_len_avg:>9} {ppl_avg:>10} {ppl_len_avg:>9} {ens_avg:>10}")
-    print("=" * 160)
+            # 累计
+            if oracle_acc:
+                oracle_totals['acc'] += oracle_acc * n
+                oracle_totals['cnt'] += n
+            if oracle_m_len:
+                oracle_totals['m_len'] += oracle_m_len * n
+                oracle_totals['m_cnt'] += n
+            if oracle_i_len:
+                oracle_totals['i_len'] += oracle_i_len * n
+                oracle_totals['i_cnt'] += n
+            if cascade_acc:
+                cascade_totals['acc'] += cascade_acc * n
+                cascade_totals['cnt'] += n
+            if cascade_m_len:
+                cascade_totals['m_len'] += cascade_m_len * n
+                cascade_totals['m_cnt'] += n
+            if cascade_i_len:
+                cascade_totals['i_len'] += cascade_i_len * n
+                cascade_totals['i_cnt'] += n
+        else:
+            oracle_acc_str = oracle_m_str = oracle_i_str = "-"
+            cascade_acc_str = cascade_m_str = cascade_i_str = "-"
+            gap_str = "-"
+
+        row += f"{oracle_acc_str:>7} {oracle_m_str:>7} {oracle_i_str:>8} "
+        row += f"{cascade_acc_str:>7} {cascade_m_str:>7} {cascade_i_str:>8} {gap_str:>8}"
+
+        print(row)
+
+    print("-" * W)
+
+    # 打印 TOTAL 行
+    row = f"{'TOTAL (weighted)':<22} {total_n:>6}  "
+
+    for tokens in [0, 100, 500, 1000]:
+        t = totals[tokens]
+        acc_str = f"{t['acc']/t['cnt']:.4f}" if t['cnt'] > 0 else "-"
+        m_len_str = f"{t['m_len']/t['m_cnt']:.1f}" if t['m_cnt'] > 0 else "-"
+        i_len_str = f"{t['i_len']/t['i_cnt']:.1f}" if t['i_cnt'] > 0 else "-"
+        row += f"{acc_str:>7} {m_len_str:>7} {i_len_str:>8} "
+
+    # Mentor
+    t = totals[-1]
+    mentor_acc_str = f"{t['acc']/t['cnt']:.4f}" if t['cnt'] > 0 else "-"
+    mentor_len_str = f"{t['m_len']/t['m_cnt']:.1f}" if t['m_cnt'] > 0 else "-"
+    row += f"{mentor_acc_str:>7} {mentor_len_str:>7}  "
+
+    # Oracle
+    oracle_acc_str = f"{oracle_totals['acc']/oracle_totals['cnt']:.4f}" if oracle_totals['cnt'] > 0 else "-"
+    oracle_m_str = f"{oracle_totals['m_len']/oracle_totals['m_cnt']:.1f}" if oracle_totals['m_cnt'] > 0 else "-"
+    oracle_i_str = f"{oracle_totals['i_len']/oracle_totals['i_cnt']:.1f}" if oracle_totals['i_cnt'] > 0 else "-"
+    row += f"{oracle_acc_str:>7} {oracle_m_str:>7} {oracle_i_str:>8} "
+
+    # Cascade
+    cascade_acc_str = f"{cascade_totals['acc']/cascade_totals['cnt']:.4f}" if cascade_totals['cnt'] > 0 else "-"
+    cascade_m_str = f"{cascade_totals['m_len']/cascade_totals['m_cnt']:.1f}" if cascade_totals['m_cnt'] > 0 else "-"
+    cascade_i_str = f"{cascade_totals['i_len']/cascade_totals['i_cnt']:.1f}" if cascade_totals['i_cnt'] > 0 else "-"
+
+    # Gap
+    t0_avg = totals[0]['acc'] / totals[0]['cnt'] if totals[0]['cnt'] > 0 else 0
+    cascade_avg = cascade_totals['acc'] / cascade_totals['cnt'] if cascade_totals['cnt'] > 0 else 0
+    gap = cascade_avg - t0_avg if cascade_avg and t0_avg else 0
+    gap_str = f"{gap:+.4f}" if gap else "-"
+
+    row += f"{cascade_acc_str:>7} {cascade_m_str:>7} {cascade_i_str:>8} {gap_str:>8}"
+
+    print(row)
+    print("=" * W)
 
 
 def summarize_single(data_dir: str, subset: str, model_dir: str = None, show_length: bool = True):
