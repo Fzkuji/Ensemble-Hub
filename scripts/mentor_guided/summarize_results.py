@@ -153,11 +153,13 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
 
     # Mentor 列宽度 (acc + len)
     W_MENTOR = W_ACC + W_LEN
-    # 计算实际行宽 (T0-T1000 各 24, Mentor 16, Oracle/Cascade 各 24)
+    # 两个 Gap 列
+    W_GAP2 = W_GAP * 2  # M-Gap 和 O-Gap
+    # 计算实际行宽 (T0-T1000 各 24, Mentor 16, Oracle/Cascade 各 24, 两个Gap)
     if show_length:
-        line_width = W_SUBSET + W_N + W_TOKEN_GROUP * 4 + W_MENTOR + W_TOKEN_GROUP * 2 + W_GAP + 10
+        line_width = W_SUBSET + W_N + W_TOKEN_GROUP * 4 + W_MENTOR + W_TOKEN_GROUP * 2 + W_GAP2 + 10
     else:
-        line_width = 110
+        line_width = 120
 
     source_label = "[individual]" if model_source == "individual" else "[all]"
     print("=" * line_width)
@@ -167,12 +169,12 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
     if show_length:
         # Mentor 列宽度 (acc + len，没有 i_len)
         W_MENTOR = W_ACC + W_LEN
-        # 表头第一行：Subset, N, T0, T100, T500, T1000, Mentor, Oracle, Cascade, Gap
+        # 表头第一行：Subset, N, T0, T100, T500, T1000, Mentor, Oracle, Cascade, M-Gap, O-Gap
         print(f"{'Subset':<{W_SUBSET}} {'N':<{W_N}} "
               f"{'T0':<{W_TOKEN_GROUP}} {'T100':<{W_TOKEN_GROUP}} "
               f"{'T500':<{W_TOKEN_GROUP}} {'T1000':<{W_TOKEN_GROUP}} "
               f"{'Mentor':<{W_MENTOR}} "
-              f"{'Oracle':<{W_TOKEN_GROUP}} {'Cascade':<{W_TOKEN_GROUP}} {'Gap':<{W_GAP}}")
+              f"{'Oracle':<{W_TOKEN_GROUP}} {'Cascade':<{W_TOKEN_GROUP}} {'M-Gap':<{W_GAP}}{'O-Gap':<{W_GAP}}")
         # 表头第二行：acc, m_len, i_len
         print(f"{'':<{W_SUBSET}} {'':<{W_N}} "
               f"{'acc':<{W_ACC}}{'m_len':<{W_LEN}}{'i_len':<{W_LEN}} "
@@ -185,7 +187,7 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
     else:
         print(f"{'Subset':<{W_SUBSET}} {'N':<{W_N}} {'T0':<{W_ACC}} {'T100':<{W_ACC}} "
               f"{'T500':<{W_ACC}} {'T1000':<{W_ACC}} {'Mentor':<{W_ACC}} {'Oracle':<{W_ORACLE}} "
-              f"{'Cascade':<{W_CASCADE}} {'Gap':<{W_GAP}}")
+              f"{'Cascade':<{W_CASCADE}} {'M-Gap':<{W_GAP}}{'O-Gap':<{W_GAP}}")
 
     print("-" * line_width)
 
@@ -208,9 +210,6 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
     total_oracle_i_len = 0
     total_cascade_m_len = 0
     total_cascade_i_len = 0
-
-    # Collect gap data for later analysis
-    collected_gaps = []  # [(subset, gap, n, oracle, cascade)]
 
     # 根据 model_source 决定加载路径
     all_mlp_results = None
@@ -352,12 +351,16 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
             cascade_m_str = f"{cascade_m:<{W_LEN}.1f}" if cascade_m else f"{'-':<{W_LEN}}"
             cascade_i_str = f"{cascade_i:<{W_LEN}.1f}" if cascade_i else f"{'-':<{W_LEN}}"
 
+            # M-Gap = Cascade - Mentor, O-Gap = Oracle - Cascade
+            m_gap = cascade - mentor_acc if mentor_acc else 0
+            o_gap = oracle - cascade
+
             print(f"{subset:<{W_SUBSET}} {n:<{W_N}} "
                   f"{fmt_token_group(t0, l0)} {fmt_token_group(t100, l100)} "
                   f"{fmt_token_group(t500, l500)} {fmt_token_group(t1000, l1000)} "
                   f"{mentor_acc_str}{mentor_len_str} "
                   f"{oracle:<{W_ACC}.4f}{oracle_m_str}{oracle_i_str} "
-                  f"{cascade:<{W_ACC}.4f}{cascade_m_str}{cascade_i_str} {gap:+.4f}")
+                  f"{cascade:<{W_ACC}.4f}{cascade_m_str}{cascade_i_str} {m_gap:+.4f}  {o_gap:+.4f}")
 
             # 累计长度统计
             for tokens, l_stat in [(0, l0), (100, l100), (500, l500), (1000, l1000)]:
@@ -387,9 +390,12 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
             mentor_stats = compute_mentor_only_stats(data_dir, subset)
             mentor_acc = mentor_stats['accuracy'] if mentor_stats else 0
             mentor_acc_str = f"{mentor_acc:<{W_ACC}.4f}" if mentor_acc else "-"
+            # M-Gap = Cascade - Mentor, O-Gap = Oracle - Cascade
+            m_gap = cascade - mentor_acc if mentor_acc else 0
+            o_gap = oracle - cascade
             print(f"{subset:<{W_SUBSET}} {n:<{W_N}} {t0:<{W_ACC}.4f} {t100:<{W_ACC}.4f} "
                   f"{t500:<{W_ACC}.4f} {t1000:<{W_ACC}.4f} {mentor_acc_str:<{W_ACC}} {oracle:<{W_ORACLE}.4f} "
-                  f"{cascade:<{W_CASCADE}.4f} {gap:+.4f}")
+                  f"{cascade:<{W_CASCADE}.4f} {m_gap:+.4f}  {o_gap:+.4f}")
             # 累计 Mentor（不显示长度时）
             if mentor_stats:
                 total_mentor_acc += mentor_acc * n
@@ -402,9 +408,6 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
         total_t100 += t100 * n
         total_t500 += t500 * n
         total_t1000 += t1000 * n
-
-        # Collect for gap analysis
-        collected_gaps.append((subset, gap, n, oracle, cascade))
 
     print("-" * line_width)
     if total_n > 0:
@@ -446,44 +449,27 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
             cascade_m_str = f"{avg_cascade_m:<{W_LEN}.1f}" if avg_cascade_m else f"{'-':<{W_LEN}}"
             cascade_i_str = f"{avg_cascade_i:<{W_LEN}.1f}" if avg_cascade_i else f"{'-':<{W_LEN}}"
             
+            # M-Gap = Cascade - Mentor, O-Gap = Oracle - Cascade
+            avg_m_gap = avg_cascade - avg_mentor_acc if avg_mentor_acc else 0
+            avg_o_gap = avg_oracle - avg_cascade
+
             print(f"{'TOTAL (weighted)':<{W_SUBSET}} {total_n:<{W_N}} "
                   f"{fmt_total_token_group(avg_t0, 0)} {fmt_total_token_group(avg_t100, 100)} "
                   f"{fmt_total_token_group(avg_t500, 500)} {fmt_total_token_group(avg_t1000, 1000)} "
                   f"{mentor_acc_str}{mentor_len_str} "
                   f"{avg_oracle:<{W_ACC}.4f}{oracle_m_str}{oracle_i_str} "
-                  f"{avg_cascade:<{W_ACC}.4f}{cascade_m_str}{cascade_i_str} {avg_gap:+.4f}")
+                  f"{avg_cascade:<{W_ACC}.4f}{cascade_m_str}{cascade_i_str} {avg_m_gap:+.4f}  {avg_o_gap:+.4f}")
         else:
             avg_mentor_acc = total_mentor_acc / total_n if total_n > 0 else 0
             mentor_acc_str = f"{avg_mentor_acc:<{W_ACC}.4f}" if avg_mentor_acc else "-"
+            # M-Gap = Cascade - Mentor, O-Gap = Oracle - Cascade
+            avg_m_gap = avg_cascade - avg_mentor_acc if avg_mentor_acc else 0
+            avg_o_gap = avg_oracle - avg_cascade
             print(f"{'TOTAL (weighted)':<{W_SUBSET}} {total_n:<{W_N}} {avg_t0:<{W_ACC}.4f} "
                   f"{avg_t100:<{W_ACC}.4f} {avg_t500:<{W_ACC}.4f} {avg_t1000:<{W_ACC}.4f} "
-                  f"{mentor_acc_str:<{W_ACC}} {avg_oracle:<{W_ORACLE}.4f} {avg_cascade:<{W_CASCADE}.4f} {avg_gap:+.4f}")
+                  f"{mentor_acc_str:<{W_ACC}} {avg_oracle:<{W_ORACLE}.4f} {avg_cascade:<{W_CASCADE}.4f} {avg_m_gap:+.4f}  {avg_o_gap:+.4f}")
 
     print("=" * line_width)
-
-    # Additional analysis (using collected data from main loop)
-    print("\n" + "=" * 60)
-    print("Gap Analysis (Cascade - Best Baseline)")
-    print("=" * 60)
-
-    if collected_gaps:
-        # Sort by gap descending
-        sorted_gaps = sorted(collected_gaps, key=lambda x: x[1], reverse=True)
-        for subset, gap, n, oracle, cascade in sorted_gaps:
-            status = "+" if gap > 0 else ""
-            print(f"  {subset:<{W_SUBSET}}: {status}{gap:.4f} ({status}{gap*100:.2f}%)")
-
-    # Oracle gap analysis
-    print("\n" + "=" * 60)
-    print("Oracle Gap Analysis (Oracle - Cascade)")
-    print("=" * 60)
-
-    if collected_gaps:
-        # Sort by oracle gap descending
-        oracle_gaps = [(s, o - c, n) for s, g, n, o, c in collected_gaps]
-        oracle_gaps.sort(key=lambda x: x[1], reverse=True)
-        for subset, gap, n in oracle_gaps:
-            print(f"  {subset:<{W_SUBSET}}: {gap:.4f} ({gap*100:.2f}%)")
 
     # 分类器对比表格 (LoRA vs MLP vs PPL vs Ensemble)
     print_classifier_comparison(data_dir, model_source, SUBSETS)
