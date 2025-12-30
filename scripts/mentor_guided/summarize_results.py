@@ -196,14 +196,27 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
             if os.path.exists(mlp_file):
                 with open(mlp_file, 'r') as f:
                     mlp_r = json.load(f)
-                r = {
-                    'n_test': mlp_r.get('n_val', 0),
-                    'baseline': mlp_r.get('test_per_stage_baseline_acc', mlp_r.get('per_stage_baseline_acc', {})),
-                    'oracle': mlp_r.get('test_oracle_acc', mlp_r.get('oracle_acc', 0)),
-                    'cascade_accuracy': mlp_r.get('test_best_cascade_acc', mlp_r.get('best_cascade_acc', 0)),
-                    'oracle_length': mlp_r.get('test_oracle_length', mlp_r.get('oracle_length', {})),
-                    'cascade_length': mlp_r.get('test_cascade_length', mlp_r.get('cascade_length', {})),
-                }
+                # 优先从 test_results_per_subset 获取测试集结果
+                test_subset_results = mlp_r.get('test_results_per_subset', {}).get(subset, {})
+                if test_subset_results:
+                    r = {
+                        'n_test': test_subset_results.get('n_test', 0),
+                        'baseline': test_subset_results.get('per_stage_baseline_acc', {}),
+                        'oracle': test_subset_results.get('oracle_acc', 0),
+                        'cascade_accuracy': test_subset_results.get('cascade_acc', 0),
+                        'oracle_length': test_subset_results.get('oracle_length', {}),
+                        'cascade_length': test_subset_results.get('cascade_length', {}),
+                    }
+                else:
+                    # fallback to old format
+                    r = {
+                        'n_test': mlp_r.get('n_val', 0),
+                        'baseline': mlp_r.get('test_per_stage_baseline_acc', mlp_r.get('per_stage_baseline_acc', {})),
+                        'oracle': mlp_r.get('test_oracle_acc', mlp_r.get('oracle_acc', 0)),
+                        'cascade_accuracy': mlp_r.get('test_best_cascade_acc', mlp_r.get('best_cascade_acc', 0)),
+                        'oracle_length': mlp_r.get('test_oracle_length', mlp_r.get('oracle_length', {})),
+                        'cascade_length': mlp_r.get('test_cascade_length', mlp_r.get('cascade_length', {})),
+                    }
             if r is None:
                 result_file = os.path.join(data_dir, subset, "lora_model", "cascade_eval.json")
                 if os.path.exists(result_file):
