@@ -573,7 +573,7 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
 
 def get_classifier_results(data_dir: str, subset: str, model_type: str, model_source: str = "individual"):
     """获取指定分类器的结果
-    
+
     Args:
         data_dir: 数据目录
         subset: 子集名称
@@ -586,9 +586,16 @@ def get_classifier_results(data_dir: str, subset: str, model_type: str, model_so
         if os.path.exists(result_file):
             with open(result_file, 'r') as f:
                 r = json.load(f)
+            # 获取长度信息
+            cascade_len = r.get('test_cascade_length', r.get('cascade_length', {}))
+            if isinstance(cascade_len, dict):
+                avg_len = cascade_len.get('mean', cascade_len.get('avg', 0))
+            else:
+                avg_len = cascade_len if cascade_len else 0
             return {
                 'cascade_acc': r.get('test_best_cascade_acc', r.get('best_cascade_acc', r.get('cascade_acc', 0))),
                 'oracle_acc': r.get('test_oracle_acc', r.get('oracle_acc', 0)),
+                'cascade_length': avg_len,
                 'source': 'individual',
             }
         
@@ -598,16 +605,22 @@ def get_classifier_results(data_dir: str, subset: str, model_type: str, model_so
             if os.path.exists(lora_eval_file):
                 with open(lora_eval_file, 'r') as f:
                     r = json.load(f)
+                cascade_len = r.get('cascade_length', r.get('avg_length', {}))
+                if isinstance(cascade_len, dict):
+                    avg_len = cascade_len.get('mean', cascade_len.get('avg', 0))
+                else:
+                    avg_len = cascade_len if cascade_len else 0
                 return {
                     'cascade_acc': r.get('cascade_accuracy', 0),
                     'oracle_acc': r.get('oracle', 0),
+                    'cascade_length': avg_len,
                     'source': 'individual',
                 }
-    
+
     elif model_source == "all":
         # 从 all 目录加载合并训练的结果
         all_model_dir = os.path.join(data_dir, "all", f"{model_type}_model")
-        
+
         # 对于 MLP，检查 per-subset 结果
         if model_type == "mlp":
             for fname in [f"results_{subset}.json", "results_all.json", "results.json"]:
@@ -618,12 +631,18 @@ def get_classifier_results(data_dir: str, subset: str, model_type: str, model_so
                     # 检查是否有 per-subset 结果
                     if 'test_results_per_subset' in r and subset in r['test_results_per_subset']:
                         sub_r = r['test_results_per_subset'][subset]
+                        cascade_len = sub_r.get('cascade_length', {})
+                        if isinstance(cascade_len, dict):
+                            avg_len = cascade_len.get('mean', cascade_len.get('avg', 0))
+                        else:
+                            avg_len = cascade_len if cascade_len else 0
                         return {
                             'cascade_acc': sub_r.get('cascade_acc', 0),
                             'oracle_acc': sub_r.get('oracle_acc', 0),
+                            'cascade_length': avg_len,
                             'source': 'all',
                         }
-        
+
         # 对于 PPL，检查 test_results
         if model_type == "ppl":
             ppl_path = os.path.join(all_model_dir, "results.json")
@@ -632,12 +651,18 @@ def get_classifier_results(data_dir: str, subset: str, model_type: str, model_so
                     r = json.load(f)
                 if 'test_results' in r and subset in r['test_results']:
                     sub_r = r['test_results'][subset]
+                    cascade_len = sub_r.get('cascade_length', {})
+                    if isinstance(cascade_len, dict):
+                        avg_len = cascade_len.get('mean', cascade_len.get('avg', 0))
+                    else:
+                        avg_len = cascade_len if cascade_len else 0
                     return {
                         'cascade_acc': sub_r.get('cascade_acc', 0),
                         'oracle_acc': sub_r.get('oracle_acc', 0),
+                        'cascade_length': avg_len,
                         'source': 'all',
                     }
-        
+
         # 对于 LoRA，检查 all/lora_model 的结果
         if model_type == "lora":
             # 检查 results.json
@@ -648,9 +673,15 @@ def get_classifier_results(data_dir: str, subset: str, model_type: str, model_so
                 # 检查是否有 per-subset 结果
                 if 'test_results_per_subset' in r and subset in r['test_results_per_subset']:
                     sub_r = r['test_results_per_subset'][subset]
+                    cascade_len = sub_r.get('cascade_length', {})
+                    if isinstance(cascade_len, dict):
+                        avg_len = cascade_len.get('mean', cascade_len.get('avg', 0))
+                    else:
+                        avg_len = cascade_len if cascade_len else 0
                     return {
                         'cascade_acc': sub_r.get('cascade_acc', sub_r.get('cascade_accuracy', 0)),
                         'oracle_acc': sub_r.get('oracle_acc', sub_r.get('oracle', 0)),
+                        'cascade_length': avg_len,
                         'source': 'all',
                     }
             # 检查 cascade_eval.json
@@ -661,12 +692,18 @@ def get_classifier_results(data_dir: str, subset: str, model_type: str, model_so
                 # 检查是否有 per-subset 结果
                 if 'per_subset' in r and subset in r['per_subset']:
                     sub_r = r['per_subset'][subset]
+                    cascade_len = sub_r.get('cascade_length', sub_r.get('avg_length', {}))
+                    if isinstance(cascade_len, dict):
+                        avg_len = cascade_len.get('mean', cascade_len.get('avg', 0))
+                    else:
+                        avg_len = cascade_len if cascade_len else 0
                     return {
                         'cascade_acc': sub_r.get('cascade_accuracy', sub_r.get('cascade_acc', 0)),
                         'oracle_acc': sub_r.get('oracle', sub_r.get('oracle_acc', 0)),
+                        'cascade_length': avg_len,
                         'source': 'all',
                     }
-    
+
     return None
 
 
@@ -682,20 +719,22 @@ def get_subset_n_test(data_dir: str, subset: str) -> int:
 
 
 def print_classifier_comparison(data_dir: str, model_source: str = "individual", subsets: list = None):
-    """打印分类器对比表格"""
+    """打印分类器对比表格（包含准确率和长度）"""
     if subsets is None:
         subsets = detect_subsets(data_dir, "test")
 
     source_label = "[individual]" if model_source == "individual" else "[all]"
-    print("\n" + "=" * 130)
-    print(f"                                   CLASSIFIER COMPARISON {source_label}")
-    print("=" * 130)
-    print(f"{'Subset':<25} {'N':>6} {'LoRA':>12} {'MLP':>12} {'PPL':>12} {'Ensemble':>12} {'Oracle':>12} {'Best':>12}")
-    print("-" * 130)
+    print("\n" + "=" * 160)
+    print(f"                                          CLASSIFIER COMPARISON {source_label}")
+    print("=" * 160)
+    print(f"{'Subset':<20} {'N':>5} {'LoRA Acc':>10} {'LoRA Len':>9} {'MLP Acc':>10} {'MLP Len':>9} {'PPL Acc':>10} {'PPL Len':>9} {'Ens Acc':>10} {'Oracle':>10} {'Best':>8}")
+    print("-" * 160)
 
     # 加权平均统计
     totals = {'lora': 0, 'mlp': 0, 'ppl': 0, 'ensemble': 0}
     counts = {'lora': 0, 'mlp': 0, 'ppl': 0, 'ensemble': 0}
+    len_totals = {'lora': 0, 'mlp': 0, 'ppl': 0, 'ensemble': 0}
+    len_counts = {'lora': 0, 'mlp': 0, 'ppl': 0, 'ensemble': 0}
     total_n = 0
 
     for subset in subsets:
@@ -712,6 +751,11 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
         ppl_acc = ppl_r['cascade_acc'] if ppl_r else None
         ens_acc = ens_r['cascade_acc'] if ens_r else None
 
+        lora_len = lora_r.get('cascade_length', 0) if lora_r else 0
+        mlp_len = mlp_r.get('cascade_length', 0) if mlp_r else 0
+        ppl_len = ppl_r.get('cascade_length', 0) if ppl_r else 0
+        ens_len = ens_r.get('cascade_length', 0) if ens_r else 0
+
         # Oracle (优先使用 PPL 的，因为它在原始测试数据上评估)
         oracle = None
         if ppl_r and ppl_r.get('oracle_acc'):
@@ -724,11 +768,16 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
             oracle = ens_r['oracle_acc']
 
         # 格式化输出
-        lora_str = f"{lora_acc:.4f}" if lora_acc is not None else "-"
-        mlp_str = f"{mlp_acc:.4f}" if mlp_acc is not None else "-"
-        ppl_str = f"{ppl_acc:.4f}" if ppl_acc is not None else "-"
-        ens_str = f"{ens_acc:.4f}" if ens_acc is not None else "-"
+        lora_acc_str = f"{lora_acc:.4f}" if lora_acc is not None else "-"
+        mlp_acc_str = f"{mlp_acc:.4f}" if mlp_acc is not None else "-"
+        ppl_acc_str = f"{ppl_acc:.4f}" if ppl_acc is not None else "-"
+        ens_acc_str = f"{ens_acc:.4f}" if ens_acc is not None else "-"
         oracle_str = f"{oracle:.4f}" if oracle is not None else "-"
+
+        lora_len_str = f"{lora_len:.0f}" if lora_len else "-"
+        mlp_len_str = f"{mlp_len:.0f}" if mlp_len else "-"
+        ppl_len_str = f"{ppl_len:.0f}" if ppl_len else "-"
+        ens_len_str = f"{ens_len:.0f}" if ens_len else "-"
 
         # 找最佳并累计加权统计
         accs = []
@@ -736,24 +785,36 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
             accs.append(('LoRA', lora_acc))
             totals['lora'] += lora_acc * n
             counts['lora'] += n
+            if lora_len:
+                len_totals['lora'] += lora_len * n
+                len_counts['lora'] += n
         if mlp_acc is not None and mlp_acc > 0:
             accs.append(('MLP', mlp_acc))
             totals['mlp'] += mlp_acc * n
             counts['mlp'] += n
+            if mlp_len:
+                len_totals['mlp'] += mlp_len * n
+                len_counts['mlp'] += n
         if ppl_acc is not None and ppl_acc > 0:
             accs.append(('PPL', ppl_acc))
             totals['ppl'] += ppl_acc * n
             counts['ppl'] += n
+            if ppl_len:
+                len_totals['ppl'] += ppl_len * n
+                len_counts['ppl'] += n
         if ens_acc is not None and ens_acc > 0:
             accs.append(('Ens', ens_acc))
             totals['ensemble'] += ens_acc * n
             counts['ensemble'] += n
+            if ens_len:
+                len_totals['ensemble'] += ens_len * n
+                len_counts['ensemble'] += n
 
         best = max(accs, key=lambda x: x[1])[0] if accs else "-"
 
-        print(f"{subset:<25} {n:>6} {lora_str:>12} {mlp_str:>12} {ppl_str:>12} {ens_str:>12} {oracle_str:>12} {best:>12}")
+        print(f"{subset:<20} {n:>5} {lora_acc_str:>10} {lora_len_str:>9} {mlp_acc_str:>10} {mlp_len_str:>9} {ppl_acc_str:>10} {ppl_len_str:>9} {ens_acc_str:>10} {oracle_str:>10} {best:>8}")
 
-    print("-" * 130)
+    print("-" * 160)
 
     # 计算加权平均
     lora_avg = f"{totals['lora'] / counts['lora']:.4f}" if counts['lora'] > 0 else "-"
@@ -761,8 +822,13 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
     ppl_avg = f"{totals['ppl'] / counts['ppl']:.4f}" if counts['ppl'] > 0 else "-"
     ens_avg = f"{totals['ensemble'] / counts['ensemble']:.4f}" if counts['ensemble'] > 0 else "-"
 
-    print(f"{'TOTAL (weighted)':<25} {total_n:>6} {lora_avg:>12} {mlp_avg:>12} {ppl_avg:>12} {ens_avg:>12}")
-    print("=" * 130)
+    lora_len_avg = f"{len_totals['lora'] / len_counts['lora']:.0f}" if len_counts['lora'] > 0 else "-"
+    mlp_len_avg = f"{len_totals['mlp'] / len_counts['mlp']:.0f}" if len_counts['mlp'] > 0 else "-"
+    ppl_len_avg = f"{len_totals['ppl'] / len_counts['ppl']:.0f}" if len_counts['ppl'] > 0 else "-"
+    ens_len_avg = f"{len_totals['ensemble'] / len_counts['ensemble']:.0f}" if len_counts['ensemble'] > 0 else "-"
+
+    print(f"{'TOTAL (weighted)':<20} {total_n:>5} {lora_avg:>10} {lora_len_avg:>9} {mlp_avg:>10} {mlp_len_avg:>9} {ppl_avg:>10} {ppl_len_avg:>9} {ens_avg:>10}")
+    print("=" * 160)
 
 
 def summarize_single(data_dir: str, subset: str, model_dir: str = None, show_length: bool = True):
