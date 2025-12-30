@@ -566,7 +566,7 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
             print(f"Cascade vs Mentor-Only: {cascade_vs_mentor:+.4f} ({cascade_vs_mentor*100:+.2f}%)")
 
     # 分类器对比表格
-    print_classifier_comparison(data_dir, model_source)
+    print_classifier_comparison(data_dir, model_source, SUBSETS)
 
     print()
 
@@ -681,8 +681,11 @@ def get_subset_n_test(data_dir: str, subset: str) -> int:
     return 0
 
 
-def print_classifier_comparison(data_dir: str, model_source: str = "individual"):
+def print_classifier_comparison(data_dir: str, model_source: str = "individual", subsets: list = None):
     """打印分类器对比表格"""
+    if subsets is None:
+        subsets = detect_subsets(data_dir, "test")
+
     source_label = "[individual]" if model_source == "individual" else "[all]"
     print("\n" + "=" * 130)
     print(f"                                   CLASSIFIER COMPARISON {source_label}")
@@ -695,7 +698,7 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual")
     counts = {'lora': 0, 'mlp': 0, 'ppl': 0, 'ensemble': 0}
     total_n = 0
 
-    for subset in SUBSETS:
+    for subset in subsets:
         n = get_subset_n_test(data_dir, subset)
         total_n += n
 
