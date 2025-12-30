@@ -12,6 +12,7 @@ import json
 import os
 from typing import List
 import numpy as np
+from tabulate import tabulate
 
 # Default subsets for hendrycks_math (used as fallback)
 DEFAULT_SUBSETS = [
@@ -140,7 +141,7 @@ def compute_length_stats(data_dir: str, subset: str, split: str = "test"):
 
 
 def summarize(data_dir: str, show_length: bool = True, model_source: str = "individual"):
-    """汇总所有子集的结果 - Markdown 格式
+    """汇总所有子集的结果 - 使用 tabulate 格式化输出
 
     Args:
         data_dir: 数据目录
@@ -152,8 +153,10 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
     print(f"Detected subsets: {SUBSETS}")
 
     source_label = "[individual]" if model_source == "individual" else "[all]"
-    print(f"\n## Results Summary {source_label}")
-    print(f"Data: `{data_dir}`\n")
+    print(f"\n{'='*80}")
+    print(f"Results Summary {source_label}")
+    print(f"Data: {data_dir}")
+    print(f"{'='*80}")
 
     # 辅助函数：格式化数值
     def fmt(v, decimals=4):
@@ -162,16 +165,8 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
     def fmt_len(v):
         return f"{v:.1f}" if v else "-"
 
-    # Markdown 表头
-    if show_length:
-        header = "| Subset | N | T0 acc | T0 i_len | T100 acc | T100 m | T100 i | T500 acc | T500 m | T500 i | T1000 acc | T1000 m | T1000 i | Mentor acc | Mentor len | Oracle acc | Oracle m | Oracle i | Cascade acc | Cascade m | Cascade i | M-Gap | O-Gap |"
-        separator = "|--------|---|-------:|--------:|--------:|------:|------:|--------:|------:|------:|---------:|-------:|-------:|----------:|----------:|----------:|--------:|--------:|-----------:|---------:|---------:|------:|------:|"
-    else:
-        header = "| Subset | N | T0 | T100 | T500 | T1000 | Mentor | Oracle | Cascade | M-Gap | O-Gap |"
-        separator = "|--------|---|----:|-----:|-----:|------:|-------:|-------:|--------:|------:|------:|"
-
-    print(header)
-    print(separator)
+    # 准备表格数据
+    table_data = []
 
     # 统计变量
     total_n = 0
@@ -262,7 +257,10 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
                         }
 
         if r is None:
-            print(f"| {subset} | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - | - |")
+            if show_length:
+                table_data.append([subset, "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"])
+            else:
+                table_data.append([subset, "-", "-", "-", "-", "-", "-", "-", "-", "-", "-"])
             continue
 
         n = r['n_test']
@@ -307,8 +305,6 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
             cascade_m = cascade_len.get('mentor_mean', 0)
             cascade_i = cascade_len.get('intern_mean', 0)
 
-            row = f"| {subset} | {n} | {fmt(t0)} | {fmt_len(t0_i)} | {fmt(t100)} | {fmt_len(t100_m)} | {fmt_len(t100_i)} | {fmt(t500)} | {fmt_len(t500_m)} | {fmt_len(t500_i)} | {fmt(t1000)} | {fmt_len(t1000_m)} | {fmt_len(t1000_i)} | {fmt(mentor_acc)} | {fmt_len(mentor_len)} | {fmt(oracle)} | {fmt_len(oracle_m)} | {fmt_len(oracle_i)} | {fmt(cascade)} | {fmt_len(cascade_m)} | {fmt_len(cascade_i)} | {m_gap:+.4f} | {o_gap:+.4f} |"
-
             # 累计长度统计
             for tokens, l_stat in [(0, l0), (100, l100), (500, l500), (1000, l1000)]:
                 if l_stat:
@@ -327,10 +323,26 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
                 total_cascade_m_len += cascade_m * n
             if cascade_i:
                 total_cascade_i_len += cascade_i * n
-        else:
-            row = f"| {subset} | {n} | {fmt(t0)} | {fmt(t100)} | {fmt(t500)} | {fmt(t1000)} | {fmt(mentor_acc)} | {fmt(oracle)} | {fmt(cascade)} | {m_gap:+.4f} | {o_gap:+.4f} |"
 
-        print(row)
+            # 计算总长度 (mentor + intern)
+            cascade_total_len = (cascade_m or 0) + (cascade_i or 0)
+            oracle_total_len = (oracle_m or 0) + (oracle_i or 0)
+            mentor_total_len = mentor_len
+
+            table_data.append([
+                subset, n,
+                fmt(t0), fmt(t100), fmt(t500), fmt(t1000),
+                fmt(mentor_acc), fmt(oracle), fmt(cascade),
+                f"{m_gap:+.4f}", f"{o_gap:+.4f}",
+                fmt_len(cascade_total_len), fmt_len(mentor_total_len)
+            ])
+        else:
+            table_data.append([
+                subset, n,
+                fmt(t0), fmt(t100), fmt(t500), fmt(t1000),
+                fmt(mentor_acc), fmt(oracle), fmt(cascade),
+                f"{m_gap:+.4f}", f"{o_gap:+.4f}"
+            ])
 
         # 累计统计
         total_n += n
@@ -357,24 +369,37 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
         avg_o_gap = avg_oracle - avg_cascade
 
         if show_length:
-            avg_t0_i = total_intern_len[0] / total_len_count[0] if total_len_count[0] > 0 else 0
-            avg_t100_m = total_mentor_len[100] / total_len_count[100] if total_len_count[100] > 0 else 0
-            avg_t100_i = total_intern_len[100] / total_len_count[100] if total_len_count[100] > 0 else 0
-            avg_t500_m = total_mentor_len[500] / total_len_count[500] if total_len_count[500] > 0 else 0
-            avg_t500_i = total_intern_len[500] / total_len_count[500] if total_len_count[500] > 0 else 0
-            avg_t1000_m = total_mentor_len[1000] / total_len_count[1000] if total_len_count[1000] > 0 else 0
-            avg_t1000_i = total_intern_len[1000] / total_len_count[1000] if total_len_count[1000] > 0 else 0
             avg_mentor_len = total_mentor_only_len / total_n if total_n > 0 else 0
             avg_oracle_m = total_oracle_m_len / total_n if total_n > 0 else 0
             avg_oracle_i = total_oracle_i_len / total_n if total_n > 0 else 0
             avg_cascade_m = total_cascade_m_len / total_n if total_n > 0 else 0
             avg_cascade_i = total_cascade_i_len / total_n if total_n > 0 else 0
+            avg_cascade_total_len = avg_cascade_m + avg_cascade_i
+            avg_mentor_total_len = avg_mentor_len
 
-            row = f"| **TOTAL** | {total_n} | {fmt(avg_t0)} | {fmt_len(avg_t0_i)} | {fmt(avg_t100)} | {fmt_len(avg_t100_m)} | {fmt_len(avg_t100_i)} | {fmt(avg_t500)} | {fmt_len(avg_t500_m)} | {fmt_len(avg_t500_i)} | {fmt(avg_t1000)} | {fmt_len(avg_t1000_m)} | {fmt_len(avg_t1000_i)} | {fmt(avg_mentor_acc)} | {fmt_len(avg_mentor_len)} | {fmt(avg_oracle)} | {fmt_len(avg_oracle_m)} | {fmt_len(avg_oracle_i)} | {fmt(avg_cascade)} | {fmt_len(avg_cascade_m)} | {fmt_len(avg_cascade_i)} | {avg_m_gap:+.4f} | {avg_o_gap:+.4f} |"
+            table_data.append([
+                "TOTAL", total_n,
+                fmt(avg_t0), fmt(avg_t100), fmt(avg_t500), fmt(avg_t1000),
+                fmt(avg_mentor_acc), fmt(avg_oracle), fmt(avg_cascade),
+                f"{avg_m_gap:+.4f}", f"{avg_o_gap:+.4f}",
+                fmt_len(avg_cascade_total_len), fmt_len(avg_mentor_total_len)
+            ])
         else:
-            row = f"| **TOTAL** | {total_n} | {fmt(avg_t0)} | {fmt(avg_t100)} | {fmt(avg_t500)} | {fmt(avg_t1000)} | {fmt(avg_mentor_acc)} | {fmt(avg_oracle)} | {fmt(avg_cascade)} | {avg_m_gap:+.4f} | {avg_o_gap:+.4f} |"
+            table_data.append([
+                "TOTAL", total_n,
+                fmt(avg_t0), fmt(avg_t100), fmt(avg_t500), fmt(avg_t1000),
+                fmt(avg_mentor_acc), fmt(avg_oracle), fmt(avg_cascade),
+                f"{avg_m_gap:+.4f}", f"{avg_o_gap:+.4f}"
+            ])
 
-        print(row)
+    # 定义表头
+    if show_length:
+        headers = ["Subset", "N", "T0", "T100", "T500", "T1000", "Mentor", "Oracle", "Cascade", "M-Gap", "O-Gap", "C-Len", "M-Len"]
+    else:
+        headers = ["Subset", "N", "T0", "T100", "T500", "T1000", "Mentor", "Oracle", "Cascade", "M-Gap", "O-Gap"]
+
+    # 使用 tabulate 输出表格
+    print(tabulate(table_data, headers=headers, tablefmt="simple", numalign="right", stralign="left"))
 
     # 分类器对比表格 (LoRA vs MLP vs PPL vs Ensemble)
     print_classifier_comparison(data_dir, model_source, SUBSETS)
@@ -530,7 +555,7 @@ def get_subset_n_test(data_dir: str, subset: str) -> int:
 
 
 def print_classifier_comparison(data_dir: str, model_source: str = "individual", subsets: list = None):
-    """打印分类器对比表格（LoRA vs MLP vs PPL vs Ensemble，包含准确率和长度）- Markdown 格式"""
+    """打印分类器对比表格（LoRA vs MLP vs PPL vs Ensemble）- 使用 tabulate 格式化输出"""
     if subsets is None:
         subsets = detect_subsets(data_dir, "test")
 
@@ -539,30 +564,23 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
     # 方法列表
     methods = ["LoRA", "MLP", "PPL", "Ensemble"]
 
-    print(f"\n## CLASSIFIER COMPARISON {source_label}\n")
+    print(f"\n{'='*60}")
+    print(f"Classifier Comparison {source_label}")
+    print(f"{'='*60}")
 
-    # Markdown 表头
-    header = "| Subset | N |"
-    separator = "|--------|---|"
-    for method in methods:
-        header += f" {method} acc | {method} m_len | {method} i_len |"
-        separator += "-------:|-------:|-------:|"
-    header += " Oracle | Best |"
-    separator += "-------:|------|"
-
-    print(header)
-    print(separator)
+    # 准备表格数据
+    table_data = []
 
     # 统计变量
     total_n = 0
-    method_totals = {m: {'acc': 0, 'm_len': 0, 'i_len': 0, 'cnt': 0, 'm_cnt': 0, 'i_cnt': 0} for m in methods}
+    method_totals = {m: {'acc': 0, 'len': 0, 'cnt': 0, 'len_cnt': 0} for m in methods}
     oracle_total = {'acc': 0, 'cnt': 0}
 
     for subset in subsets:
         n = get_subset_n_test(data_dir, subset)
         total_n += n
 
-        row = f"| {subset} | {n} |"
+        row = [subset, n]
 
         # 获取每个分类器的结果
         results = {}
@@ -604,23 +622,22 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
                         i_len = cascade_len.get('intern_mean', cascade_len.get('intern', 0))
 
                 acc_str = f"{acc:.4f}" if acc else "-"
-                m_len_str = f"{m_len:.1f}" if m_len else "-"
-                i_len_str = f"{i_len:.1f}" if i_len else "-"
+                total_len = (m_len or 0) + (i_len or 0)
+                len_str = f"{total_len:.0f}" if total_len else "-"
 
                 # 累计统计
                 if acc:
                     method_totals[method]['acc'] += acc * n
                     method_totals[method]['cnt'] += n
-                if m_len:
-                    method_totals[method]['m_len'] += m_len * n
-                    method_totals[method]['m_cnt'] += n
-                if i_len:
-                    method_totals[method]['i_len'] += i_len * n
-                    method_totals[method]['i_cnt'] += n
+                if total_len:
+                    method_totals[method]['len'] += total_len * n
+                    method_totals[method]['len_cnt'] += n
             else:
-                acc_str = m_len_str = i_len_str = "-"
+                acc_str = "-"
+                len_str = "-"
 
-            row += f" {acc_str} | {m_len_str} | {i_len_str} |"
+            row.append(acc_str)
+            row.append(len_str)
 
         # Oracle 和 Best
         oracle_str = f"{oracle_acc:.4f}" if oracle_acc else "-"
@@ -628,23 +645,33 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
             oracle_total['acc'] += oracle_acc * n
             oracle_total['cnt'] += n
 
-        row += f" {oracle_str} | {best_method} |"
-        print(row)
+        row.append(oracle_str)
+        row.append(best_method)
+        table_data.append(row)
 
     # TOTAL 行
-    row = f"| **TOTAL** | {total_n} |"
+    total_row = ["TOTAL", total_n]
     for method in methods:
         t = method_totals[method]
         acc_str = f"{t['acc']/t['cnt']:.4f}" if t['cnt'] > 0 else "-"
-        m_len_str = f"{t['m_len']/t['m_cnt']:.1f}" if t['m_cnt'] > 0 else "-"
-        i_len_str = f"{t['i_len']/t['i_cnt']:.1f}" if t['i_cnt'] > 0 else "-"
-        row += f" {acc_str} | {m_len_str} | {i_len_str} |"
+        len_str = f"{t['len']/t['len_cnt']:.0f}" if t['len_cnt'] > 0 else "-"
+        total_row.append(acc_str)
+        total_row.append(len_str)
 
     oracle_avg = oracle_total['acc'] / oracle_total['cnt'] if oracle_total['cnt'] > 0 else 0
     oracle_str = f"{oracle_avg:.4f}" if oracle_avg else "-"
-    row += f" {oracle_str} | |"
+    total_row.append(oracle_str)
+    total_row.append("")
+    table_data.append(total_row)
 
-    print(row)
+    # 定义表头
+    headers = ["Subset", "N"]
+    for method in methods:
+        headers.extend([f"{method}", f"Len"])
+    headers.extend(["Oracle", "Best"])
+
+    # 使用 tabulate 输出表格
+    print(tabulate(table_data, headers=headers, tablefmt="simple", numalign="right", stralign="left"))
 
 
 def summarize_single(data_dir: str, subset: str, model_dir: str = None, show_length: bool = True):
