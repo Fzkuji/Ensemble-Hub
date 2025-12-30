@@ -24,6 +24,7 @@
 #   --fixed-threshold TH  Use fixed threshold instead of searching (e.g., 0.5)
 #   --unfiltered-val      Use unfiltered data for validation/threshold search
 #   --skip-epoch-cascade  Skip cascade evaluation after each epoch (faster training)
+#   --method METHODS      Comma-separated list of methods to run: mlp,ppl,lora,ensemble (default: all)
 #
 # Examples:
 #   ./run_pipeline.sh --think                                    # Think mode, 8 GPUs, all subsets
@@ -31,6 +32,8 @@
 #   ./run_pipeline.sh --train-subset all --eval-subset all       # Train on all, test each separately
 #   ./run_pipeline.sh --subset algebra                           # Train & test on algebra only
 #   ./run_pipeline.sh --dataset gsm8k                            # Run on GSM8K dataset
+#   ./run_pipeline.sh --dataset gsm8k --method ppl               # Only train PPL classifier
+#   ./run_pipeline.sh --method mlp,ppl                           # Only train MLP and PPL
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,6 +62,7 @@ DROPOUT=0.3
 FIXED_THRESHOLD=""
 UNFILTERED_VAL=false
 SKIP_EPOCH_CASCADE=false
+METHODS="mlp,ppl,lora,ensemble"  # Default: run all methods
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -155,10 +159,31 @@ while [[ $# -gt 0 ]]; do
             SKIP_EPOCH_CASCADE=true
             shift
             ;;
+        --method)
+            METHODS="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
             ;;
+    esac
+done
+
+# Parse methods into flags
+RUN_MLP=false
+RUN_PPL=false
+RUN_LORA=false
+RUN_ENSEMBLE=false
+IFS=',' read -ra METHOD_ARRAY <<< "$METHODS"
+for method in "${METHOD_ARRAY[@]}"; do
+    case "$method" in
+        mlp) RUN_MLP=true ;;
+        ppl) RUN_PPL=true ;;
+        lora) RUN_LORA=true ;;
+        ensemble) RUN_ENSEMBLE=true ;;
+        all) RUN_MLP=true; RUN_PPL=true; RUN_LORA=true; RUN_ENSEMBLE=true ;;
+        *) echo "Unknown method: $method (valid: mlp,ppl,lora,ensemble,all)"; exit 1 ;;
     esac
 done
 
@@ -282,6 +307,7 @@ echo "Data dir: $DATA_DIR"
 echo "GPUs: $GPUS (${NUM_GPUS} GPUs)"
 echo "Train subset: ${TRAIN_SUBSET:-all (individual)}"
 echo "Eval subset: ${EVAL_SUBSET:-same as train}"
+echo "Methods: $METHODS"
 echo "============================================================"
 
 # Helper function to check if data collection is complete for a subset/split
@@ -357,8 +383,7 @@ echo "========== Step 2: Data Statistics =========="
 python compute_stats.py --data-dir $DATA_DIR --split train
 python compute_stats.py --data-dir $DATA_DIR --split test
 
-echo ""
-echo "========== Step 3: Train MLP Classifiers =========="
+# Common flags for training
 FILTER_FLAG=""
 if [ "$NO_FILTER" = true ]; then
     FILTER_FLAG="--no-filter"
@@ -380,128 +405,146 @@ if [ "$SKIP_EPOCH_CASCADE" = true ]; then
     SKIP_EPOCH_CASCADE_FLAG="--skip-epoch-cascade"
 fi
 
-if [ -n "$TRAIN_SUBSET" ]; then
-    # Specific train subset specified
-    if [ "$TRAIN_SUBSET" = "all" ]; then
-        MODEL_DIR="all"
-    else
-        MODEL_DIR="$TRAIN_SUBSET"
-    fi
-
-    if check_model_exists "$MODEL_DIR" "mlp"; then
-        echo ">>> MLP: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET [SKIP - already trained, use --force to retrain]"
-    else
-        echo ">>> Training MLP: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET"
-        echo ">>> (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
-        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
-            --ddp --train-subset $TRAIN_SUBSET --eval-subset $EVAL_SUBSET --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
-            --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
-            --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG $SKIP_EPOCH_CASCADE_FLAG
-    fi
-else
-    # No train subset specified - train each subset individually
-    for subset in "${ALL_SUBSETS[@]}"; do
-        if check_model_exists "$subset" "mlp"; then
-            echo ">>> MLP: $subset [SKIP - already trained, use --force to retrain]"
+echo ""
+echo "========== Step 3: Train MLP Classifiers =========="
+if [ "$RUN_MLP" = true ]; then
+    if [ -n "$TRAIN_SUBSET" ]; then
+        # Specific train subset specified
+        if [ "$TRAIN_SUBSET" = "all" ]; then
+            MODEL_DIR="all"
         else
-            echo ">>> Training MLP: $subset (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
+            MODEL_DIR="$TRAIN_SUBSET"
+        fi
+
+        if check_model_exists "$MODEL_DIR" "mlp"; then
+            echo ">>> MLP: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET [SKIP - already trained, use --force to retrain]"
+        else
+            echo ">>> Training MLP: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET"
+            echo ">>> (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
-                --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
+                --ddp --train-subset $TRAIN_SUBSET --eval-subset $EVAL_SUBSET --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
                 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
                 --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG $SKIP_EPOCH_CASCADE_FLAG
         fi
-    done
+    else
+        # No train subset specified - train each subset individually
+        for subset in "${ALL_SUBSETS[@]}"; do
+            if check_model_exists "$subset" "mlp"; then
+                echo ">>> MLP: $subset [SKIP - already trained, use --force to retrain]"
+            else
+                echo ">>> Training MLP: $subset (lr=$LR, epochs=$EPOCHS, batch_size=$BATCH_SIZE, pooling=$POOLING, dropout=$DROPOUT, no_val=$NO_VAL)"
+                CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
+                    --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
+                    --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
+                    --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG $SKIP_EPOCH_CASCADE_FLAG
+            fi
+        done
+    fi
+else
+    echo ">>> MLP: [SKIP - not in --method]"
 fi
 
 echo ""
 echo "========== Step 4: Train PPL Classifiers =========="
-if [ -n "$TRAIN_SUBSET" ]; then
-    # Specific train subset specified
-    if [ "$TRAIN_SUBSET" = "all" ]; then
-        PPL_MODEL_DIR="all"
-    else
-        PPL_MODEL_DIR="$TRAIN_SUBSET"
-    fi
+if [ "$RUN_PPL" = true ]; then
+    if [ -n "$TRAIN_SUBSET" ]; then
+        # Specific train subset specified
+        if [ "$TRAIN_SUBSET" = "all" ]; then
+            PPL_MODEL_DIR="all"
+        else
+            PPL_MODEL_DIR="$TRAIN_SUBSET"
+        fi
 
-    if check_model_exists "$PPL_MODEL_DIR" "ppl"; then
-        echo ">>> PPL: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET [SKIP - already trained, use --force to retrain]"
+        if check_model_exists "$PPL_MODEL_DIR" "ppl"; then
+            echo ">>> PPL: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET [SKIP - already trained, use --force to retrain]"
+        else
+            echo ">>> Training PPL: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET (no_val=$NO_VAL)"
+            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_ppl_classifier.py \
+                --ddp --train-subset $TRAIN_SUBSET --eval-subset $EVAL_SUBSET --data-dir $DATA_DIR $NO_VAL_FLAG
+        fi
     else
-        echo ">>> Training PPL: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET (no_val=$NO_VAL)"
-        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_ppl_classifier.py \
-            --ddp --train-subset $TRAIN_SUBSET --eval-subset $EVAL_SUBSET --data-dir $DATA_DIR $NO_VAL_FLAG
+        # No train subset specified - train each subset individually
+        for subset in "${ALL_SUBSETS[@]}"; do
+            if check_model_exists "$subset" "ppl"; then
+                echo ">>> PPL: $subset [SKIP - already trained, use --force to retrain]"
+            else
+                echo ">>> Training PPL: $subset (no_val=$NO_VAL)"
+                CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_ppl_classifier.py \
+                    --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR $NO_VAL_FLAG
+            fi
+        done
     fi
 else
-    # No train subset specified - train each subset individually
-    for subset in "${ALL_SUBSETS[@]}"; do
-        if check_model_exists "$subset" "ppl"; then
-            echo ">>> PPL: $subset [SKIP - already trained, use --force to retrain]"
-        else
-            echo ">>> Training PPL: $subset (no_val=$NO_VAL)"
-            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_ppl_classifier.py \
-                --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR $NO_VAL_FLAG
-        fi
-    done
+    echo ">>> PPL: [SKIP - not in --method]"
 fi
 
 echo ""
 echo "========== Step 5: Train Ensemble (MLP + PPL) =========="
-if [ "$TRAIN_SUBSET" = "all" ]; then
-    echo ">>> Ensemble training skipped for --train-subset all (not supported)"
-else
-    # Determine subsets for Ensemble training
-    if [ -n "$TRAIN_SUBSET" ]; then
-        ENS_SUBSETS=("$TRAIN_SUBSET")
+if [ "$RUN_ENSEMBLE" = true ]; then
+    if [ "$TRAIN_SUBSET" = "all" ]; then
+        echo ">>> Ensemble training skipped for --train-subset all (not supported)"
     else
-        ENS_SUBSETS=("${ALL_SUBSETS[@]}")
-    fi
-    for subset in "${ENS_SUBSETS[@]}"; do
-        if check_model_exists "$subset" "ensemble"; then
-            echo ">>> Ensemble: $subset [SKIP - already trained, use --force to retrain]"
+        # Determine subsets for Ensemble training
+        if [ -n "$TRAIN_SUBSET" ]; then
+            ENS_SUBSETS=("$TRAIN_SUBSET")
         else
-            echo ">>> Training Ensemble: $subset"
-            CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python train_ensemble_classifier.py \
-                --subset $subset --data-dir $DATA_DIR --base-model $MODEL --use-mlp
+            ENS_SUBSETS=("${ALL_SUBSETS[@]}")
         fi
-    done
+        for subset in "${ENS_SUBSETS[@]}"; do
+            if check_model_exists "$subset" "ensemble"; then
+                echo ">>> Ensemble: $subset [SKIP - already trained, use --force to retrain]"
+            else
+                echo ">>> Training Ensemble: $subset"
+                CUDA_VISIBLE_DEVICES=${GPU_ARRAY[0]} python train_ensemble_classifier.py \
+                    --subset $subset --data-dir $DATA_DIR --base-model $MODEL --use-mlp
+            fi
+        done
+    fi
+else
+    echo ">>> Ensemble: [SKIP - not in --method]"
 fi
 
 echo ""
 echo "========== Step 6: Train LoRA Classifiers =========="
-if [ -n "$TRAIN_SUBSET" ]; then
-    # Specific train subset specified
-    if [ "$TRAIN_SUBSET" = "all" ]; then
-        LORA_MODEL_DIR="all"
-        if check_model_exists "$LORA_MODEL_DIR" "lora"; then
-            echo ">>> LoRA: train=all, eval=$EVAL_SUBSET [SKIP - already trained, use --force to retrain]"
+if [ "$RUN_LORA" = true ]; then
+    if [ -n "$TRAIN_SUBSET" ]; then
+        # Specific train subset specified
+        if [ "$TRAIN_SUBSET" = "all" ]; then
+            LORA_MODEL_DIR="all"
+            if check_model_exists "$LORA_MODEL_DIR" "lora"; then
+                echo ">>> LoRA: train=all, eval=$EVAL_SUBSET [SKIP - already trained, use --force to retrain]"
+            else
+                echo ">>> Training LoRA: train=all, eval=$EVAL_SUBSET"
+                CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
+                    --ddp --subset all --eval-subset "$EVAL_SUBSET" --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
+                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+            fi
         else
-            echo ">>> Training LoRA: train=all, eval=$EVAL_SUBSET"
-            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
-                --ddp --subset all --eval-subset "$EVAL_SUBSET" --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
-                --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+            LORA_MODEL_DIR="$TRAIN_SUBSET"
+            if check_model_exists "$LORA_MODEL_DIR" "lora"; then
+                echo ">>> LoRA: $TRAIN_SUBSET [SKIP - already trained, use --force to retrain]"
+            else
+                echo ">>> Training LoRA: $TRAIN_SUBSET"
+                CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
+                    --ddp --subset $TRAIN_SUBSET --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
+                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+            fi
         fi
     else
-        LORA_MODEL_DIR="$TRAIN_SUBSET"
-        if check_model_exists "$LORA_MODEL_DIR" "lora"; then
-            echo ">>> LoRA: $TRAIN_SUBSET [SKIP - already trained, use --force to retrain]"
-        else
-            echo ">>> Training LoRA: $TRAIN_SUBSET"
-            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
-                --ddp --subset $TRAIN_SUBSET --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
-                --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
-        fi
+        # No train subset specified - train each subset individually
+        for subset in "${ALL_SUBSETS[@]}"; do
+            if check_model_exists "$subset" "lora"; then
+                echo ">>> LoRA: $subset [SKIP - already trained, use --force to retrain]"
+            else
+                echo ">>> Training LoRA: $subset"
+                CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
+                    --ddp --subset $subset --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
+                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+            fi
+        done
     fi
 else
-    # No train subset specified - train each subset individually
-    for subset in "${ALL_SUBSETS[@]}"; do
-        if check_model_exists "$subset" "lora"; then
-            echo ">>> LoRA: $subset [SKIP - already trained, use --force to retrain]"
-        else
-            echo ">>> Training LoRA: $subset"
-            CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
-                --ddp --subset $subset --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
-                --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
-        fi
-    done
+    echo ">>> LoRA: [SKIP - not in --method]"
 fi
 
 echo ""
