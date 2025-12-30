@@ -26,38 +26,43 @@ def load_data(data_dir: str, subset: str, token_level: int) -> List[Dict]:
         return json.load(f)
 
 
-def compute_average_curve(samples: List[Dict], field: str, max_len: int) -> Tuple[np.ndarray, np.ndarray]:
+def compute_curve_with_std(samples: List[Dict], field: str, max_len: int, min_samples: int = 10) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute average curve up to max_len tokens.
+    Compute average curve with standard deviation up to max_len tokens.
+
+    Args:
+        samples: List of sample dictionaries
+        field: Field name to extract (e.g., 'per_token_entropy')
+        max_len: Maximum token position to consider
+        min_samples: Minimum number of samples required at each position
 
     Returns:
         x: token positions (1 to max_len)
-        y: average values at each position
+        y_mean: mean values at each position
+        y_std: standard deviation at each position
     """
-    # Filter samples that have the field
     valid = [s for s in samples if field in s and s[field] and len(s[field]) > 0]
     if not valid:
-        return np.array([]), np.array([])
+        return np.array([]), np.array([]), np.array([])
 
-    # Collect values at each position (only up to max_len)
     position_values = [[] for _ in range(max_len)]
 
     for s in valid:
         values = s[field]
-        # Only use values up to max_len
         for i, v in enumerate(values[:max_len]):
             if not np.isnan(v) and not np.isinf(v):
                 position_values[i].append(v)
 
-    # Compute mean at each position (only where we have data)
     x_list = []
-    y_list = []
+    y_mean_list = []
+    y_std_list = []
     for i, vals in enumerate(position_values):
-        if vals:  # Only include positions with data
-            x_list.append(i + 1)  # 1-indexed
-            y_list.append(np.mean(vals))
+        if len(vals) >= min_samples:
+            x_list.append(i + 1)
+            y_mean_list.append(np.mean(vals))
+            y_std_list.append(np.std(vals))
 
-    return np.array(x_list), np.array(y_list)
+    return np.array(x_list), np.array(y_mean_list), np.array(y_std_list)
 
 
 def plot_entropy_by_category(
@@ -68,7 +73,7 @@ def plot_entropy_by_category(
 ):
     """
     Plot entropy trends: Sufficient vs Insufficient side by side.
-    Each curve ends at its corresponding token level.
+    Uses filled areas to show mean +/- std.
     """
     colors = {100: '#1f77b4', 500: '#ff7f0e', 1000: '#2ca02c'}
 
@@ -80,14 +85,14 @@ def plot_entropy_by_category(
         samples = sufficient.get(tl, [])
         if not samples:
             continue
-        x, y = compute_average_curve(samples, 'per_token_entropy', max_len=tl)
+        x, y_mean, y_std = compute_curve_with_std(samples, 'per_token_entropy', max_len=tl)
         if len(x) > 0:
-            ax.plot(x, y, color=colors[tl], label=f'T={tl} (n={len(samples)})', linewidth=1.5)
+            ax.plot(x, y_mean, color=colors[tl], label=f'T={tl} (n={len(samples)})', linewidth=1.5)
+            ax.fill_between(x, y_mean - y_std, y_mean + y_std, color=colors[tl], alpha=0.2)
 
     ax.set_title('Sufficient', fontsize=14)
-    ax.set_xlabel('Token Position (log scale)', fontsize=12)
+    ax.set_xlabel('Token Position', fontsize=12)
     ax.set_ylabel('Average Entropy', fontsize=12)
-    ax.set_xscale('log')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -97,14 +102,14 @@ def plot_entropy_by_category(
         samples = insufficient.get(tl, [])
         if not samples:
             continue
-        x, y = compute_average_curve(samples, 'per_token_entropy', max_len=tl)
+        x, y_mean, y_std = compute_curve_with_std(samples, 'per_token_entropy', max_len=tl)
         if len(x) > 0:
-            ax.plot(x, y, color=colors[tl], label=f'T={tl} (n={len(samples)})', linewidth=1.5)
+            ax.plot(x, y_mean, color=colors[tl], label=f'T={tl} (n={len(samples)})', linewidth=1.5)
+            ax.fill_between(x, y_mean - y_std, y_mean + y_std, color=colors[tl], alpha=0.2)
 
     ax.set_title('Insufficient', fontsize=14)
-    ax.set_xlabel('Token Position (log scale)', fontsize=12)
+    ax.set_xlabel('Token Position', fontsize=12)
     ax.set_ylabel('Average Entropy', fontsize=12)
-    ax.set_xscale('log')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -122,6 +127,7 @@ def plot_entropy_comparison(
 ):
     """
     Plot entropy comparison: Sufficient vs Insufficient for each token level.
+    Uses filled areas to show mean +/- std.
     """
     fig, axes = plt.subplots(1, len(token_levels), figsize=(5 * len(token_levels), 4))
     if len(token_levels) == 1:
@@ -133,21 +139,22 @@ def plot_entropy_comparison(
         # Sufficient
         suff = sufficient.get(tl, [])
         if suff:
-            x, y = compute_average_curve(suff, 'per_token_entropy', max_len=tl)
+            x, y_mean, y_std = compute_curve_with_std(suff, 'per_token_entropy', max_len=tl)
             if len(x) > 0:
-                ax.plot(x, y, color='green', label=f'Sufficient (n={len(suff)})', linewidth=1.5)
+                ax.plot(x, y_mean, color='green', label=f'Sufficient (n={len(suff)})', linewidth=1.5)
+                ax.fill_between(x, y_mean - y_std, y_mean + y_std, color='green', alpha=0.2)
 
         # Insufficient
         insuff = insufficient.get(tl, [])
         if insuff:
-            x, y = compute_average_curve(insuff, 'per_token_entropy', max_len=tl)
+            x, y_mean, y_std = compute_curve_with_std(insuff, 'per_token_entropy', max_len=tl)
             if len(x) > 0:
-                ax.plot(x, y, color='red', label=f'Insufficient (n={len(insuff)})', linewidth=1.5)
+                ax.plot(x, y_mean, color='red', label=f'Insufficient (n={len(insuff)})', linewidth=1.5)
+                ax.fill_between(x, y_mean - y_std, y_mean + y_std, color='red', alpha=0.2)
 
         ax.set_title(f'T = {tl}', fontsize=14)
-        ax.set_xlabel('Token Position (log scale)', fontsize=12)
+        ax.set_xlabel('Token Position', fontsize=12)
         ax.set_ylabel('Average Entropy', fontsize=12)
-        ax.set_xscale('log')
         ax.legend()
         ax.grid(True, alpha=0.3)
 
