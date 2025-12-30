@@ -153,10 +153,8 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
     print(f"Detected subsets: {SUBSETS}")
 
     source_label = "[individual]" if model_source == "individual" else "[all]"
-    print(f"\n{'='*80}")
-    print(f"Results Summary {source_label}")
-    print(f"Data: {data_dir}")
-    print(f"{'='*80}")
+    print(f"\n**Results Summary** {source_label}")
+    print(f"Data: {data_dir}\n")
 
     # 辅助函数：格式化数值
     def fmt(v, decimals=4):
@@ -584,9 +582,7 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
     # 方法列表
     methods = ["LoRA", "MLP", "PPL", "Ensemble"]
 
-    print(f"\n{'='*60}")
-    print(f"Classifier Comparison {source_label}")
-    print(f"{'='*60}")
+    print(f"\n**Classifier Comparison** {source_label}\n")
 
     # 准备表格数据
     table_data = []
