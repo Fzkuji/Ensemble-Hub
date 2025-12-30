@@ -41,7 +41,7 @@ def plot_distribution(
     """Plot PPL and Entropy distribution comparison."""
     if entropy_only:
         # Single row for entropy only
-        fig, axes = plt.subplots(1, len(token_levels), figsize=(4 * len(token_levels), 3.5))
+        fig, axes = plt.subplots(1, len(token_levels), figsize=(4 * len(token_levels), 2.8))
         if len(token_levels) == 1:
             axes = [axes]
 
@@ -57,9 +57,9 @@ def plot_distribution(
                 ax.axvline(np.mean(insuff_ent), color='#d62728', linestyle='--', linewidth=2, alpha=0.8)
 
             if idx == 0:
-                ax.set_ylabel('Density', fontsize=12)
+                ax.set_ylabel('Value', fontsize=12)
             ax.set_title(f'Guidance = {tl} tokens', fontsize=13, fontweight='bold')
-            ax.set_xlabel('Average Entropy', fontsize=12)
+            ax.set_xlabel('Average Token Entropy', fontsize=12)
             if idx == len(token_levels) - 1:
                 ax.legend(loc='upper right', fontsize=10)
             ax.tick_params(labelsize=10)
