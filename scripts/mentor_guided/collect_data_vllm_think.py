@@ -116,6 +116,116 @@ DATASET_CONFIGS = {
 # Simple system prompt (ACT-E uses simple prompts)
 SYSTEM_PROMPT = """Please reason step by step, and put your final answer within \\boxed{}."""
 
+# =============================================================================
+# Model Family Configurations
+# =============================================================================
+# Different model families handle thinking mode differently:
+#
+# DeepSeek-R1:
+#   - Chat template automatically adds <think>\n at the end
+#   - For no-think mode: manually append <think>\n</think>\n\n after prompt
+#   - </think> token ID: 151649
+#
+# Qwen3:
+#   - Chat template does NOT add <think> by default (enable_thinking=True)
+#   - For no-think mode: use enable_thinking=False, which adds <think>\n\n</think>\n\n
+#   - Model will generate <think>...</think> on its own when thinking
+#   - </think> token ID: 151668
+#
+# Cross-model (e.g., DeepSeek mentor + Qwen3 intern):
+#   - Mentor generates with its own think format
+#   - We extract thinking content and re-format for intern's expected format
+#
+MODEL_FAMILIES = {
+    "deepseek-r1": {
+        "think_start": "<think>",
+        "think_end": "</think>",
+        "think_end_token_id": 151649,
+        "template_adds_think": True,  # Chat template adds <think>\n
+        "no_think_prefill": "<think>\n</think>\n\n",  # For no-think mode
+    },
+    "qwen3": {
+        "think_start": "<think>",
+        "think_end": "</think>",
+        "think_end_token_id": 151668,
+        "template_adds_think": False,  # Chat template does NOT add <think>
+        "enable_thinking_param": True,  # Use enable_thinking param in apply_chat_template
+    },
+    "default": {
+        "think_start": None,
+        "think_end": None,
+        "template_adds_think": False,
+    },
+}
+
+
+def detect_model_family(model_name: str) -> str:
+    """Detect model family from model name.
+
+    Args:
+        model_name: HuggingFace model name (e.g., 'deepseek-ai/DeepSeek-R1-Distill-Qwen-7B')
+
+    Returns:
+        Model family key ('deepseek-r1', 'qwen3', or 'default')
+    """
+    model_lower = model_name.lower()
+
+    if "deepseek-r1" in model_lower or "deepseek_r1" in model_lower:
+        return "deepseek-r1"
+    elif "qwen3" in model_lower or "qwen-3" in model_lower or "qwen/qwen3" in model_lower:
+        return "qwen3"
+    else:
+        return "default"
+
+
+def build_cross_model_prompt(
+    question: str,
+    mentor_output: str,
+    intern_model: "VLLMInference",
+    use_think: bool = True,
+) -> str:
+    """Build prompt for intern model to continue from mentor's output.
+
+    When mentor and intern are different model families, we need to:
+    1. Build intern's native prompt format
+    2. Append mentor's thinking content in a format intern understands
+
+    Args:
+        question: The original question
+        mentor_output: Mentor's generated output (thinking + partial answer)
+        intern_model: The intern VLLMInference instance
+        use_think: Whether thinking mode is enabled
+
+    Returns:
+        Formatted prompt for intern to continue generation
+    """
+    # Build intern's base prompt
+    intern_prompt = intern_model.build_chat_prompt(question, use_think=use_think)
+
+    # For cross-model scenarios, we need to handle the prompt carefully:
+    # - If intern is Qwen3 and mentor is DeepSeek-R1, the mentor's output
+    #   already contains <think>...</think> or partial <think>... content
+    # - Both use the same <think>/<think> tags, so we can directly append
+    #
+    # The key insight: since both DeepSeek-R1 and Qwen3 use identical
+    # <think>...</think> tags, we can simply append mentor's output
+    # to intern's prompt (which may or may not have started a think block)
+
+    if intern_model.model_family == "qwen3":
+        # Qwen3's prompt doesn't include <think>, so we need to add it
+        # if mentor started thinking
+        if mentor_output.startswith("<think>") or mentor_output.strip().startswith("<think>"):
+            # Mentor already started thinking, just append
+            return intern_prompt + mentor_output
+        else:
+            # Mentor didn't start with <think>, might be a different format
+            # Add <think> wrapper for consistency
+            return intern_prompt + "<think>\n" + mentor_output
+    else:
+        # DeepSeek-R1 or default: prompt already ends with <think>\n
+        # Just append mentor's output (which continues the thinking)
+        return intern_prompt + mentor_output
+
 
 def parse_answer(raw_answer: str, parser_type: Optional[str] = None) -> str:
     """Parse answer based on dataset-specific format.
@@ -169,9 +279,20 @@ def extract_boxed_answer(text: str) -> str:
 
 
 def check_math_correctness(prediction: str, ground_truth: str) -> bool:
-    """Check if math answer is correct using the official grader."""
+    """Check if math answer is correct using the official grader.
+
+    Handles two formats:
+    - MATH-style: ground_truth contains \\boxed{answer}
+    - GSM8K-style: ground_truth is just the answer (e.g., "72")
+    """
     pred_answer = extract_boxed_answer(prediction)
+
+    # Try to extract boxed answer from ground_truth first
     true_answer = extract_boxed_answer(ground_truth)
+
+    # If ground_truth has no \boxed{}, use it directly (GSM8K format)
+    if not true_answer:
+        true_answer = ground_truth.strip()
 
     if not pred_answer or not true_answer:
         return False
@@ -205,11 +326,16 @@ class VLLMInference:
         if gpu_ids is None:
             gpu_ids = [0]
 
+        # Store model name and detect model family
+        self.model_name = model_name
+        self.model_family = detect_model_family(model_name)
+        self.family_config = MODEL_FAMILIES.get(self.model_family, MODEL_FAMILIES["default"])
+
         # Set visible GPUs
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
         tensor_parallel_size = len(gpu_ids)
 
-        logger.info(f"Loading model {model_name} with vLLM on GPU {gpu_ids} (tp={tensor_parallel_size}, memory_util={gpu_memory_utilization})...")
+        logger.info(f"Loading model {model_name} (family: {self.model_family}) with vLLM on GPU {gpu_ids} (tp={tensor_parallel_size}, memory_util={gpu_memory_utilization})...")
 
         self.model = LLM(
             model=model_name,
@@ -254,8 +380,9 @@ class VLLMInference:
     ) -> str:
         """Build simple chat prompt.
 
-        ACT-E uses simple prompts without complex frameworks.
-        For DeepSeek R1 no-think mode, we pre-fill empty think block.
+        Handles different model families:
+        - DeepSeek-R1: template adds <think>\n, no-think mode pre-fills empty block
+        - Qwen3: use enable_thinking param, no-think uses enable_thinking=False
 
         Args:
             question: The math problem
@@ -269,15 +396,27 @@ class VLLMInference:
             {"role": "user", "content": question},
         ]
 
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        # For DeepSeek R1 no-think mode: pre-fill empty think block
-        if not use_think:
-            prompt = prompt + "<think>\n</think>\n\n"
+        # Build base prompt based on model family
+        if self.model_family == "qwen3":
+            # Qwen3: use enable_thinking parameter
+            # enable_thinking=True: model decides whether to think (default behavior)
+            # enable_thinking=False: pre-fills empty think block to skip thinking
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=use_think,
+            )
+        else:
+            # DeepSeek-R1 and others: standard template
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            # For no-think mode: pre-fill empty think block
+            if not use_think and self.family_config.get("no_think_prefill"):
+                prompt = prompt + self.family_config["no_think_prefill"]
 
         return prompt
 
@@ -621,15 +760,26 @@ def collect_data_for_token_level(
                 })
         else:
             # Mentor generates first N tokens
-            prompts = [mentor_model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
-            mentor_outputs = mentor_model.generate_mentor_tokens(prompts, max_tokens=token_level)
+            mentor_prompts = [mentor_model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
+            mentor_outputs = mentor_model.generate_mentor_tokens(mentor_prompts, max_tokens=token_level)
 
-            # Intern CONTINUES from mentor's output (not starting over)
-            # Concatenate prompt + mentor_output, then continue generating
-            continued_prompts = [
-                prompt + mentor_output
-                for prompt, mentor_output in zip(prompts, mentor_outputs)
-            ]
+            # Intern CONTINUES from mentor's output
+            # Check if cross-model scenario (different model families)
+            is_cross_model = mentor_model.model_family != intern_model.model_family
+
+            if is_cross_model:
+                # Cross-model: build intern-native prompts with mentor's output
+                continued_prompts = [
+                    build_cross_model_prompt(item['question'], mentor_output, intern_model, use_think)
+                    for item, mentor_output in zip(batch, mentor_outputs)
+                ]
+            else:
+                # Same model family: directly concatenate prompt + mentor_output
+                continued_prompts = [
+                    prompt + mentor_output
+                    for prompt, mentor_output in zip(mentor_prompts, mentor_outputs)
+                ]
+
             intern_continuations = intern_model.generate(continued_prompts)
 
             for item, mentor_output, intern_continuation in zip(batch, mentor_outputs, intern_continuations):
