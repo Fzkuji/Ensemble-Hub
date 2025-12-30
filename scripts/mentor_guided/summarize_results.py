@@ -280,9 +280,9 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
         mentor_acc = mentor_stats['accuracy'] if mentor_stats else 0
         mentor_len = mentor_stats['mentor_length_mean'] if mentor_stats else 0
 
-        # M-Gap = Cascade - Mentor, O-Gap = Oracle - Cascade
+        # M-Gap = Cascade - Mentor (正=提升), O-Gap = Cascade - Oracle (负=差距)
         m_gap = cascade - mentor_acc if mentor_acc else 0
-        o_gap = oracle - cascade
+        o_gap = cascade - oracle
 
         if show_length:
             length_stats = compute_length_stats(data_dir, subset)
@@ -367,7 +367,7 @@ def summarize(data_dir: str, show_length: bool = True, model_source: str = "indi
         avg_mentor_acc = total_mentor_acc / total_n
 
         avg_m_gap = avg_cascade - avg_mentor_acc if avg_mentor_acc else 0
-        avg_o_gap = avg_oracle - avg_cascade
+        avg_o_gap = avg_cascade - avg_oracle
 
         if show_length:
             avg_t0_i = total_intern_len[0] / total_len_count[0] if total_len_count[0] > 0 else 0
