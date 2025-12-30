@@ -32,60 +32,33 @@ def compute_average_curve(
     samples: List[Dict],
     field: str = 'per_token_entropy',
     max_length: int = None,
-    normalize_length: bool = False,
-    num_bins: int = 100,
 ) -> np.ndarray:
     """
-    计算平均曲线
+    计算平均曲线（按实际 token 位置）
 
     Args:
         samples: 样本列表
         field: 要提取的字段名 ('per_token_entropy' 或 'per_token_nll')
         max_length: 最大长度（截断）
-        normalize_length: 是否归一化长度到 [0, 1]
-        num_bins: 归一化时的 bin 数量
 
     Returns:
         average_curve: 平均曲线
     """
-    # 过滤出有该字段的样本
     valid_samples = [s for s in samples if field in s and s[field]]
-
     if not valid_samples:
         return np.array([])
 
-    if normalize_length:
-        # 归一化到相同长度
-        all_curves = []
-        for s in valid_samples:
-            values = np.array(s[field])
-            # 插值到 num_bins 个点
-            x_old = np.linspace(0, 1, len(values))
-            x_new = np.linspace(0, 1, num_bins)
-            interpolated = np.interp(x_new, x_old, values)
-            all_curves.append(interpolated)
+    lengths = [len(s[field]) for s in valid_samples]
+    target_length = min(max_length, max(lengths)) if max_length else max(lengths)
 
-        return np.mean(all_curves, axis=0)
-    else:
-        # 按实际位置计算平均
-        lengths = [len(s[field]) for s in valid_samples]
-        if max_length:
-            target_length = min(max_length, max(lengths))
-        else:
-            target_length = max(lengths)
+    all_curves = []
+    for s in valid_samples:
+        values = s[field][:target_length]
+        if len(values) < target_length:
+            values = values + [np.nan] * (target_length - len(values))
+        all_curves.append(values)
 
-        # 对齐并计算平均
-        all_curves = []
-        for s in valid_samples:
-            values = s[field][:target_length]
-            # 补齐到 target_length (用 nan)
-            if len(values) < target_length:
-                values = values + [np.nan] * (target_length - len(values))
-            all_curves.append(values)
-
-        all_curves = np.array(all_curves)
-        # 对每个位置计算平均（忽略 nan）
-        return np.nanmean(all_curves, axis=0)
+    return np.nanmean(np.array(all_curves), axis=0)
 
 
 def plot_metric_trends(
@@ -95,8 +68,6 @@ def plot_metric_trends(
     output_dir: str,
     metric_field: str,
     metric_name: str,
-    normalize_length: bool = False,
-    num_bins: int = 100,
     max_length: int = 2000,
 ):
     """绘制单个指标的趋势曲线"""
@@ -113,13 +84,7 @@ def plot_metric_trends(
         if not samples:
             continue
 
-        curve = compute_average_curve(
-            samples,
-            field=metric_field,
-            normalize_length=normalize_length,
-            num_bins=num_bins,
-            max_length=max_length,
-        )
+        curve = compute_average_curve(samples, field=metric_field, max_length=max_length)
 
         if len(curve) > 0:
             x = np.arange(1, len(curve) + 1)  # 从1开始，避免log10(0)
@@ -139,13 +104,7 @@ def plot_metric_trends(
         if not samples:
             continue
 
-        curve = compute_average_curve(
-            samples,
-            field=metric_field,
-            normalize_length=normalize_length,
-            num_bins=num_bins,
-            max_length=max_length,
-        )
+        curve = compute_average_curve(samples, field=metric_field, max_length=max_length)
 
         if len(curve) > 0:
             x = np.arange(1, len(curve) + 1)
@@ -173,13 +132,7 @@ def plot_metric_trends(
         # Sufficient
         suff_samples = all_sufficient[token_level]
         if suff_samples:
-            suff_curve = compute_average_curve(
-                suff_samples,
-                field=metric_field,
-                normalize_length=normalize_length,
-                num_bins=num_bins,
-                max_length=max_length,
-            )
+            suff_curve = compute_average_curve(suff_samples, field=metric_field, max_length=max_length)
             if len(suff_curve) > 0:
                 x = np.arange(1, len(suff_curve) + 1)
                 ax.plot(x, suff_curve, color='green', label=f'Sufficient (n={len(suff_samples)})', linewidth=2)
@@ -187,13 +140,7 @@ def plot_metric_trends(
         # Insufficient
         non_suff_samples = all_non_sufficient[token_level]
         if non_suff_samples:
-            non_suff_curve = compute_average_curve(
-                non_suff_samples,
-                field=metric_field,
-                normalize_length=normalize_length,
-                num_bins=num_bins,
-                max_length=max_length,
-            )
+            non_suff_curve = compute_average_curve(non_suff_samples, field=metric_field, max_length=max_length)
             if len(non_suff_curve) > 0:
                 x = np.arange(1, len(non_suff_curve) + 1)
                 ax.plot(x, non_suff_curve, color='red', label=f'Insufficient (n={len(non_suff_samples)})', linewidth=2)
@@ -217,8 +164,6 @@ def plot_entropy_trends(
     subsets: List[str],
     token_levels: List[int],
     output_dir: str,
-    normalize_length: bool = False,  # 默认不归一化，显示实际token位置
-    num_bins: int = 100,
     max_length: int = 2000,
 ):
     """绘制 entropy 和 NLL 趋势曲线"""
@@ -259,8 +204,7 @@ def plot_entropy_trends(
         print("\nPlotting Entropy trends...")
         plot_metric_trends(
             all_sufficient, all_non_sufficient, token_levels, output_dir,
-            'per_token_entropy', 'Entropy',
-            normalize_length, num_bins, max_length
+            'per_token_entropy', 'Entropy', max_length
         )
 
     # 绘制 NLL (负对数概率) 趋势
@@ -268,8 +212,7 @@ def plot_entropy_trends(
         print("\nPlotting NLL (Negative Log Prob) trends...")
         plot_metric_trends(
             all_sufficient, all_non_sufficient, token_levels, output_dir,
-            'per_token_nll', 'NLL (-log p)',
-            normalize_length, num_bins, max_length
+            'per_token_nll', 'NLL (-log p)', max_length
         )
 
     # 打印统计信息
@@ -305,12 +248,8 @@ def main():
                         help="Specific subset (default: all)")
     parser.add_argument("--token-levels", type=str, default="100,500,1000",
                         help="Comma-separated token levels")
-    parser.add_argument("--no-normalize", action="store_true",
-                        help="Don't normalize length (use absolute positions)")
-    parser.add_argument("--num-bins", type=int, default=100,
-                        help="Number of bins for normalization")
     parser.add_argument("--max-length", type=int, default=2000,
-                        help="Maximum token length (for non-normalized mode)")
+                        help="Maximum token length to show")
 
     args = parser.parse_args()
 
@@ -344,8 +283,6 @@ def main():
         subsets,
         token_levels,
         args.output_dir,
-        normalize_length=False,  # 使用实际token位置
-        num_bins=args.num_bins,
         max_length=args.max_length,
     )
 
