@@ -41,7 +41,7 @@ def plot_distribution(
     """Plot PPL and Entropy distribution comparison."""
     if entropy_only:
         # Single row for entropy only
-        fig, axes = plt.subplots(1, len(token_levels), figsize=(4 * len(token_levels), 2.8))
+        fig, axes = plt.subplots(1, len(token_levels), figsize=(4 * len(token_levels), 3.2))
         if len(token_levels) == 1:
             axes = [axes]
 
