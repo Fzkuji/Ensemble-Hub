@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-计算 SLM 对 guidance 的 PPL 和 Entropy
+计算 SLM 对 guidance 的 PPL 和 Entropy（支持 DDP）
 
 对于每个样本，计算 intern 模型在给定 prompt + mentor guidance 情况下，
 生成 intern response 的 perplexity 和 entropy。
+
+Usage:
+    # 单卡
+    CUDA_VISIBLE_DEVICES=0 python compute_ppl_entropy.py --subset algebra
+
+    # 多卡 DDP
+    CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 compute_ppl_entropy.py --ddp
 """
 
 import argparse
 import json
 import os
 import torch
+import torch.distributed as dist
 import numpy as np
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -17,9 +25,34 @@ from typing import List, Dict, Tuple
 import torch.nn.functional as F
 
 
+def setup_distributed():
+    """初始化分布式环境"""
+    if 'RANK' in os.environ:
+        dist.init_process_group(backend='nccl')
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+        return local_rank, dist.get_world_size(), True
+    return 0, 1, False
+
+
+def cleanup_distributed():
+    """清理分布式环境"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """判断是否是主进程"""
+    if dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
+
+
 def load_model(model_path: str, device: str = "cuda"):
     """加载模型和 tokenizer"""
-    print(f"Loading model from {model_path}...")
+    if is_main_process():
+        print(f"Loading model from {model_path}...")
+
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -30,7 +63,9 @@ def load_model(model_path: str, device: str = "cuda"):
         device_map=device,
     )
     model.eval()
-    print(f"Model loaded on {device}")
+
+    if is_main_process():
+        print(f"Model loaded on {device}")
     return model, tokenizer
 
 
@@ -115,11 +150,14 @@ def process_subset(
     token_level: int,
     output_dir: str,
     max_samples: int = None,
+    world_size: int = 1,
+    rank: int = 0,
 ):
     """处理单个子集的数据"""
     data_file = os.path.join(data_dir, subset, split, f"tokens{token_level}.json")
     if not os.path.exists(data_file):
-        print(f"File not found: {data_file}")
+        if is_main_process():
+            print(f"File not found: {data_file}")
         return
 
     with open(data_file, 'r') as f:
@@ -128,10 +166,20 @@ def process_subset(
     if max_samples:
         data = data[:max_samples]
 
-    print(f"\nProcessing {subset}/tokens{token_level}.json ({len(data)} samples)...")
+    # DDP: 每个进程处理一部分数据
+    total_samples = len(data)
+    samples_per_rank = (total_samples + world_size - 1) // world_size
+    start_idx = rank * samples_per_rank
+    end_idx = min(start_idx + samples_per_rank, total_samples)
+    local_data = data[start_idx:end_idx]
+
+    if is_main_process():
+        print(f"\nProcessing {subset}/tokens{token_level}.json ({total_samples} samples, {len(local_data)} on this rank)...")
 
     results = []
-    for item in tqdm(data, desc=f"{subset}/T{token_level}"):
+    pbar = tqdm(local_data, desc=f"{subset}/T{token_level}", disable=not is_main_process())
+
+    for item in pbar:
         question = item.get('question', '')
         mentor_response = item.get('mentor_response', '')
         intern_response = item.get('response', '')
@@ -146,11 +194,13 @@ def process_subset(
                 model, tokenizer, prompt, intern_response
             )
         except Exception as e:
-            print(f"Error computing PPL: {e}")
+            if is_main_process():
+                print(f"Error computing PPL: {e}")
             ppl, avg_entropy, max_entropy = float('inf'), float('inf'), float('inf')
 
         # 保存结果
         result = {
+            'idx': start_idx + len(results),  # 全局索引
             'is_correct': item.get('is_correct', False),
             'ppl': ppl,
             'avg_entropy': avg_entropy,
@@ -161,34 +211,67 @@ def process_subset(
         }
         results.append(result)
 
-    # 保存结果
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, f"{subset}_tokens{token_level}_ppl.json")
-    with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"Saved: {output_file}")
+    # DDP: 收集所有进程的结果
+    if world_size > 1:
+        # 每个进程保存自己的部分结果
+        os.makedirs(output_dir, exist_ok=True)
+        temp_file = os.path.join(output_dir, f"{subset}_tokens{token_level}_ppl_rank{rank}.json")
+        with open(temp_file, 'w') as f:
+            json.dump(results, f)
 
-    # 打印统计
-    sufficient = [r for r in results if r['is_correct']]
-    non_sufficient = [r for r in results if not r['is_correct']]
+        # 同步
+        dist.barrier()
 
-    print(f"\n  Sufficient (n={len(sufficient)}):")
-    if sufficient:
-        suff_ppl = [r['ppl'] for r in sufficient if r['ppl'] < float('inf')]
-        suff_entropy = [r['avg_entropy'] for r in sufficient if r['avg_entropy'] < float('inf')]
-        if suff_ppl:
-            print(f"    PPL: mean={np.mean(suff_ppl):.2f}, median={np.median(suff_ppl):.2f}")
-        if suff_entropy:
-            print(f"    Entropy: mean={np.mean(suff_entropy):.2f}, median={np.median(suff_entropy):.2f}")
+        # 主进程合并结果
+        if is_main_process():
+            all_results = []
+            for r in range(world_size):
+                temp_file = os.path.join(output_dir, f"{subset}_tokens{token_level}_ppl_rank{r}.json")
+                if os.path.exists(temp_file):
+                    with open(temp_file, 'r') as f:
+                        all_results.extend(json.load(f))
+                    os.remove(temp_file)  # 删除临时文件
 
-    print(f"  Non-sufficient (n={len(non_sufficient)}):")
-    if non_sufficient:
-        non_suff_ppl = [r['ppl'] for r in non_sufficient if r['ppl'] < float('inf')]
-        non_suff_entropy = [r['avg_entropy'] for r in non_sufficient if r['avg_entropy'] < float('inf')]
-        if non_suff_ppl:
-            print(f"    PPL: mean={np.mean(non_suff_ppl):.2f}, median={np.median(non_suff_ppl):.2f}")
-        if non_suff_entropy:
-            print(f"    Entropy: mean={np.mean(non_suff_entropy):.2f}, median={np.median(non_suff_entropy):.2f}")
+            # 按全局索引排序
+            all_results.sort(key=lambda x: x['idx'])
+            # 移除索引字段
+            for r in all_results:
+                del r['idx']
+            results = all_results
+    else:
+        # 移除索引字段
+        for r in results:
+            del r['idx']
+
+    # 主进程保存最终结果
+    if is_main_process():
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(output_dir, f"{subset}_tokens{token_level}_ppl.json")
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"Saved: {output_file}")
+
+        # 打印统计
+        sufficient = [r for r in results if r['is_correct']]
+        non_sufficient = [r for r in results if not r['is_correct']]
+
+        print(f"\n  Sufficient (n={len(sufficient)}):")
+        if sufficient:
+            suff_ppl = [r['ppl'] for r in sufficient if r['ppl'] < float('inf')]
+            suff_entropy = [r['avg_entropy'] for r in sufficient if r['avg_entropy'] < float('inf')]
+            if suff_ppl:
+                print(f"    PPL: mean={np.mean(suff_ppl):.2f}, median={np.median(suff_ppl):.2f}")
+            if suff_entropy:
+                print(f"    Entropy: mean={np.mean(suff_entropy):.2f}, median={np.median(suff_entropy):.2f}")
+
+        print(f"  Non-sufficient (n={len(non_sufficient)}):")
+        if non_sufficient:
+            non_suff_ppl = [r['ppl'] for r in non_sufficient if r['ppl'] < float('inf')]
+            non_suff_entropy = [r['avg_entropy'] for r in non_sufficient if r['avg_entropy'] < float('inf')]
+            if non_suff_ppl:
+                print(f"    PPL: mean={np.mean(non_suff_ppl):.2f}, median={np.median(non_suff_ppl):.2f}")
+            if non_suff_entropy:
+                print(f"    Entropy: mean={np.mean(non_suff_entropy):.2f}, median={np.median(non_suff_entropy):.2f}")
 
 
 def main():
@@ -209,10 +292,18 @@ def main():
                         help="Comma-separated token levels to process")
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Max samples per subset (for testing)")
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="Device to use")
+    parser.add_argument("--ddp", action="store_true",
+                        help="Use DDP for multi-GPU")
 
     args = parser.parse_args()
+
+    # 设置分布式
+    if args.ddp:
+        local_rank, world_size, use_ddp = setup_distributed()
+        device = f"cuda:{local_rank}"
+    else:
+        local_rank, world_size, use_ddp = 0, 1, False
+        device = "cuda"
 
     if args.output_dir is None:
         args.output_dir = os.path.join(args.data_dir, "ppl_analysis")
@@ -220,7 +311,7 @@ def main():
     token_levels = [int(x) for x in args.token_levels.split(',')]
 
     # 加载模型
-    model, tokenizer = load_model(args.model, args.device)
+    model, tokenizer = load_model(args.model, device)
 
     # 确定要处理的子集
     if args.subset:
@@ -235,9 +326,11 @@ def main():
                     subsets.append(name)
         subsets = sorted(subsets)
 
-    print(f"Processing subsets: {subsets}")
-    print(f"Token levels: {token_levels}")
-    print(f"Output dir: {args.output_dir}")
+    if is_main_process():
+        print(f"Processing subsets: {subsets}")
+        print(f"Token levels: {token_levels}")
+        print(f"Output dir: {args.output_dir}")
+        print(f"World size: {world_size}")
 
     # 处理每个子集
     for subset in subsets:
@@ -245,10 +338,14 @@ def main():
             process_subset(
                 model, tokenizer,
                 args.data_dir, subset, args.split, token_level,
-                args.output_dir, args.max_samples
+                args.output_dir, args.max_samples,
+                world_size, local_rank
             )
 
-    print(f"\nDone! Results saved to: {args.output_dir}")
+    if is_main_process():
+        print(f"\nDone! Results saved to: {args.output_dir}")
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
