@@ -625,41 +625,28 @@ def get_subset_n_test(data_dir: str, subset: str) -> int:
 
 
 def print_classifier_comparison(data_dir: str, model_source: str = "individual", subsets: list = None):
-    """打印分类器对比表格（LoRA vs MLP vs PPL vs Ensemble，包含准确率和长度）"""
+    """打印分类器对比表格（LoRA vs MLP vs PPL vs Ensemble，包含准确率和长度）- Markdown 格式"""
     if subsets is None:
         subsets = detect_subsets(data_dir, "test")
 
     source_label = "[individual]" if model_source == "individual" else "[all]"
 
-    # 列宽定义
-    W_SUBSET = 25
-    W_N = 8
-    W_METHOD = 20  # 每个方法的列宽 (acc + m_len + i_len)
-    W_ORACLE = 8
-    W_BEST = 10
-
     # 方法列表
     methods = ["LoRA", "MLP", "PPL", "Ensemble"]
 
-    # 计算总宽度
-    W = W_SUBSET + W_N + W_METHOD * len(methods) + W_ORACLE + W_BEST + 10
+    print(f"\n## CLASSIFIER COMPARISON {source_label}\n")
 
-    print("\n" + "=" * W)
-    print(f"{'CLASSIFIER COMPARISON':^{W}} {source_label}")
-    print("=" * W)
-
-    # 两行表头
-    header1 = f"{'Subset':<{W_SUBSET}} {'N':>{W_N}}"
-    header2 = f"{'':<{W_SUBSET}} {'':>{W_N}}"
+    # Markdown 表头
+    header = "| Subset | N |"
+    separator = "|--------|---|"
     for method in methods:
-        header1 += f"  {method:^{W_METHOD-2}}"
-        header2 += f"  {'acc':>6} {'m_len':>6} {'i_len':>6}"
-    header1 += f"  {'Oracle':>{W_ORACLE}} {'Best':>{W_BEST}}"
-    header2 += f"  {'':>{W_ORACLE}} {'':>{W_BEST}}"
+        header += f" {method} acc | {method} m_len | {method} i_len |"
+        separator += "-------:|-------:|-------:|"
+    header += " Oracle | Best |"
+    separator += "-------:|------|"
 
-    print(header1)
-    print(header2)
-    print("-" * W)
+    print(header)
+    print(separator)
 
     # 统计变量
     total_n = 0
@@ -670,7 +657,7 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
         n = get_subset_n_test(data_dir, subset)
         total_n += n
 
-        row = f"{subset:<{W_SUBSET}} {n:>{W_N}}"
+        row = f"| {subset} | {n} |"
 
         # 获取每个分类器的结果
         results = {}
@@ -728,7 +715,7 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
             else:
                 acc_str = m_len_str = i_len_str = "-"
 
-            row += f"  {acc_str:>6} {m_len_str:>6} {i_len_str:>6}"
+            row += f" {acc_str} | {m_len_str} | {i_len_str} |"
 
         # Oracle 和 Best
         oracle_str = f"{oracle_acc:.4f}" if oracle_acc else "-"
@@ -736,26 +723,23 @@ def print_classifier_comparison(data_dir: str, model_source: str = "individual",
             oracle_total['acc'] += oracle_acc * n
             oracle_total['cnt'] += n
 
-        row += f"  {oracle_str:>{W_ORACLE}} {best_method:>{W_BEST}}"
+        row += f" {oracle_str} | {best_method} |"
         print(row)
 
-    print("-" * W)
-
     # TOTAL 行
-    row = f"{'TOTAL (weighted)':<{W_SUBSET}} {total_n:>{W_N}}"
+    row = f"| **TOTAL** | {total_n} |"
     for method in methods:
         t = method_totals[method]
         acc_str = f"{t['acc']/t['cnt']:.4f}" if t['cnt'] > 0 else "-"
         m_len_str = f"{t['m_len']/t['m_cnt']:.1f}" if t['m_cnt'] > 0 else "-"
         i_len_str = f"{t['i_len']/t['i_cnt']:.1f}" if t['i_cnt'] > 0 else "-"
-        row += f"  {acc_str:>6} {m_len_str:>6} {i_len_str:>6}"
+        row += f" {acc_str} | {m_len_str} | {i_len_str} |"
 
     oracle_avg = oracle_total['acc'] / oracle_total['cnt'] if oracle_total['cnt'] > 0 else 0
     oracle_str = f"{oracle_avg:.4f}" if oracle_avg else "-"
-    row += f"  {oracle_str:>{W_ORACLE}} {'':>{W_BEST}}"
+    row += f" {oracle_str} | |"
 
     print(row)
-    print("=" * W)
 
 
 def summarize_single(data_dir: str, subset: str, model_dir: str = None, show_length: bool = True):
