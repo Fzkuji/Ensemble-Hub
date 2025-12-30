@@ -217,7 +217,7 @@ def plot_entropy_trends(
     subsets: List[str],
     token_levels: List[int],
     output_dir: str,
-    normalize_length: bool = True,
+    normalize_length: bool = False,  # 默认不归一化，显示实际token位置
     num_bins: int = 100,
     max_length: int = 2000,
 ):
