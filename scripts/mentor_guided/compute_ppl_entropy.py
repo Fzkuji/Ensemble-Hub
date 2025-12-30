@@ -75,7 +75,8 @@ def compute_ppl_and_entropy(
     prompt: str,
     response: str,
     max_length: int = 4096,
-) -> Tuple[float, float, float]:
+    return_per_token: bool = False,
+) -> Tuple[float, float, float, List[float]]:
     """
     计算给定 prompt 下生成 response 的 PPL 和 entropy
 
@@ -83,6 +84,7 @@ def compute_ppl_and_entropy(
         ppl: perplexity
         avg_entropy: 平均 entropy
         max_entropy: 最大 entropy
+        per_token_entropy: 每个token位置的entropy列表 (if return_per_token=True)
     """
     # 构建完整输入
     full_text = prompt + response
@@ -97,7 +99,7 @@ def compute_ppl_and_entropy(
 
     if prompt_len >= input_ids.shape[1]:
         # Response 被截断了
-        return float('inf'), float('inf'), float('inf')
+        return float('inf'), float('inf'), float('inf'), []
 
     # Forward pass
     with torch.no_grad():
@@ -127,7 +129,10 @@ def compute_ppl_and_entropy(
         avg_entropy = entropies.mean().item()
         max_entropy = entropies.max().item()
 
-    return ppl, avg_entropy, max_entropy
+        # 每个token的entropy
+        per_token_entropy = entropies.cpu().tolist() if return_per_token else []
+
+    return ppl, avg_entropy, max_entropy, per_token_entropy
 
 
 def build_prompt(question: str, mentor_response: str, mentor_tokens: int) -> str:
@@ -152,6 +157,7 @@ def process_subset(
     max_samples: int = None,
     world_size: int = 1,
     rank: int = 0,
+    save_per_token: bool = False,
 ):
     """处理单个子集的数据"""
     data_file = os.path.join(data_dir, subset, split, f"tokens{token_level}.json")
@@ -190,13 +196,13 @@ def process_subset(
 
         # 计算 PPL 和 entropy
         try:
-            ppl, avg_entropy, max_entropy = compute_ppl_and_entropy(
-                model, tokenizer, prompt, intern_response
+            ppl, avg_entropy, max_entropy, per_token_entropy = compute_ppl_and_entropy(
+                model, tokenizer, prompt, intern_response, return_per_token=save_per_token
             )
         except Exception as e:
             if is_main_process():
                 print(f"Error computing PPL: {e}")
-            ppl, avg_entropy, max_entropy = float('inf'), float('inf'), float('inf')
+            ppl, avg_entropy, max_entropy, per_token_entropy = float('inf'), float('inf'), float('inf'), []
 
         # 保存结果
         result = {
@@ -209,6 +215,8 @@ def process_subset(
             'mentor_length': item.get('mentor_length', 0),
             'level': item.get('level', ''),
         }
+        if save_per_token and per_token_entropy:
+            result['per_token_entropy'] = per_token_entropy
         results.append(result)
 
     # DDP: 收集所有进程的结果
@@ -294,6 +302,8 @@ def main():
                         help="Max samples per subset (for testing)")
     parser.add_argument("--ddp", action="store_true",
                         help="Use DDP for multi-GPU")
+    parser.add_argument("--save-per-token", action="store_true",
+                        help="Save per-token entropy for trend visualization")
 
     args = parser.parse_args()
 
@@ -339,7 +349,8 @@ def main():
                 model, tokenizer,
                 args.data_dir, subset, args.split, token_level,
                 args.output_dir, args.max_samples,
-                world_size, local_rank
+                world_size, local_rank,
+                save_per_token=args.save_per_token
             )
 
     if is_main_process():
