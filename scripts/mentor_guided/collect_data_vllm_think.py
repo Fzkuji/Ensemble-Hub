@@ -41,6 +41,13 @@ if scripts_dir not in sys.path:
 
 from grader import grade_answer
 
+# Optional: OpenRouter API support
+try:
+    from openrouter_inference import OpenRouterInference
+    OPENROUTER_AVAILABLE = True
+except ImportError:
+    OPENROUTER_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -827,6 +834,9 @@ def worker_process_all_tasks(
     force: bool = False,
     need_mentor: bool = True,
     need_intern: bool = True,
+    mentor_api: str = None,
+    openrouter_api_key: str = None,
+    api_max_workers: int = 8,
 ):
     """Worker process that processes ALL subsets and token levels.
 
@@ -845,6 +855,9 @@ def worker_process_all_tasks(
         intern_gpu_ids: List of GPU IDs for intern model (for tensor parallelism)
         mentor_memory_util: GPU memory utilization for mentor model
         intern_memory_util: GPU memory utilization for intern model
+        mentor_api: API type for mentor model (e.g., "openrouter")
+        openrouter_api_key: OpenRouter API key
+        api_max_workers: Max concurrent API requests
     """
     # Determine GPU IDs for each model
     mentor_gpus = mentor_gpu_ids if mentor_gpu_ids is not None else [gpu_id]
@@ -874,19 +887,35 @@ def worker_process_all_tasks(
     intern_model = None
 
     if need_mentor:
-        logger.info(f"[Worker {rank}] Loading mentor model: {mentor_model_name} on GPU {mentor_gpus} (tp={len(mentor_gpus)}, memory_util={mentor_mem_util}, max_len={mentor_max_len})...")
-        try:
-            mentor_model = VLLMInference(
-                model_name=mentor_model_name,
-                gpu_ids=mentor_gpus,
-                max_model_len=mentor_max_len,
-                gpu_memory_utilization=mentor_mem_util,
-            )
-        except Exception as e:
-            logger.error(f"[Worker {rank}] Failed to load mentor model: {e}")
-            logger.error(f"[Worker {rank}] Try: 1) Reduce --mentor-max-model-len (current: {mentor_max_len})")
-            logger.error(f"[Worker {rank}]     2) Lower --mentor-memory-util (current: {mentor_mem_util})")
-            raise
+        if mentor_api == "openrouter":
+            # Use OpenRouter API for mentor (closed-source models like GPT-4, Claude)
+            if not OPENROUTER_AVAILABLE:
+                raise ImportError("OpenRouter support not available. Make sure openrouter_inference.py exists.")
+            logger.info(f"[Worker {rank}] Loading mentor via OpenRouter API: {mentor_model_name} (max_workers={api_max_workers})...")
+            try:
+                mentor_model = OpenRouterInference(
+                    model_name=mentor_model_name,
+                    api_key=openrouter_api_key,
+                    max_workers=api_max_workers,
+                )
+            except Exception as e:
+                logger.error(f"[Worker {rank}] Failed to initialize OpenRouter client: {e}")
+                raise
+        else:
+            # Use vLLM for local mentor model
+            logger.info(f"[Worker {rank}] Loading mentor model: {mentor_model_name} on GPU {mentor_gpus} (tp={len(mentor_gpus)}, memory_util={mentor_mem_util}, max_len={mentor_max_len})...")
+            try:
+                mentor_model = VLLMInference(
+                    model_name=mentor_model_name,
+                    gpu_ids=mentor_gpus,
+                    max_model_len=mentor_max_len,
+                    gpu_memory_utilization=mentor_mem_util,
+                )
+            except Exception as e:
+                logger.error(f"[Worker {rank}] Failed to load mentor model: {e}")
+                logger.error(f"[Worker {rank}] Try: 1) Reduce --mentor-max-model-len (current: {mentor_max_len})")
+                logger.error(f"[Worker {rank}]     2) Lower --mentor-memory-util (current: {mentor_mem_util})")
+                raise
     else:
         logger.info(f"[Worker {rank}] Skipping mentor model (not needed for token levels {token_levels})")
 
@@ -1000,6 +1029,9 @@ def collect_parallel(
     force: bool = False,
     need_mentor: bool = True,
     need_intern: bool = True,
+    mentor_api: str = None,
+    openrouter_api_key: str = None,
+    api_max_workers: int = 8,
 ) -> Dict[int, Dict[str, Any]]:
     """Collect data for a single dataset in parallel.
 
@@ -1025,6 +1057,9 @@ def collect_parallel(
         force=force,
         need_mentor=need_mentor,
         need_intern=need_intern,
+        mentor_api=mentor_api,
+        openrouter_api_key=openrouter_api_key,
+        api_max_workers=api_max_workers,
     )
     return results.get("single", {})
 
@@ -1080,6 +1115,9 @@ def collect_all_parallel(
     force: bool = False,
     need_mentor: bool = True,
     need_intern: bool = True,
+    mentor_api: str = None,
+    openrouter_api_key: str = None,
+    api_max_workers: int = 8,
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """Collect data for ALL subsets in parallel.
 
@@ -1169,12 +1207,15 @@ def collect_all_parallel(
         intern_gpu_list = tensor_gpus if need_intern else None
         p = mp.Process(
             target=worker_process_all_tasks,
-            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu_list, intern_gpu_list, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern)
+            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu_list, intern_gpu_list, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers)
         )
         p.start()
         processes.append(p)
         if need_mentor:
-            print(f"[MAIN] Started worker 0 (mentor on GPUs {tensor_gpus}, tp={len(tensor_gpus)}, PID: {p.pid})", flush=True)
+            if mentor_api:
+                print(f"[MAIN] Started worker 0 (mentor via {mentor_api} API, PID: {p.pid})", flush=True)
+            else:
+                print(f"[MAIN] Started worker 0 (mentor on GPUs {tensor_gpus}, tp={len(tensor_gpus)}, PID: {p.pid})", flush=True)
         else:
             print(f"[MAIN] Started worker 0 (intern on GPUs {tensor_gpus}, tp={len(tensor_gpus)}, PID: {p.pid})", flush=True)
     else:
@@ -1184,7 +1225,7 @@ def collect_all_parallel(
             intern_gpu = [intern_gpu_ids[rank]] if intern_gpu_ids else [gpu_id]
             p = mp.Process(
                 target=worker_process_all_tasks,
-                args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern)
+                args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers)
             )
             p.start()
             processes.append(p)
@@ -1255,6 +1296,14 @@ def main():
                         help="Disable structured thinking prompt (use standard prompt)")
     parser.add_argument("--force", action="store_true",
                         help="Force re-collection even if data files already exist")
+    # OpenRouter API support for closed-source mentor models
+    parser.add_argument("--mentor-api", type=str, default=None,
+                        choices=["openrouter"],
+                        help="Use API for mentor model (e.g., 'openrouter' for GPT-4, Claude, etc.)")
+    parser.add_argument("--openrouter-api-key", type=str, default=None,
+                        help="OpenRouter API key (or set OPENROUTER_API_KEY env var)")
+    parser.add_argument("--api-max-workers", type=int, default=8,
+                        help="Max concurrent API requests for OpenRouter (default: 8)")
 
     args = parser.parse_args()
 
@@ -1486,6 +1535,9 @@ def main():
                 force=args.force,
                 need_mentor=True,
                 need_intern=False,
+                mentor_api=args.mentor_api,
+                openrouter_api_key=args.openrouter_api_key,
+                api_max_workers=args.api_max_workers,
             )
             all_stats.update(stats)
 
@@ -1511,6 +1563,9 @@ def main():
                 force=args.force,
                 need_mentor=False,
                 need_intern=True,
+                mentor_api=args.mentor_api,
+                openrouter_api_key=args.openrouter_api_key,
+                api_max_workers=args.api_max_workers,
             )
             all_stats.update(stats)
 
@@ -1536,6 +1591,9 @@ def main():
                 force=args.force,
                 need_mentor=True,
                 need_intern=True,
+                mentor_api=args.mentor_api,
+                openrouter_api_key=args.openrouter_api_key,
+                api_max_workers=args.api_max_workers,
             )
             all_stats.update(stats)
 
@@ -1648,6 +1706,9 @@ def main():
             force=args.force,
             need_mentor=need_mentor,
             need_intern=need_intern,
+            mentor_api=args.mentor_api,
+            openrouter_api_key=args.openrouter_api_key,
+            api_max_workers=args.api_max_workers,
         )
 
     logger.info("\nData collection complete!")
