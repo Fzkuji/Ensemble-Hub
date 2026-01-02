@@ -39,6 +39,9 @@ class OpenRouterInference:
         "o1": "openai/o1",
         "o1-mini": "openai/o1-mini",
         "o1-preview": "openai/o1-preview",
+        # GPT-OSS (open source reasoning model from OpenAI)
+        "gpt-oss-20b": "openai/gpt-oss-20b",
+        "gpt-oss": "openai/gpt-oss-20b",
         # Anthropic
         "claude-3-opus": "anthropic/claude-3-opus",
         "claude-3-sonnet": "anthropic/claude-3-sonnet",
@@ -105,6 +108,8 @@ class OpenRouterInference:
             return "deepseek-r1"
         elif "qwen" in model_lower:
             return "qwen3"
+        elif "gpt-oss" in model_lower or "gptoss" in model_lower:
+            return "gpt-oss"
         else:
             return "default"
 
@@ -170,6 +175,11 @@ class OpenRouterInference:
         Note: OpenRouter uses message list format, not string prompts.
         For compatibility with vLLM interface, we return messages as a list.
 
+        Handles different model families:
+        - GPT-OSS: use "Reasoning: high/none" directive in system prompt
+        - DeepSeek/Qwen: standard thinking prompts
+        - Others: encourage step-by-step reasoning
+
         Args:
             question: The math problem
             use_think: Whether to encourage thinking (adds hint to system prompt)
@@ -177,10 +187,15 @@ class OpenRouterInference:
         Returns:
             List of message dictionaries
         """
-        system_content = SYSTEM_PROMPT
-        if use_think:
-            # Encourage step-by-step reasoning
+        if self.model_family == "gpt-oss":
+            # GPT-OSS: control reasoning via "Reasoning: high/medium/low/none"
+            reasoning_directive = "Reasoning: high" if use_think else "Reasoning: none"
+            system_content = f"{reasoning_directive}\n\n{SYSTEM_PROMPT}"
+        elif use_think:
+            # Encourage step-by-step reasoning for other models
             system_content = "Please think through this problem step by step, showing your reasoning process. " + SYSTEM_PROMPT
+        else:
+            system_content = SYSTEM_PROMPT
 
         messages = [
             {"role": "system", "content": system_content},

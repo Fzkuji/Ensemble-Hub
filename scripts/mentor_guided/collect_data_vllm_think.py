@@ -158,6 +158,18 @@ MODEL_FAMILIES = {
         "template_adds_think": False,  # Chat template does NOT add <think>
         "enable_thinking_param": True,  # Use enable_thinking param in apply_chat_template
     },
+    "gpt-oss": {
+        # GPT-OSS uses <thinking>/<final_answer> tags (different from DeepSeek/Qwen's <think>)
+        # Reasoning mode is controlled via system prompt: "Reasoning: high/medium/low/none"
+        "think_start": "<thinking>",
+        "think_end": "</thinking>",
+        "final_answer_start": "<final_answer>",
+        "final_answer_end": "</final_answer>",
+        "template_adds_think": False,  # Need to add "Reasoning: high" to system prompt
+        "reasoning_system_prompt": True,  # Use "Reasoning: high" in system prompt
+        "no_think_system": "Reasoning: none",  # System prompt for no-think mode
+        "think_system": "Reasoning: high",  # System prompt for think mode
+    },
     "default": {
         "think_start": None,
         "think_end": None,
@@ -173,7 +185,7 @@ def detect_model_family(model_name: str) -> str:
         model_name: HuggingFace model name (e.g., 'deepseek-ai/DeepSeek-R1-Distill-Qwen-7B')
 
     Returns:
-        Model family key ('deepseek-r1', 'qwen3', or 'default')
+        Model family key ('deepseek-r1', 'qwen3', 'gpt-oss', or 'default')
     """
     model_lower = model_name.lower()
 
@@ -181,6 +193,8 @@ def detect_model_family(model_name: str) -> str:
         return "deepseek-r1"
     elif "qwen3" in model_lower or "qwen-3" in model_lower or "qwen/qwen3" in model_lower:
         return "qwen3"
+    elif "gpt-oss" in model_lower or "gptoss" in model_lower or "openai/gpt-oss" in model_lower:
+        return "gpt-oss"
     else:
         return "default"
 
@@ -190,6 +204,7 @@ def build_cross_model_prompt(
     mentor_output: str,
     intern_model: "VLLMInference",
     use_think: bool = True,
+    mentor_family: str = None,
 ) -> str:
     """Build prompt for intern model to continue from mentor's output.
 
@@ -202,6 +217,7 @@ def build_cross_model_prompt(
         mentor_output: Mentor's generated output (thinking + partial answer)
         intern_model: The intern VLLMInference instance
         use_think: Whether thinking mode is enabled
+        mentor_family: Mentor's model family (for format conversion)
 
     Returns:
         Formatted prompt for intern to continue generation
@@ -209,29 +225,36 @@ def build_cross_model_prompt(
     # Build intern's base prompt
     intern_prompt = intern_model.build_chat_prompt(question, use_think=use_think)
 
-    # For cross-model scenarios, we need to handle the prompt carefully:
-    # - If intern is Qwen3 and mentor is DeepSeek-R1, the mentor's output
-    #   already contains <think>...</think> or partial <think>... content
-    # - Both use the same <think>/<think> tags, so we can directly append
-    #
-    # The key insight: since both DeepSeek-R1 and Qwen3 use identical
-    # <think>...</think> tags, we can simply append mentor's output
-    # to intern's prompt (which may or may not have started a think block)
+    # Handle cross-model format conversion
+    # GPT-OSS uses <thinking>/<final_answer> while DeepSeek/Qwen use <think>
+    intern_family = intern_model.model_family
 
-    if intern_model.model_family == "qwen3":
+    # Convert mentor output format to intern's expected format if needed
+    converted_output = mentor_output
+    if mentor_family == "gpt-oss" and intern_family in ("deepseek-r1", "qwen3"):
+        # Convert GPT-OSS format to DeepSeek/Qwen format
+        converted_output = mentor_output.replace("<thinking>", "<think>").replace("</thinking>", "</think>")
+        converted_output = converted_output.replace("<final_answer>", "").replace("</final_answer>", "")
+    elif mentor_family in ("deepseek-r1", "qwen3") and intern_family == "gpt-oss":
+        # Convert DeepSeek/Qwen format to GPT-OSS format
+        converted_output = mentor_output.replace("<think>", "<thinking>").replace("</think>", "</thinking>")
+
+    # For cross-model scenarios, we need to handle the prompt carefully
+    if intern_family == "qwen3":
         # Qwen3's prompt doesn't include <think>, so we need to add it
-        # if mentor started thinking
-        if mentor_output.startswith("<think>") or mentor_output.strip().startswith("<think>"):
-            # Mentor already started thinking, just append
-            return intern_prompt + mentor_output
+        if converted_output.startswith("<think>") or converted_output.strip().startswith("<think>"):
+            return intern_prompt + converted_output
         else:
-            # Mentor didn't start with <think>, might be a different format
-            # Add <think> wrapper for consistency
-            return intern_prompt + "<think>\n" + mentor_output
+            return intern_prompt + "<think>\n" + converted_output
+    elif intern_family == "gpt-oss":
+        # GPT-OSS: the reasoning is triggered by system prompt, just append output
+        if converted_output.startswith("<thinking>") or converted_output.strip().startswith("<thinking>"):
+            return intern_prompt + converted_output
+        else:
+            return intern_prompt + "<thinking>\n" + converted_output
     else:
         # DeepSeek-R1 or default: prompt already ends with <think>\n
-        # Just append mentor's output (which continues the thinking)
-        return intern_prompt + mentor_output
+        return intern_prompt + converted_output
 
 
 def parse_answer(raw_answer: str, parser_type: Optional[str] = None) -> str:
@@ -283,6 +306,56 @@ def extract_boxed_answer(text: str) -> str:
             content += text[i]
         i += 1
     return content.strip()
+
+
+def extract_thinking_content(text: str, model_family: str = None) -> Tuple[str, str]:
+    """Extract thinking content and final answer from model output.
+
+    Handles different model formats:
+    - DeepSeek/Qwen: <think>...</think>
+    - GPT-OSS: <thinking>...</thinking> and <final_answer>...</final_answer>
+
+    Args:
+        text: Model output text
+        model_family: Model family for format detection (optional, will auto-detect)
+
+    Returns:
+        Tuple of (thinking_content, remaining_content)
+    """
+    import re
+
+    # Auto-detect format if not specified
+    if model_family is None:
+        if "<thinking>" in text:
+            model_family = "gpt-oss"
+        elif "<think>" in text:
+            model_family = "deepseek-r1"  # or qwen3, same format
+
+    if model_family == "gpt-oss":
+        # GPT-OSS format: <thinking>...</thinking> and optionally <final_answer>...</final_answer>
+        thinking_match = re.search(r'<thinking>(.*?)</thinking>', text, re.DOTALL)
+        thinking = thinking_match.group(1).strip() if thinking_match else ""
+
+        # Get content after </thinking> or <final_answer>...</final_answer>
+        remaining = text
+        if thinking_match:
+            remaining = text[thinking_match.end():]
+
+        final_match = re.search(r'<final_answer>(.*?)</final_answer>', remaining, re.DOTALL)
+        if final_match:
+            remaining = final_match.group(1).strip()
+
+        return thinking, remaining.strip()
+    else:
+        # DeepSeek/Qwen format: <think>...</think>
+        think_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
+        thinking = think_match.group(1).strip() if think_match else ""
+
+        remaining = text
+        if think_match:
+            remaining = text[think_match.end():]
+
+        return thinking, remaining.strip()
 
 
 def check_math_correctness(prediction: str, ground_truth: str) -> bool:
@@ -390,6 +463,7 @@ class VLLMInference:
         Handles different model families:
         - DeepSeek-R1: template adds <think>\n, no-think mode pre-fills empty block
         - Qwen3: use enable_thinking param, no-think uses enable_thinking=False
+        - GPT-OSS: use "Reasoning: high/none" in system prompt
 
         Args:
             question: The math problem
@@ -398,8 +472,16 @@ class VLLMInference:
         Returns:
             Formatted prompt string
         """
+        # Build system prompt based on model family
+        if self.model_family == "gpt-oss":
+            # GPT-OSS: control reasoning via system prompt
+            reasoning_directive = self.family_config.get("think_system" if use_think else "no_think_system", "")
+            system_content = f"{reasoning_directive}\n\n{SYSTEM_PROMPT}" if reasoning_directive else SYSTEM_PROMPT
+        else:
+            system_content = SYSTEM_PROMPT
+
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": question},
         ]
 
@@ -413,6 +495,13 @@ class VLLMInference:
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=use_think,
+            )
+        elif self.model_family == "gpt-oss":
+            # GPT-OSS: standard template (reasoning controlled via system prompt)
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
             )
         else:
             # DeepSeek-R1 and others: standard template
