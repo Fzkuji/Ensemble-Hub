@@ -63,6 +63,61 @@ logger = logging.getLogger(__name__)
 TOKEN_LEVELS = [0, 100, 500, 1000]
 MENTOR_ONLY_LEVEL = -1  # Special level for mentor-only baseline
 
+
+def truncate_to_tokens(text: str, tokenizer, max_tokens: int) -> str:
+    """Truncate text to at most max_tokens tokens.
+
+    Args:
+        text: Input text to truncate
+        tokenizer: Tokenizer with encode/decode methods
+        max_tokens: Maximum number of tokens
+
+    Returns:
+        Truncated text (may be shorter if original was shorter)
+    """
+    if not text:
+        return ""
+    tokens = tokenizer.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    truncated_tokens = tokens[:max_tokens]
+    return tokenizer.decode(truncated_tokens)
+
+
+def collect_full_mentor_outputs(
+    mentor_model,
+    data: List[Dict[str, Any]],
+    batch_size: int = 8,
+    use_think: bool = True,
+) -> Dict[str, str]:
+    """Collect full mentor outputs for all questions.
+
+    This is used to cache mentor outputs so they can be truncated
+    for different token levels without re-running inference.
+
+    Args:
+        mentor_model: VLLMInference or OpenRouterInference instance
+        data: List of problems with 'question' field
+        batch_size: Batch size for inference
+        use_think: Whether to use think mode
+
+    Returns:
+        Dict mapping question -> full_mentor_response
+    """
+    mentor_cache = {}
+    total_batches = (len(data) + batch_size - 1) // batch_size
+
+    for batch_start in tqdm(range(0, len(data), batch_size), desc="collecting mentor outputs", total=total_batches, unit="batch", ncols=80):
+        batch = data[batch_start:batch_start + batch_size]
+        prompts = [mentor_model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
+        responses = mentor_model.generate(prompts)
+
+        for item, response in zip(batch, responses):
+            mentor_cache[item['question']] = response
+
+    return mentor_cache
+
+
 # =============================================================================
 # Dataset Configurations
 # =============================================================================
@@ -794,6 +849,7 @@ def collect_data_for_token_level(
     token_level: int,
     batch_size: int = 8,
     use_think: bool = True,
+    mentor_cache: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """Collect data for a specific token level.
 
@@ -802,6 +858,9 @@ def collect_data_for_token_level(
     - token_level=0: Intern generates from scratch
     - token_level>0: Mentor generates first N tokens, then Intern CONTINUES from there
 
+    When mentor_cache is provided and token_level > 0, mentor outputs are truncated
+    from the cached full responses instead of re-running mentor inference.
+
     Args:
         mentor_model: VLLMInference instance for mentor (large model)
         intern_model: VLLMInference instance for intern (small model)
@@ -809,6 +868,8 @@ def collect_data_for_token_level(
         token_level: -1 for mentor only, 0 for intern only, >0 for mentor tokens
         batch_size: Batch size for inference
         use_think: Whether to use think mode
+        mentor_cache: Optional dict mapping question -> full_mentor_response
+                     When provided, token_level > 0 will truncate from cache
 
     Returns:
         List of results with responses and correctness
@@ -863,9 +924,23 @@ def collect_data_for_token_level(
                     'level': item.get('level', ''),
                 })
         else:
-            # Mentor generates first N tokens
+            # Mentor generates first N tokens (or truncate from cache)
             mentor_prompts = [mentor_model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
-            mentor_outputs = mentor_model.generate_mentor_tokens(mentor_prompts, max_tokens=token_level)
+
+            # Check if we can use cached mentor outputs
+            if mentor_cache is not None:
+                # Truncate from cached full mentor outputs
+                mentor_outputs = []
+                for item in batch:
+                    full_response = mentor_cache.get(item['question'], '')
+                    if full_response:
+                        truncated = truncate_to_tokens(full_response, mentor_model.tokenizer, token_level)
+                    else:
+                        truncated = ''
+                    mentor_outputs.append(truncated)
+            else:
+                # No cache - run mentor inference
+                mentor_outputs = mentor_model.generate_mentor_tokens(mentor_prompts, max_tokens=token_level)
 
             # Intern CONTINUES from mentor's output
             # Check if cross-model scenario (different model families)
@@ -1035,6 +1110,11 @@ def worker_process_all_tasks(
 
     logger.info(f"[Worker {rank}] Models loaded, processing {len(all_tasks)} subsets × {len(token_levels)} token levels")
 
+    # Identify which token levels need mentor inference
+    mentor_only_levels = [t for t in token_levels if t == -1]
+    intern_only_levels = [t for t in token_levels if t == 0]
+    mentor_hint_levels = [t for t in token_levels if t > 0]
+
     # Process all tasks
     for subset_name, output_dir, data in all_tasks:
         # Shard data for this worker
@@ -1046,21 +1126,59 @@ def worker_process_all_tasks(
 
         logger.info(f"[Worker {rank}] Processing subset {subset_name}: {len(shard_data)} samples")
 
+        # Check which token levels need to be computed
+        levels_to_compute = []
         for token_level in token_levels:
-            # Check if merged file already exists (skip if it does, unless force is True)
             merged_file = os.path.join(output_dir, f"tokens{token_level}.json")
             if os.path.exists(merged_file) and not force:
                 logger.info(f"[Worker {rank}] {subset_name} tokens={token_level} already exists, skipping...")
-                continue
-            elif os.path.exists(merged_file) and force:
+            else:
+                levels_to_compute.append(token_level)
+
+        if not levels_to_compute:
+            continue
+
+        # Optimization: run mentor once and truncate for different token levels
+        # If we have mentor_hint_levels (>0) to compute, we need full mentor outputs
+        # If -1 is also in the list, we'll build cache while processing -1
+        # Otherwise, collect full mentor outputs upfront
+        mentor_cache = None
+        has_hint_levels_to_compute = any(t > 0 for t in levels_to_compute)
+        has_mentor_only_to_compute = -1 in levels_to_compute
+
+        # Ensure -1 is processed first (if present) so we can build cache from its results
+        if has_mentor_only_to_compute and has_hint_levels_to_compute:
+            levels_to_compute = [-1] + [t for t in levels_to_compute if t != -1]
+
+        if has_hint_levels_to_compute and mentor_model is not None and not has_mentor_only_to_compute:
+            # Need full mentor outputs but -1 is not in the list, so collect separately
+            logger.info(f"[Worker {rank}] Collecting full mentor outputs for {len(shard_data)} samples (for truncation)...")
+            mentor_cache = collect_full_mentor_outputs(
+                mentor_model, shard_data, batch_size, use_think=use_think
+            )
+            logger.info(f"[Worker {rank}] Mentor outputs collected, will truncate for levels: {[t for t in levels_to_compute if t > 0]}")
+
+        for token_level in levels_to_compute:
+            merged_file = os.path.join(output_dir, f"tokens{token_level}.json")
+            if os.path.exists(merged_file) and force:
                 logger.info(f"[Worker {rank}] {subset_name} tokens={token_level} already exists, but --force is set, will overwrite after collection...")
-            
+
             logger.info(f"[Worker {rank}] {subset_name} tokens={token_level}...")
             try:
-                results = collect_data_for_token_level(mentor_model, intern_model, shard_data, token_level, batch_size, use_think=use_think)
+                # Pass mentor_cache for token_level > 0 to avoid re-running mentor inference
+                cache_to_use = mentor_cache if token_level > 0 else None
+                results = collect_data_for_token_level(
+                    mentor_model, intern_model, shard_data, token_level,
+                    batch_size, use_think=use_think, mentor_cache=cache_to_use
+                )
             except Exception as e:
                 logger.error(f"[Worker {rank}] Error collecting {subset_name} tokens={token_level}: {e}", exc_info=True)
                 continue
+
+            # If we just processed -1 and have hint levels to compute, build cache from results
+            if token_level == -1 and has_hint_levels_to_compute and mentor_cache is None:
+                mentor_cache = {r['question']: r['mentor_response'] for r in results}
+                logger.info(f"[Worker {rank}] Built mentor cache from -1 results for {len(mentor_cache)} samples")
 
             correct = sum(1 for r in results if r['is_correct'])
             accuracy = correct / len(results) if results else 0
