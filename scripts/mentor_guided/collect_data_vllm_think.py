@@ -48,6 +48,14 @@ try:
 except ImportError:
     OPENROUTER_AVAILABLE = False
 
+# Single model cache for reusing -1 and 0 token level results
+try:
+    from single_model_cache import SingleModelCache, check_and_use_cache, save_to_cache, get_model_short_name
+    CACHE_AVAILABLE = True
+except ImportError:
+    CACHE_AVAILABLE = False
+    SingleModelCache = None
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -1226,13 +1234,20 @@ def collect_all_parallel(
         need_mentor: Whether mentor model is needed (based on token levels)
         need_intern: Whether intern model is needed (based on token levels)
     """
-    # Determine mode: tensor parallelism (single model) vs data parallelism (both models)
-    single_model_mode = (need_mentor and not need_intern) or (need_intern and not need_mentor)
+    # Determine mode: tensor parallelism (single GPU model) vs data parallelism (both GPU models)
+    # When mentor uses API, only intern needs GPU -> use tensor parallelism for intern
+    mentor_uses_api = mentor_api is not None
+    mentor_needs_gpu = need_mentor and not mentor_uses_api
+
+    # Single model mode: only one model needs GPU (tensor parallelism with all GPUs)
+    # - Only mentor needs GPU (no intern, or intern not needed)
+    # - Only intern needs GPU (mentor uses API, or mentor not needed)
+    single_model_mode = (mentor_needs_gpu and not need_intern) or (need_intern and not mentor_needs_gpu)
 
     if single_model_mode:
         # Single model: use tensor parallelism with all GPUs in one worker
         world_size = 1
-        if need_mentor:
+        if mentor_needs_gpu:
             tensor_gpus = mentor_gpu_ids if mentor_gpu_ids else gpus
             print(f"\n{'='*60}", flush=True)
             print(f"[MAIN] Single-model tensor parallelism mode (mentor only)", flush=True)
@@ -1241,7 +1256,11 @@ def collect_all_parallel(
         else:
             tensor_gpus = intern_gpu_ids if intern_gpu_ids else gpus
             print(f"\n{'='*60}", flush=True)
-            print(f"[MAIN] Single-model tensor parallelism mode (intern only)", flush=True)
+            if mentor_uses_api:
+                print(f"[MAIN] Hybrid mode: mentor via API, intern via tensor parallelism", flush=True)
+                print(f"[MAIN] Mentor model: {mentor_model_name} (via {mentor_api} API)", flush=True)
+            else:
+                print(f"[MAIN] Single-model tensor parallelism mode (intern only)", flush=True)
             print(f"[MAIN] Intern model: {intern_model_name}", flush=True)
             print(f"[MAIN] Using {len(tensor_gpus)} GPUs for tensor parallelism: {tensor_gpus}", flush=True)
         print(f"[MAIN] Workers: {world_size}", flush=True)
@@ -1249,17 +1268,17 @@ def collect_all_parallel(
         print(f"[MAIN] Token levels: {token_levels}", flush=True)
         print(f"{'='*60}\n", flush=True)
     else:
-        # Both models: use data parallelism
+        # Both models need GPU: use data parallelism
         world_size = len(gpus)
 
-        # Validate GPU list lengths (only for models that are needed)
-        if need_mentor and mentor_gpu_ids and len(mentor_gpu_ids) != world_size:
+        # Validate GPU list lengths (only for models that need GPU)
+        if mentor_needs_gpu and mentor_gpu_ids and len(mentor_gpu_ids) != world_size:
             raise ValueError(f"mentor_gpu_ids length ({len(mentor_gpu_ids)}) must match gpus length ({world_size})")
         if need_intern and intern_gpu_ids and len(intern_gpu_ids) != world_size:
             raise ValueError(f"intern_gpu_ids length ({len(intern_gpu_ids)}) must match gpus length ({world_size})")
 
         print(f"\n{'='*60}", flush=True)
-        print(f"[MAIN] Data parallelism mode (both models)", flush=True)
+        print(f"[MAIN] Data parallelism mode (both models on GPU)", flush=True)
         print(f"[MAIN] Mentor model: {mentor_model_name} (GPU: {mentor_gpu_ids}, memory_util={mentor_memory_util})", flush=True)
         print(f"[MAIN] Intern model: {intern_model_name} (GPU: {intern_gpu_ids}, memory_util={intern_memory_util})", flush=True)
         print(f"[MAIN] Workers: {world_size}", flush=True)
@@ -1474,37 +1493,47 @@ def main():
         # Default to GPU 0
         return [0]
 
-    # Determine worker GPUs based on what models are needed
-    if need_mentor and not need_intern:
-        # Only mentor needed
+    # Check if mentor uses API (doesn't need GPU)
+    mentor_uses_api = args.mentor_api is not None
+    mentor_needs_gpu = need_mentor and not mentor_uses_api
+
+    # Determine worker GPUs based on what models NEED GPU
+    if mentor_needs_gpu and not need_intern:
+        # Only mentor needs GPU (no intern)
         if mentor_gpu_ids:
             gpus = mentor_gpu_ids
-            logger.info(f"Only mentor needed, using --mentor-gpus: {gpus}")
+            logger.info(f"Only mentor needs GPU, using --mentor-gpus: {gpus}")
         elif gpus_from_arg:
             gpus = gpus_from_arg
             mentor_gpu_ids = gpus
-            logger.info(f"Only mentor needed, using --gpus: {gpus}")
+            logger.info(f"Only mentor needs GPU, using --gpus: {gpus}")
         else:
             # Auto-detect GPUs
             gpus = get_available_gpus()
             mentor_gpu_ids = gpus
-            logger.info(f"Only mentor needed, auto-detected GPUs: {gpus}")
-    elif need_intern and not need_mentor:
-        # Only intern needed
+            logger.info(f"Only mentor needs GPU, auto-detected GPUs: {gpus}")
+    elif need_intern and not mentor_needs_gpu:
+        # Only intern needs GPU (mentor uses API or not needed)
         if intern_gpu_ids:
             gpus = intern_gpu_ids
-            logger.info(f"Only intern needed, using --intern-gpus: {gpus}")
+            logger.info(f"Only intern needs GPU, using --intern-gpus: {gpus}")
         elif gpus_from_arg:
             gpus = gpus_from_arg
             intern_gpu_ids = gpus
-            logger.info(f"Only intern needed, using --gpus: {gpus}")
+            if mentor_uses_api:
+                logger.info(f"Mentor via API, intern uses all GPUs: {gpus}")
+            else:
+                logger.info(f"Only intern needs GPU, using --gpus: {gpus}")
         else:
             # Auto-detect GPUs
             gpus = get_available_gpus()
             intern_gpu_ids = gpus
-            logger.info(f"Only intern needed, auto-detected GPUs: {gpus}")
-    else:
-        # Both models needed
+            if mentor_uses_api:
+                logger.info(f"Mentor via API, intern uses all auto-detected GPUs: {gpus}")
+            else:
+                logger.info(f"Only intern needs GPU, auto-detected GPUs: {gpus}")
+    elif mentor_needs_gpu and need_intern:
+        # Both models need GPU - split GPUs
         if mentor_gpu_ids and intern_gpu_ids:
             # Both explicitly specified
             gpus = list(range(len(mentor_gpu_ids)))
@@ -1544,6 +1573,10 @@ def main():
         if len(mentor_gpu_ids) != len(intern_gpu_ids):
             raise ValueError(f"mentor_gpu_ids length ({len(mentor_gpu_ids)}) must match intern_gpu_ids length ({len(intern_gpu_ids)})")
         gpus = list(range(len(mentor_gpu_ids)))
+    else:
+        # Neither model needs GPU (shouldn't happen, but handle gracefully)
+        gpus = gpus_from_arg if gpus_from_arg else get_available_gpus()
+        logger.warning(f"Neither model needs GPU? Using: {gpus}")
 
     # Set output directory (default: server path)
     # Build experiment name from models
@@ -1574,6 +1607,13 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     logger.info(f"Output directory: {args.output_dir}")
 
+    # Initialize single model cache for reusing -1 and 0 token level results
+    single_model_cache = None
+    if CACHE_AVAILABLE:
+        cache_base_dir = "/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments"
+        single_model_cache = SingleModelCache(cache_base_dir)
+        logger.info(f"Single model cache enabled: {single_model_cache.cache_dir}")
+
     # Define subsets
     MATH_SUBSETS = [
         "algebra",
@@ -1585,13 +1625,15 @@ def main():
         "precalculus",
     ]
 
-    def collect_and_save(data: List[Dict[str, Any]], output_subdir: str):
+    def collect_and_save(data: List[Dict[str, Any]], output_subdir: str, subset_name: str = None, split: str = None):
         """Helper to collect data and save results.
 
         Intelligently batches token levels by their GPU requirements:
         - Mentor-only (-1): tensor parallelism with all GPUs
         - Intern-only (0): tensor parallelism with all GPUs
         - Both models (>0): data parallelism with each GPU running both models
+
+        Uses single model cache for -1 and 0 token levels to avoid redundant computation.
         """
         os.makedirs(output_subdir, exist_ok=True)
 
@@ -1601,6 +1643,37 @@ def main():
         mentor_only_levels = [t for t in token_levels if t == -1]
         intern_only_levels = [t for t in token_levels if t == 0]
         both_models_levels = [t for t in token_levels if t > 0]
+
+        # Check cache for single-model levels
+        cached_mentor_levels = []
+        cached_intern_levels = []
+
+        if single_model_cache and subset_name and split:
+            # Check mentor-only cache (-1)
+            for t in mentor_only_levels:
+                cache_stats = check_and_use_cache(
+                    single_model_cache, args.dataset, mode_suffix, mentor_model,
+                    subset_name, split, output_subdir, t, args.force
+                )
+                if cache_stats:
+                    logger.info(f"  [CACHE HIT] tokens={t} (mentor): {cache_stats['accuracy']:.4f} ({cache_stats['correct']}/{cache_stats['total']})")
+                    all_stats[t] = cache_stats
+                    cached_mentor_levels.append(t)
+
+            # Check intern-only cache (0)
+            for t in intern_only_levels:
+                cache_stats = check_and_use_cache(
+                    single_model_cache, args.dataset, mode_suffix, intern_model,
+                    subset_name, split, output_subdir, t, args.force
+                )
+                if cache_stats:
+                    logger.info(f"  [CACHE HIT] tokens={t} (intern): {cache_stats['accuracy']:.4f} ({cache_stats['correct']}/{cache_stats['total']})")
+                    all_stats[t] = cache_stats
+                    cached_intern_levels.append(t)
+
+        # Remove cached levels from processing
+        mentor_only_levels = [t for t in mentor_only_levels if t not in cached_mentor_levels]
+        intern_only_levels = [t for t in intern_only_levels if t not in cached_intern_levels]
 
         # Process mentor-only levels (tensor parallelism)
         if mentor_only_levels:
@@ -1630,6 +1703,16 @@ def main():
             )
             all_stats.update(stats)
 
+            # Save to cache
+            if single_model_cache and subset_name and split:
+                for t in mentor_only_levels:
+                    output_file = os.path.join(output_subdir, f"tokens{t}.json")
+                    if os.path.exists(output_file):
+                        with open(output_file, 'r') as f:
+                            results = json.load(f)
+                        save_to_cache(single_model_cache, results, args.dataset, mode_suffix, mentor_model, subset_name, split)
+                        logger.info(f"  [CACHE SAVE] tokens={t} (mentor) -> {get_model_short_name(mentor_model)}/{subset_name}/{split}")
+
         # Process intern-only levels (tensor parallelism)
         if intern_only_levels:
             logger.info(f"Processing intern-only levels {intern_only_levels} with tensor parallelism...")
@@ -1657,6 +1740,16 @@ def main():
                 api_max_workers=args.api_max_workers,
             )
             all_stats.update(stats)
+
+            # Save to cache
+            if single_model_cache and subset_name and split:
+                for t in intern_only_levels:
+                    output_file = os.path.join(output_subdir, f"tokens{t}.json")
+                    if os.path.exists(output_file):
+                        with open(output_file, 'r') as f:
+                            results = json.load(f)
+                        save_to_cache(single_model_cache, results, args.dataset, mode_suffix, intern_model, subset_name, split)
+                        logger.info(f"  [CACHE SAVE] tokens={t} (intern) -> {get_model_short_name(intern_model)}/{subset_name}/{split}")
 
         # Process both-models levels (data parallelism)
         if both_models_levels:
@@ -1711,7 +1804,7 @@ def main():
 
         data = load_math500()
         output_subdir = os.path.join(args.output_dir, "math500", "test")
-        collect_and_save(data, output_subdir)
+        collect_and_save(data, output_subdir, subset_name="math500", split="test")
 
     elif args.dataset == "hendrycks_math_all":
         # All hendrycks_math subsets merged
@@ -1721,7 +1814,7 @@ def main():
 
         data = load_hendrycks_math_all(args.split)
         output_subdir = os.path.join(args.output_dir, "all", args.split)
-        collect_and_save(data, output_subdir)
+        collect_and_save(data, output_subdir, subset_name="all", split=args.split)
 
     elif args.dataset == "gsm8k":
         # GSM8K dataset
@@ -1731,13 +1824,46 @@ def main():
 
         data = load_gsm8k(args.split)
         output_subdir = os.path.join(args.output_dir, "gsm8k", args.split)
-        collect_and_save(data, output_subdir)
+        collect_and_save(data, output_subdir, subset_name="gsm8k", split=args.split)
 
     else:
         # hendrycks_math by subset
         subsets = [args.subset] if args.subset else MATH_SUBSETS
 
-        # Check if all data files already exist (before loading data and initializing models)
+        # First, check and use cache for single-model levels (-1 and 0)
+        cache_hits = {"mentor": [], "intern": []}
+        if single_model_cache and not args.force:
+            logger.info(f"\n{'='*60}")
+            logger.info("Checking single model cache...")
+            logger.info(f"{'='*60}")
+
+            for subset in subsets:
+                output_subdir = os.path.join(args.output_dir, subset, args.split)
+                os.makedirs(output_subdir, exist_ok=True)
+
+                # Check mentor cache (-1)
+                if -1 in token_levels:
+                    cache_stats = check_and_use_cache(
+                        single_model_cache, args.dataset, mode_suffix, mentor_model,
+                        subset, args.split, output_subdir, -1, args.force
+                    )
+                    if cache_stats:
+                        logger.info(f"  [CACHE HIT] {subset}/tokens-1 (mentor): {cache_stats['accuracy']:.4f}")
+                        cache_hits["mentor"].append(subset)
+
+                # Check intern cache (0)
+                if 0 in token_levels:
+                    cache_stats = check_and_use_cache(
+                        single_model_cache, args.dataset, mode_suffix, intern_model,
+                        subset, args.split, output_subdir, 0, args.force
+                    )
+                    if cache_stats:
+                        logger.info(f"  [CACHE HIT] {subset}/tokens0 (intern): {cache_stats['accuracy']:.4f}")
+                        cache_hits["intern"].append(subset)
+
+            logger.info(f"Cache hits: mentor={len(cache_hits['mentor'])}/{len(subsets)}, intern={len(cache_hits['intern'])}/{len(subsets)}")
+
+        # Check if all data files already exist (after cache check)
         if not args.force:
             all_exist = True
             missing_files = []
@@ -1748,7 +1874,7 @@ def main():
                     if not os.path.exists(merged_file):
                         all_exist = False
                         missing_files.append(f"{subset}/{args.split}/tokens{token_level}.json")
-            
+
             if all_exist:
                 logger.info(f"\n{'='*60}")
                 logger.info(f"All data files already exist for split={args.split}")
@@ -1764,6 +1890,25 @@ def main():
                 logger.info(f"Proceeding with data collection...")
                 logger.info(f"{'='*60}\n")
 
+        # Determine which token levels still need computation
+        # Exclude levels that are fully cached for all subsets
+        remaining_token_levels = []
+        for t in token_levels:
+            if t == -1:
+                if len(cache_hits["mentor"]) < len(subsets):
+                    remaining_token_levels.append(t)
+            elif t == 0:
+                if len(cache_hits["intern"]) < len(subsets):
+                    remaining_token_levels.append(t)
+            else:
+                remaining_token_levels.append(t)
+
+        if not remaining_token_levels:
+            logger.info("All token levels fully served from cache!")
+            return
+
+        logger.info(f"Token levels to compute: {remaining_token_levels}")
+
         # Always use parallel mode: load all subsets and process together (ONE model init per GPU)
         logger.info(f"\n{'='*60}")
         logger.info(f"Loading all {len(subsets)} subsets for parallel processing...")
@@ -1777,13 +1922,17 @@ def main():
 
         logger.info(f"Total samples across all subsets: {sum(len(t[2]) for t in all_tasks)}")
 
+        # Recalculate need_mentor and need_intern based on remaining levels
+        remaining_need_mentor = any(t == -1 or t > 0 for t in remaining_token_levels)
+        remaining_need_intern = any(t == 0 or t > 0 for t in remaining_token_levels)
+
         collect_all_parallel(
             mentor_model_name=mentor_model,
             intern_model_name=intern_model,
             max_model_len=args.max_model_len,
             batch_size=args.batch_size,
             all_tasks=all_tasks,
-            token_levels=token_levels,
+            token_levels=remaining_token_levels,
             gpus=gpus,
             mentor_gpu_ids=mentor_gpu_ids,
             intern_gpu_ids=intern_gpu_ids,
@@ -1793,12 +1942,39 @@ def main():
             mentor_max_model_len=args.mentor_max_model_len,
             intern_max_model_len=args.intern_max_model_len,
             force=args.force,
-            need_mentor=need_mentor,
-            need_intern=need_intern,
+            need_mentor=remaining_need_mentor,
+            need_intern=remaining_need_intern,
             mentor_api=args.mentor_api,
             openrouter_api_key=args.openrouter_api_key,
             api_max_workers=args.api_max_workers,
         )
+
+        # Save newly computed single-model results to cache
+        if single_model_cache:
+            logger.info(f"\n{'='*60}")
+            logger.info("Saving new results to single model cache...")
+            logger.info(f"{'='*60}")
+
+            for subset in subsets:
+                output_subdir = os.path.join(args.output_dir, subset, args.split)
+
+                # Save mentor results (-1) if newly computed
+                if -1 in remaining_token_levels and subset not in cache_hits["mentor"]:
+                    output_file = os.path.join(output_subdir, "tokens-1.json")
+                    if os.path.exists(output_file):
+                        with open(output_file, 'r') as f:
+                            results = json.load(f)
+                        save_to_cache(single_model_cache, results, args.dataset, mode_suffix, mentor_model, subset, args.split)
+                        logger.info(f"  [CACHE SAVE] {subset}/tokens-1 -> {get_model_short_name(mentor_model)}")
+
+                # Save intern results (0) if newly computed
+                if 0 in remaining_token_levels and subset not in cache_hits["intern"]:
+                    output_file = os.path.join(output_subdir, "tokens0.json")
+                    if os.path.exists(output_file):
+                        with open(output_file, 'r') as f:
+                            results = json.load(f)
+                        save_to_cache(single_model_cache, results, args.dataset, mode_suffix, intern_model, subset, args.split)
+                        logger.info(f"  [CACHE SAVE] {subset}/tokens0 -> {get_model_short_name(intern_model)}")
 
     logger.info("\nData collection complete!")
 

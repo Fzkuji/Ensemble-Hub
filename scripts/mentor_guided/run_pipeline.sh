@@ -7,6 +7,10 @@
 #   --think               Enable thinking mode (default)
 #   --no-think            Disable thinking mode (standard prompt)
 #   --model MODEL         Model name (default: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B)
+#   --mentor-model MODEL  Mentor model name (large model for guidance)
+#   --intern-model MODEL  Intern model name (small model for generation)
+#   --mentor-api API      API type for mentor model: "openrouter" (for GPT-4o, Claude, etc.)
+#   --api-max-workers N   Max concurrent API requests (default: 8)
 #   --dataset DATASET     Dataset: hendrycks_math, math500, gsm8k (default: hendrycks_math)
 #   --subset SUBSET       (Legacy) Sets both train and eval subset
 #   --train-subset SUBSET Which subset(s) for training. 'all' merges all subsets.
@@ -34,6 +38,13 @@
 #   ./run_pipeline.sh --dataset gsm8k                            # Run on GSM8K dataset
 #   ./run_pipeline.sh --dataset gsm8k --method ppl               # Only train PPL classifier
 #   ./run_pipeline.sh --method mlp,ppl                           # Only train MLP and PPL
+#
+# API Model Examples:
+#   # GPT-4o as mentor via OpenRouter
+#   ./run_pipeline.sh --mentor-model openai/gpt-4o --mentor-api openrouter --intern-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+#
+#   # Claude-3.5-Sonnet as mentor
+#   ./run_pipeline.sh --mentor-model anthropic/claude-3.5-sonnet --mentor-api openrouter
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,6 +56,8 @@ USE_THINK=true
 MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 MENTOR_MODEL=""
 INTERN_MODEL=""
+MENTOR_API=""  # API type for mentor model (e.g., "openrouter")
+API_MAX_WORKERS=8
 DATASET="hendrycks_math"
 SUBSET=""
 TRAIN_SUBSET=""
@@ -89,6 +102,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --intern-model)
             INTERN_MODEL="$2"
+            shift 2
+            ;;
+        --mentor-api)
+            MENTOR_API="$2"
+            shift 2
+            ;;
+        --api-max-workers)
+            API_MAX_WORKERS="$2"
             shift 2
             ;;
         --dataset)
@@ -289,6 +310,12 @@ elif [ -n "$INTERN_MODEL" ]; then
 else
     MODEL_ARGS="--model $MODEL"
     echo "Using same model for both: $MODEL"
+fi
+
+# Add API arguments if specified
+if [ -n "$MENTOR_API" ]; then
+    MODEL_ARGS="$MODEL_ARGS --mentor-api $MENTOR_API --api-max-workers $API_MAX_WORKERS"
+    echo "Mentor API: $MENTOR_API (max_workers=$API_MAX_WORKERS)"
 fi
 
 echo "============================================================"
