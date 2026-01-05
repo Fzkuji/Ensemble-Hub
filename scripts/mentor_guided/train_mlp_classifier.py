@@ -647,16 +647,26 @@ def main():
         if args.eval_subset is None:
             args.eval_subset = args.subset
     else:
-        # Default to algebra if nothing specified (only for training mode)
-        if not args.eval_only:
+        # Auto-detect subsets if not specified
+        if args.eval_only:
+            # Eval-only mode: auto-detect from data directory
+            if args.eval_subset is None:
+                detected = detect_subsets(args.data_dir, split="test")
+                if detected:
+                    args.eval_subset = detected[0]  # Use first detected subset
+                    if is_main_process():
+                        logger.info(f"Auto-detected eval subset: {args.eval_subset}")
+                else:
+                    raise ValueError(
+                        f"Cannot auto-detect subsets from {args.data_dir}. "
+                        "Please specify --eval-subset explicitly."
+                    )
+        else:
+            # Training mode: default to algebra
             if args.train_subset is None:
                 args.train_subset = "algebra"
             if args.eval_subset is None:
                 args.eval_subset = args.train_subset  # Default eval to same as train
-        else:
-            # Eval-only mode: require explicit eval_subset
-            if args.eval_subset is None:
-                raise ValueError("--eval-subset is required when using --eval-only mode")
 
     rank, world_size, local_rank = setup_distributed()
     use_ddp = args.ddp or world_size > 1
@@ -853,24 +863,42 @@ def main():
     # Load checkpoint if specified (for cross-dataset evaluation)
     loaded_thresholds = None
     if args.load_checkpoint:
+        if not os.path.exists(args.load_checkpoint):
+            raise FileNotFoundError(f"Checkpoint not found: {args.load_checkpoint}")
+
         if is_main_process():
-            logger.info(f"Loading checkpoint from {args.load_checkpoint}")
+            logger.info(f"")
+            logger.info(f"{'='*60}")
+            logger.info(f"Loading checkpoint for cross-dataset evaluation")
+            logger.info(f"{'='*60}")
+            logger.info(f"Checkpoint path: {args.load_checkpoint}")
+
         checkpoint = torch.load(args.load_checkpoint, map_location=device)
 
         # Load classifier state dict
         classifier_state = checkpoint.get('classifier', checkpoint)  # Handle both formats
-        if use_ddp:
-            classifier_head.module.load_state_dict(classifier_state)
-        else:
-            classifier_head.load_state_dict(classifier_state)
+        try:
+            if use_ddp:
+                classifier_head.module.load_state_dict(classifier_state)
+            else:
+                classifier_head.load_state_dict(classifier_state)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Failed to load checkpoint. The checkpoint may be incompatible with the current model. "
+                f"Make sure you're using the same intern model (hidden_size must match). Error: {e}"
+            )
 
         # Load thresholds if available
         loaded_thresholds = checkpoint.get('thresholds', None)
         if loaded_thresholds is not None and is_main_process():
             logger.info(f"Loaded cascade thresholds: {loaded_thresholds}")
+        elif is_main_process():
+            logger.warning("No cascade thresholds found in checkpoint")
 
         if is_main_process():
-            logger.info("Checkpoint loaded successfully")
+            logger.info(f"Checkpoint loaded successfully")
+            logger.info(f"{'='*60}")
+            logger.info(f"")
 
     # Release pre-allocated memory now that model is loaded
     if _reserved_memory is not None:

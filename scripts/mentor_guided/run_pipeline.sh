@@ -473,14 +473,21 @@ echo ""
 echo "========== Step 3: Train MLP Classifiers =========="
 if [ "$RUN_MLP" = true ]; then
     if [ -n "$MLP_CHECKPOINT" ]; then
-        # Using checkpoint from another dataset - eval only
-        echo ">>> MLP: Using checkpoint from $MLP_CHECKPOINT (eval-only mode)"
+        # Cross-dataset evaluation with loaded checkpoint
+        echo ">>> MLP: Cross-dataset evaluation (eval-only mode)"
+        echo "    Checkpoint: $MLP_CHECKPOINT"
+        echo "    Target dataset: $DATASET"
+        echo "    Data directory: $DATA_DIR"
+
+        # Build eval flag if specified, otherwise auto-detect
+        EVAL_FLAG=""
         if [ -n "$EVAL_SUBSET" ]; then
             EVAL_FLAG="--eval-subset $EVAL_SUBSET"
+            echo "    Eval subset: $EVAL_SUBSET (user-specified)"
         else
-            # Use first subset if not specified (for single-subset datasets like AIME, GSM8K)
-            EVAL_FLAG="--eval-subset ${ALL_SUBSETS[0]}"
+            echo "    Eval subset: auto-detecting from data directory..."
         fi
+
         CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
             --ddp $EVAL_FLAG --data-dir $DATA_DIR \
             --load-checkpoint "$MLP_CHECKPOINT" --eval-only \
