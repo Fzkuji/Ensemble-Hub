@@ -72,13 +72,15 @@ def load_model(model_path: str, device: str = "cuda"):
 def compute_ppl_and_entropy(
     model,
     tokenizer,
-    prompt: str,
-    response: str,
+    question: str,
+    mentor_hint: str,
     max_length: int = 4096,
     return_per_token: bool = False,
 ) -> Tuple[float, float, float, List[float], List[float]]:
     """
-    计算给定 prompt 下生成 response 的 PPL 和 entropy
+    计算 intern 模型对 mentor guidance 的 PPL 和 entropy
+
+    给定 question，计算模型生成 mentor_hint 的困惑度和熵。
 
     Returns:
         ppl: perplexity
@@ -87,45 +89,46 @@ def compute_ppl_and_entropy(
         per_token_entropy: 每个token位置的entropy列表 (if return_per_token=True)
         per_token_nll: 每个token位置的negative log prob列表 (if return_per_token=True)
     """
-    # 构建完整输入
-    full_text = prompt + response
+    # 构建输入：prefix + mentor_hint
+    prefix = f"Question: {question}\n\nAnswer: "
+    full_text = prefix + mentor_hint
 
     # Tokenize
     inputs = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=max_length)
     input_ids = inputs["input_ids"].to(model.device)
 
-    # 获取 prompt 的长度，用于只计算 response 部分的 loss
-    prompt_inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length)
-    prompt_len = prompt_inputs["input_ids"].shape[1]
+    # 获取 prefix 的长度，用于只计算 mentor_hint 部分的 loss
+    prefix_inputs = tokenizer(prefix, return_tensors="pt", truncation=True, max_length=max_length)
+    prefix_len = prefix_inputs["input_ids"].shape[1]
 
-    if prompt_len >= input_ids.shape[1]:
-        # Response 被截断了
+    if prefix_len >= input_ids.shape[1]:
+        # mentor_hint 被截断了
         return float('inf'), float('inf'), float('inf'), [], []
 
     # Forward pass
     with torch.no_grad():
-        outputs = model(input_ids, labels=input_ids)
+        outputs = model(input_ids)
 
         # 获取 logits
         logits = outputs.logits  # [1, seq_len, vocab_size]
 
-        # 只计算 response 部分
+        # 只计算 mentor_hint 部分
         # logits[i] 预测的是 token[i+1]
-        # 所以 response 部分对应的 logits 是 [prompt_len-1 : -1]
-        response_logits = logits[0, prompt_len-1:-1, :]  # [response_len, vocab_size]
-        response_labels = input_ids[0, prompt_len:]  # [response_len]
+        # 所以 mentor_hint 部分对应的 logits 是 [prefix_len-1 : -1]
+        hint_logits = logits[0, prefix_len-1:-1, :]  # [hint_len, vocab_size]
+        hint_labels = input_ids[0, prefix_len:]  # [hint_len]
 
         # 计算每个 token 的 log prob
-        log_probs = F.log_softmax(response_logits, dim=-1)
-        token_log_probs = log_probs.gather(1, response_labels.unsqueeze(1)).squeeze(1)  # [response_len]
+        log_probs = F.log_softmax(hint_logits, dim=-1)
+        token_log_probs = log_probs.gather(1, hint_labels.unsqueeze(1)).squeeze(1)  # [hint_len]
 
         # PPL = exp(-mean(log_probs))
         avg_log_prob = token_log_probs.mean().item()
         ppl = np.exp(-avg_log_prob)
 
         # Entropy = -sum(p * log(p)) for each position
-        probs = F.softmax(response_logits, dim=-1)
-        entropies = -(probs * log_probs).sum(dim=-1)  # [response_len]
+        probs = F.softmax(hint_logits, dim=-1)
+        entropies = -(probs * log_probs).sum(dim=-1)  # [hint_len]
 
         avg_entropy = entropies.mean().item()
         max_entropy = entropies.max().item()
@@ -190,16 +193,11 @@ def process_subset(
     for item in pbar:
         question = item.get('question', '')
         mentor_response = item.get('mentor_response', '')
-        intern_response = item.get('response', '')
-        mentor_tokens = item.get('mentor_tokens', token_level)
 
-        # 构建 prompt
-        prompt = build_prompt(question, mentor_response, mentor_tokens)
-
-        # 计算 PPL 和 entropy
+        # 计算 intern 模型对 mentor guidance 的 PPL 和 entropy
         try:
             ppl, avg_entropy, max_entropy, per_token_entropy, per_token_nll = compute_ppl_and_entropy(
-                model, tokenizer, prompt, intern_response, return_per_token=save_per_token
+                model, tokenizer, question, mentor_response, return_per_token=save_per_token
             )
         except Exception as e:
             if is_main_process():
