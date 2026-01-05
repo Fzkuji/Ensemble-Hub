@@ -58,14 +58,20 @@ def compute_stats(data_dir: str, subset: str, split: str = "test"):
         intern_lengths = []
 
         for item in data:
-            # Mentor length
-            if 'mentor_length' in item:
+            # Mentor length - use mentor_tokens field
+            if 'mentor_tokens' in item and item['mentor_tokens'] > 0:
+                mentor_lengths.append(item['mentor_tokens'])
+            elif 'mentor_length' in item and item['mentor_length'] > 0:
                 mentor_lengths.append(item['mentor_length'])
             elif 'mentor_response' in item and item['mentor_response']:
                 mentor_lengths.append(len(item['mentor_response']) // 4)
 
             # Intern length
-            if 'intern_length' in item:
+            # Special case: tokens=-1 (mentor-only) stores length in intern_length field
+            if tokens == -1 and 'intern_length' in item and item['intern_length'] > 0:
+                # For mentor-only mode, the actual length is in intern_length field
+                mentor_lengths.append(item['intern_length'])
+            elif 'intern_length' in item:
                 intern_lengths.append(item['intern_length'])
             elif 'num_tokens' in item:
                 intern_lengths.append(item['num_tokens'])
