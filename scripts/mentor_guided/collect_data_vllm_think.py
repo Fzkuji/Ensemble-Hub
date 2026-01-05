@@ -1174,12 +1174,27 @@ def worker_process_all_tasks(
             levels_to_compute = [-1] + [t for t in levels_to_compute if t != -1]
 
         if has_hint_levels_to_compute and mentor_model is not None and not has_mentor_only_to_compute:
-            # Need full mentor outputs but -1 is not in the list, so collect separately
-            logger.info(f"[Worker {rank}] Collecting full mentor outputs for {len(shard_data)} samples (for truncation)...")
-            mentor_cache = collect_full_mentor_outputs(
-                mentor_model, shard_data, batch_size, use_think=use_think
-            )
-            logger.info(f"[Worker {rank}] Mentor outputs collected, will truncate for levels: {[t for t in levels_to_compute if t > 0]}")
+            # Need full mentor outputs but -1 is not in the list
+            # First, check if tokens-1.json exists and load from it
+            tokens_minus1_file = os.path.join(output_dir, "tokens-1.json")
+            if os.path.exists(tokens_minus1_file):
+                logger.info(f"[Worker {rank}] Loading mentor cache from existing tokens-1.json...")
+                try:
+                    with open(tokens_minus1_file, 'r') as f:
+                        existing_results = json.load(f)
+                    mentor_cache = {r['question']: r['mentor_response'] for r in existing_results}
+                    logger.info(f"[Worker {rank}] Loaded mentor cache from tokens-1.json ({len(mentor_cache)} samples)")
+                except Exception as e:
+                    logger.warning(f"[Worker {rank}] Failed to load tokens-1.json: {e}, will re-collect")
+                    mentor_cache = None
+
+            # If cache not loaded, collect from scratch
+            if mentor_cache is None:
+                logger.info(f"[Worker {rank}] Collecting full mentor outputs for {len(shard_data)} samples (for truncation)...")
+                mentor_cache = collect_full_mentor_outputs(
+                    mentor_model, shard_data, batch_size, use_think=use_think
+                )
+                logger.info(f"[Worker {rank}] Mentor outputs collected, will truncate for levels: {[t for t in levels_to_compute if t > 0]}")
 
         for token_level in levels_to_compute:
             merged_file = os.path.join(output_dir, f"tokens{token_level}.json")
