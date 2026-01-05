@@ -13,9 +13,9 @@
 #   --mentor-api API      API type for mentor model: "openrouter" (for GPT-4o, Claude, etc.)
 #   --api-max-workers N   Max concurrent API requests (default: 8)
 #   --dataset DATASET     Dataset: hendrycks_math, math500, gsm8k, aime24, aime25 (default: hendrycks_math)
-#   --subset SUBSET       (Legacy) Sets both train and eval subset
-#   --train-subset SUBSET Which subset(s) for training. 'all' merges all subsets.
-#   --eval-subset SUBSET  Which subset(s) for eval. 'all' tests each subset separately.
+#   --subset SUBSET       (Legacy) Sets both train and eval subset (supports comma-separated: 'geometry,algebra')
+#   --train-subset SUBSET Which subset(s) for training. 'all' merges all, or use 'geometry,algebra' for multiple.
+#   --eval-subset SUBSET  Which subset(s) for eval. 'all' tests each separately, or use 'geometry,algebra'.
 #   --lr LR               Learning rate for LoRA training (default: 1e-4)
 #   --epochs EPOCHS       Number of epochs for LoRA training (default: 3)
 #   --batch-size BS       Batch size for LoRA training (default: 4)
@@ -39,6 +39,7 @@
 #   ./run_pipeline.sh --train-subset all --eval-subset algebra   # Train on all, test on algebra
 #   ./run_pipeline.sh --train-subset all --eval-subset all       # Train on all, test each separately
 #   ./run_pipeline.sh --subset algebra                           # Train & test on algebra only
+#   ./run_pipeline.sh --subset geometry,algebra                  # Train & test on geometry and algebra only
 #   ./run_pipeline.sh --dataset gsm8k                            # Run on GSM8K dataset
 #   ./run_pipeline.sh --dataset gsm8k --method ppl               # Only train PPL classifier
 #   ./run_pipeline.sh --method mlp,ppl                           # Only train MLP and PPL

@@ -1528,7 +1528,7 @@ def main():
                         choices=["hendrycks_math", "math500", "hendrycks_math_all", "gsm8k", "aime24", "aime25"],
                         help="Dataset: hendrycks_math (by subset), math500 (MATH-500), hendrycks_math_all (all subsets merged), gsm8k (GSM8K), aime24 (AIME 1983-2024), aime25 (AIME 2025)")
     parser.add_argument("--subset", type=str, default=None,
-                        help="Specific subset for hendrycks_math (e.g., algebra). If None, process all subsets")
+                        help="Specific subset(s) for hendrycks_math (e.g., 'algebra' or 'geometry,algebra' for multiple). If None, process all subsets")
     parser.add_argument("--split", type=str, default="test",
                         choices=["train", "test"],
                         help="Split for hendrycks_math/hendrycks_math_all (ignored for math500)")
@@ -2030,8 +2030,8 @@ def main():
         collect_and_save(data, output_subdir, subset_name="aime25", split="test")
 
     else:
-        # hendrycks_math by subset
-        subsets = [args.subset] if args.subset else MATH_SUBSETS
+        # hendrycks_math by subset (supports comma-separated list)
+        subsets = args.subset.split(',') if args.subset else MATH_SUBSETS
 
         # First, check and use cache for single-model levels (-1 and 0)
         cache_hits = {"mentor": [], "intern": []}
