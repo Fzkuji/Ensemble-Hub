@@ -170,17 +170,26 @@ DATASET_CONFIGS = {
         "subsets": ["gsm8k"],  # Single subset
         "extra_fields": [],
     },
-    # Future datasets can be added here:
-    # "aime": {
-    #     "hf_path": "...",
-    #     "hf_subset": None,
-    #     "splits": ["train", "test"],
-    #     "question_field": "problem",
-    #     "answer_field": "answer",
-    #     "answer_parser": None,
-    #     "subsets": ["aime"],
-    #     "extra_fields": ["year", "problem_number"],
-    # },
+    "aime24": {
+        "hf_path": "math-ai/aime_1983_2024",
+        "hf_subset": None,
+        "splits": ["test"],  # Only test split
+        "question_field": "problem",
+        "answer_field": "answer",
+        "answer_parser": None,  # Direct answer
+        "subsets": ["aime24"],  # Single subset
+        "extra_fields": [],
+    },
+    "aime25": {
+        "hf_path": "AI-MO/aimo-validation-aime",
+        "hf_subset": None,
+        "splits": ["test"],  # Only test split
+        "question_field": "problem",
+        "answer_field": "answer",
+        "answer_parser": None,  # Direct answer
+        "subsets": ["aime25"],  # Single subset
+        "extra_fields": [],
+    },
 }
 
 # Simple system prompt (ACT-E uses simple prompts)
@@ -1537,8 +1546,8 @@ def main():
     parser.add_argument("--intern-model", type=str, default=None,
                         help="Intern model name (small model, e.g., 7B). If not set, uses --model")
     parser.add_argument("--dataset", type=str, default="hendrycks_math",
-                        choices=["hendrycks_math", "math500", "hendrycks_math_all", "gsm8k"],
-                        help="Dataset: hendrycks_math (by subset), math500 (MATH-500), hendrycks_math_all (all subsets merged), gsm8k (GSM8K)")
+                        choices=["hendrycks_math", "math500", "hendrycks_math_all", "gsm8k", "aime24", "aime25"],
+                        help="Dataset: hendrycks_math (by subset), math500 (MATH-500), hendrycks_math_all (all subsets merged), gsm8k (GSM8K), aime24 (AIME 1983-2024), aime25 (AIME 2025)")
     parser.add_argument("--subset", type=str, default=None,
                         help="Specific subset for hendrycks_math (e.g., algebra). If None, process all subsets")
     parser.add_argument("--split", type=str, default="test",
@@ -1770,6 +1779,10 @@ def main():
             args.output_dir = f"{base_dir}/hendrycks_math_all_{mode_suffix}_{exp_name}"
         elif args.dataset == "gsm8k":
             args.output_dir = f"{base_dir}/gsm8k_{mode_suffix}_{exp_name}"
+        elif args.dataset == "aime24":
+            args.output_dir = f"{base_dir}/aime24_{mode_suffix}_{exp_name}"
+        elif args.dataset == "aime25":
+            args.output_dir = f"{base_dir}/aime25_{mode_suffix}_{exp_name}"
         else:
             # Default: hendrycks_math
             args.output_dir = f"{base_dir}/hendrycks_math_split_{mode_suffix}_{exp_name}"
@@ -2000,6 +2013,30 @@ def main():
         data = load_gsm8k(args.split)
         output_subdir = os.path.join(args.output_dir, "gsm8k", args.split)
         collect_and_save(data, output_subdir, subset_name="gsm8k", split=args.split)
+
+    elif args.dataset == "aime24":
+        # AIME 1983-2024 dataset (test only)
+        if args.split == "train":
+            logger.warning(f"AIME24 only has test split, ignoring --split train")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing AIME 1983-2024 (test)")
+        logger.info(f"{'='*60}")
+
+        data = load_dataset_generic("aime24", split="test")
+        output_subdir = os.path.join(args.output_dir, "aime24", "test")
+        collect_and_save(data, output_subdir, subset_name="aime24", split="test")
+
+    elif args.dataset == "aime25":
+        # AIME 2025 dataset (test only)
+        if args.split == "train":
+            logger.warning(f"AIME25 only has test split, ignoring --split train")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing AIME 2025 (test)")
+        logger.info(f"{'='*60}")
+
+        data = load_dataset_generic("aime25", split="test")
+        output_subdir = os.path.join(args.output_dir, "aime25", "test")
+        collect_and_save(data, output_subdir, subset_name="aime25", split="test")
 
     else:
         # hendrycks_math by subset

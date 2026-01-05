@@ -633,6 +633,10 @@ def main():
                         help="Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%%). Keeps memory occupied throughout training.")
     parser.add_argument("--pooling", type=str, default="mean_logits",
                         help="Pooling strategy: mean_logits (per-token classify then average logits)")
+    parser.add_argument("--load-checkpoint", type=str, default=None,
+                        help="Path to checkpoint (best_model.pt) to load for evaluation on different dataset")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="Only evaluate using loaded checkpoint, skip training")
 
     args = parser.parse_args()
 
@@ -841,6 +845,28 @@ def main():
         classifier_head = DDP(classifier_head, device_ids=[local_rank])
         model = FrozenLLMClassifier(base_model, classifier_head)
 
+    # Load checkpoint if specified (for cross-dataset evaluation)
+    loaded_thresholds = None
+    if args.load_checkpoint:
+        if is_main_process():
+            logger.info(f"Loading checkpoint from {args.load_checkpoint}")
+        checkpoint = torch.load(args.load_checkpoint, map_location=device)
+
+        # Load classifier state dict
+        classifier_state = checkpoint.get('classifier', checkpoint)  # Handle both formats
+        if use_ddp:
+            classifier_head.module.load_state_dict(classifier_state)
+        else:
+            classifier_head.load_state_dict(classifier_state)
+
+        # Load thresholds if available
+        loaded_thresholds = checkpoint.get('thresholds', None)
+        if loaded_thresholds is not None and is_main_process():
+            logger.info(f"Loaded cascade thresholds: {loaded_thresholds}")
+
+        if is_main_process():
+            logger.info("Checkpoint loaded successfully")
+
     # Release pre-allocated memory now that model is loaded
     if _reserved_memory is not None:
         del _reserved_memory
@@ -946,57 +972,62 @@ def main():
 
     # Training
     best_cascade_acc = 0
-    best_thresholds = None
+    best_thresholds = loaded_thresholds  # Use loaded thresholds if available
     best_state = None
 
-    for epoch in range(args.epochs):
-        if use_ddp:
-            train_sampler.set_epoch(epoch)
-
+    # Skip training if eval-only mode
+    if args.eval_only:
         if is_main_process():
-            logger.info(f"\nEpoch {epoch + 1}/{args.epochs}")
+            logger.info("Eval-only mode: skipping training")
+    else:
+        for epoch in range(args.epochs):
+            if use_ddp:
+                train_sampler.set_epoch(epoch)
 
-        train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device, args.grad_accum
-        )
-
-        if is_main_process():
-            logger.info(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
-
-        # In no-val mode, skip val_loader eval (it's same as train)
-        if args.use_val:
-            val_loss, val_acc, _, _, _ = eval_epoch(model, val_loader, criterion, device)
             if is_main_process():
-                logger.info(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+                logger.info(f"\nEpoch {epoch + 1}/{args.epochs}")
 
-        # Cascade evaluation on train (for threshold search) - skip if --skip-epoch-cascade or --fixed-threshold
-        if not args.skip_epoch_cascade and args.fixed_threshold is None:
-            if is_main_process():
-                logger.info("Running cascade evaluation on train (for threshold search)...")
-            cascade_acc, thresholds, detailed = eval_cascade_on_val(
-                model, val_data_for_cascade, tokenizer, args.max_length, device,
-                fixed_threshold=args.fixed_threshold
+            train_loss, train_acc = train_epoch(
+                model, train_loader, optimizer, criterion, device, args.grad_accum
             )
 
             if is_main_process():
-                logger.info(f"Train Cascade Acc: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
-                logger.info(f"Thresholds: {thresholds}")
-                auc_str = ", ".join([f"T{t}={detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
-                logger.info(f"Train AUC: {auc_str}")
+                logger.info(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
 
-            if cascade_acc > best_cascade_acc:
-                best_cascade_acc = cascade_acc
-                best_thresholds = thresholds
+            # In no-val mode, skip val_loader eval (it's same as train)
+            if args.use_val:
+                val_loss, val_acc, _, _, _ = eval_epoch(model, val_loader, criterion, device)
                 if is_main_process():
-                    classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
-                    best_state = {
-                        'classifier': classifier_state,
-                        'thresholds': thresholds,
-                    }
-                    logger.info(f"New best! Saving...")
+                    logger.info(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
 
-    # Save best model (or last model if skip_epoch_cascade)
-    if is_main_process():
+            # Cascade evaluation on train (for threshold search) - skip if --skip-epoch-cascade or --fixed-threshold
+            if not args.skip_epoch_cascade and args.fixed_threshold is None:
+                if is_main_process():
+                    logger.info("Running cascade evaluation on train (for threshold search)...")
+                cascade_acc, thresholds, detailed = eval_cascade_on_val(
+                    model, val_data_for_cascade, tokenizer, args.max_length, device,
+                    fixed_threshold=args.fixed_threshold
+                )
+
+                if is_main_process():
+                    logger.info(f"Train Cascade Acc: {cascade_acc:.4f} (Oracle: {detailed['oracle']:.4f})")
+                    logger.info(f"Thresholds: {thresholds}")
+                    auc_str = ", ".join([f"T{t}={detailed['auc'][t]:.4f}" for t in TOKEN_LEVELS])
+                    logger.info(f"Train AUC: {auc_str}")
+
+                if cascade_acc > best_cascade_acc:
+                    best_cascade_acc = cascade_acc
+                    best_thresholds = thresholds
+                    if is_main_process():
+                        classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
+                        best_state = {
+                            'classifier': classifier_state,
+                            'thresholds': thresholds,
+                        }
+                        logger.info(f"New best! Saving...")
+
+    # Save best model (or last model if skip_epoch_cascade) - skip if eval-only
+    if not args.eval_only and is_main_process():
         classifier_state = classifier_head.module.state_dict() if use_ddp else classifier_head.state_dict()
         if best_state:
             torch.save(best_state, os.path.join(args.output_dir, "best_model.pt"))

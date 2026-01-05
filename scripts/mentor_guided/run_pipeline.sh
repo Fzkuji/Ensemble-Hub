@@ -11,7 +11,7 @@
 #   --intern-model MODEL  Intern model name (small model for generation)
 #   --mentor-api API      API type for mentor model: "openrouter" (for GPT-4o, Claude, etc.)
 #   --api-max-workers N   Max concurrent API requests (default: 8)
-#   --dataset DATASET     Dataset: hendrycks_math, math500, gsm8k (default: hendrycks_math)
+#   --dataset DATASET     Dataset: hendrycks_math, math500, gsm8k, aime24, aime25 (default: hendrycks_math)
 #   --subset SUBSET       (Legacy) Sets both train and eval subset
 #   --train-subset SUBSET Which subset(s) for training. 'all' merges all subsets.
 #   --eval-subset SUBSET  Which subset(s) for eval. 'all' tests each subset separately.
@@ -29,6 +29,9 @@
 #   --unfiltered-val      Use unfiltered data for validation/threshold search
 #   --skip-epoch-cascade  Skip cascade evaluation after each epoch (faster training)
 #   --method METHODS      Comma-separated list of methods to run: mlp,ppl,lora,ensemble (default: all)
+#   --mlp-checkpoint PATH Path to MLP checkpoint for cross-dataset evaluation (skips training)
+#   --ppl-checkpoint PATH Path to PPL checkpoint for cross-dataset evaluation (skips training)
+#   --lora-checkpoint PATH Path to LoRA checkpoint for cross-dataset evaluation (skips training)
 #
 # Examples:
 #   ./run_pipeline.sh --think                                    # Think mode, 8 GPUs, all subsets
@@ -38,6 +41,15 @@
 #   ./run_pipeline.sh --dataset gsm8k                            # Run on GSM8K dataset
 #   ./run_pipeline.sh --dataset gsm8k --method ppl               # Only train PPL classifier
 #   ./run_pipeline.sh --method mlp,ppl                           # Only train MLP and PPL
+#
+# Cross-Dataset Evaluation Examples:
+#   # Train on GSM8K, eval on AIME24
+#   ./run_pipeline.sh --dataset aime24 --method mlp \
+#     --mlp-checkpoint /path/to/gsm8k_model/mlp_model/best_model.pt
+#
+#   # Train on MATH, eval on AIME25
+#   ./run_pipeline.sh --dataset aime25 --method mlp \
+#     --mlp-checkpoint /path/to/math_model/algebra/mlp_model/best_model.pt
 #
 # API Model Examples:
 #   # GPT-4o as mentor via OpenRouter
@@ -76,6 +88,9 @@ FIXED_THRESHOLD=""
 UNFILTERED_VAL=false
 SKIP_EPOCH_CASCADE=false
 METHODS="mlp,ppl,lora,ensemble"  # Default: run all methods
+MLP_CHECKPOINT=""  # Path to MLP checkpoint for cross-dataset evaluation
+PPL_CHECKPOINT=""  # Path to PPL checkpoint for cross-dataset evaluation
+LORA_CHECKPOINT=""  # Path to LoRA checkpoint for cross-dataset evaluation
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -184,6 +199,18 @@ while [[ $# -gt 0 ]]; do
             METHODS="$2"
             shift 2
             ;;
+        --mlp-checkpoint)
+            MLP_CHECKPOINT="$2"
+            shift 2
+            ;;
+        --ppl-checkpoint)
+            PPL_CHECKPOINT="$2"
+            shift 2
+            ;;
+        --lora-checkpoint)
+            LORA_CHECKPOINT="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -255,9 +282,19 @@ case "$DATASET" in
         ALL_SUBSETS=(gsm8k)
         DATASET_FLAG="--dataset gsm8k"
         ;;
+    aime24)
+        DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/aime24_${MODE}_${MODEL_NAME}"
+        ALL_SUBSETS=(aime24)
+        DATASET_FLAG="--dataset aime24"
+        ;;
+    aime25)
+        DATA_DIR="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected/aime25_${MODE}_${MODEL_NAME}"
+        ALL_SUBSETS=(aime25)
+        DATASET_FLAG="--dataset aime25"
+        ;;
     *)
         echo "Unknown dataset: $DATASET"
-        echo "Supported datasets: hendrycks_math, math500, gsm8k"
+        echo "Supported datasets: hendrycks_math, math500, gsm8k, aime24, aime25"
         exit 1
         ;;
 esac
@@ -435,7 +472,19 @@ fi
 echo ""
 echo "========== Step 3: Train MLP Classifiers =========="
 if [ "$RUN_MLP" = true ]; then
-    if [ -n "$TRAIN_SUBSET" ]; then
+    if [ -n "$MLP_CHECKPOINT" ]; then
+        # Using checkpoint from another dataset - eval only
+        echo ">>> MLP: Using checkpoint from $MLP_CHECKPOINT (eval-only mode)"
+        if [ -n "$EVAL_SUBSET" ]; then
+            EVAL_FLAG="--eval-subset $EVAL_SUBSET"
+        else
+            EVAL_FLAG=""
+        fi
+        CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
+            --ddp $EVAL_FLAG --data-dir $DATA_DIR \
+            --load-checkpoint "$MLP_CHECKPOINT" --eval-only \
+            --pooling $POOLING
+    elif [ -n "$TRAIN_SUBSET" ]; then
         # Specific train subset specified
         if [ "$TRAIN_SUBSET" = "all" ]; then
             MODEL_DIR="all"

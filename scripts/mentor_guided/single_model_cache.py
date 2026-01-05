@@ -407,7 +407,7 @@ def import_from_collected(
         # Parse directory name to extract dataset, mode, and model info
         # Try mentor-intern pattern first: {dataset}_{mode}_m{mentor}_i{intern}
         mentor_intern_match = re.match(
-            r'^(gsm8k|math500|hendrycks_math_split|hendrycks_math_all)_(think|standard)_m(.+?)_i(.+)$',
+            r'^(gsm8k|math500|hendrycks_math_split|hendrycks_math_all|aime24|aime25)_(think|standard)_m(.+?)_i(.+)$',
             dir_name
         )
 
@@ -424,6 +424,10 @@ def import_from_collected(
                 dataset = "math500"
             elif dataset_prefix == "hendrycks_math_all":
                 dataset = "hendrycks_math_all"
+            elif dataset_prefix == "aime24":
+                dataset = "aime24"
+            elif dataset_prefix == "aime25":
+                dataset = "aime25"
             else:
                 dataset = "hendrycks_math"
 
@@ -473,7 +477,7 @@ def import_from_collected(
         else:
             # Try single model pattern: {dataset}_{mode}_{model}
             single_match = re.match(
-                r'^(gsm8k|math500|hendrycks_math_split|hendrycks_math_all)_(think|standard)_(.+)$',
+                r'^(gsm8k|math500|hendrycks_math_split|hendrycks_math_all|aime24|aime25)_(think|standard)_(.+)$',
                 dir_name
             )
             if single_match:
@@ -492,6 +496,10 @@ def import_from_collected(
                     dataset = "math500"
                 elif dataset_prefix == "hendrycks_math_all":
                     dataset = "hendrycks_math_all"
+                elif dataset_prefix == "aime24":
+                    dataset = "aime24"
+                elif dataset_prefix == "aime25":
+                    dataset = "aime25"
                 else:
                     dataset = "hendrycks_math"
 

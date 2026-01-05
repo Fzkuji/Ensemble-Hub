@@ -138,6 +138,10 @@ class OpenRouterInference:
             "top_p": top_p,
         }
 
+        # For DeepSeek R1, enable reasoning output
+        if self.model_family == "deepseek-r1":
+            data["include_reasoning"] = True
+
         for attempt in range(self.max_retries):
             try:
                 response = requests.post(
@@ -150,7 +154,13 @@ class OpenRouterInference:
                 result = response.json()
 
                 if "choices" in result and len(result["choices"]) > 0:
-                    return result["choices"][0]["message"]["content"]
+                    message = result["choices"][0]["message"]
+                    content = message.get("content", "")
+                    # For DeepSeek R1, combine reasoning and content
+                    reasoning = message.get("reasoning", "")
+                    if reasoning:
+                        return f"<think>\n{reasoning}\n</think>\n\n{content}"
+                    return content
                 else:
                     logger.warning(f"Unexpected response format: {result}")
                     return ""
