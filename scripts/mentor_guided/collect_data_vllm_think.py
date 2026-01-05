@@ -1011,6 +1011,11 @@ def worker_process_all_tasks(
     mentor_api: str = None,
     openrouter_api_key: str = None,
     api_max_workers: int = 8,
+    # Cache parameters for saving -1 and 0 results immediately
+    cache_base_dir: str = None,
+    dataset: str = None,
+    mode_suffix: str = None,
+    split: str = None,
 ):
     """Worker process that processes ALL subsets and token levels.
 
@@ -1032,10 +1037,20 @@ def worker_process_all_tasks(
         mentor_api: API type for mentor model (e.g., "openrouter")
         openrouter_api_key: OpenRouter API key
         api_max_workers: Max concurrent API requests
+        cache_base_dir: Base directory for single model cache
+        dataset: Dataset name for cache
+        mode_suffix: Mode suffix (think/standard) for cache
+        split: Data split (train/test) for cache
     """
     # Determine GPU IDs for each model
     mentor_gpus = mentor_gpu_ids if mentor_gpu_ids is not None else [gpu_id]
     intern_gpus = intern_gpu_ids if intern_gpu_ids is not None else [gpu_id]
+
+    # Initialize single model cache for immediate saving of -1 and 0 results
+    worker_cache = None
+    if CACHE_AVAILABLE and cache_base_dir and dataset and mode_suffix and split:
+        worker_cache = SingleModelCache(cache_base_dir)
+        logger.info(f"[Worker {rank}] Single model cache enabled for immediate saving")
 
     # Determine max_model_len for each model
     mentor_max_len = mentor_max_model_len if mentor_max_model_len is not None else max_model_len
@@ -1210,6 +1225,15 @@ def worker_process_all_tasks(
                     if not os.path.exists(merged_file) or force:
                         total, correct_cnt, acc = merge_rank_files(output_dir, token_level, world_size)
                         print(f"[MERGED] {subset_name} tokens={token_level}: {total} samples, acc={acc:.4f}", flush=True)
+
+                        # Immediately save to cache for -1 and 0
+                        if worker_cache and token_level in [-1, 0]:
+                            with open(merged_file, 'r') as f:
+                                merged_results = json.load(f)
+                            model_for_cache = mentor_model_name if token_level == -1 else intern_model_name
+                            save_to_cache(worker_cache, merged_results, dataset, mode_suffix, model_for_cache, subset_name, split)
+                            print(f"[CACHE] {subset_name} tokens={token_level} -> {get_model_short_name(model_for_cache)}", flush=True)
+
                     os.remove(lock_file)
                 except FileExistsError:
                     # Another worker is merging, skip
@@ -1335,6 +1359,11 @@ def collect_all_parallel(
     mentor_api: str = None,
     openrouter_api_key: str = None,
     api_max_workers: int = 8,
+    # Cache parameters for immediate saving
+    cache_base_dir: str = None,
+    dataset: str = None,
+    mode_suffix: str = None,
+    split: str = None,
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """Collect data for ALL subsets in parallel.
 
@@ -1435,7 +1464,7 @@ def collect_all_parallel(
         intern_gpu_list = tensor_gpus if need_intern else None
         p = mp.Process(
             target=worker_process_all_tasks,
-            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu_list, intern_gpu_list, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers)
+            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu_list, intern_gpu_list, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers, cache_base_dir, dataset, mode_suffix, split)
         )
         p.start()
         processes.append(p)
@@ -1453,7 +1482,7 @@ def collect_all_parallel(
             intern_gpu = [intern_gpu_ids[rank]] if intern_gpu_ids else [gpu_id]
             p = mp.Process(
                 target=worker_process_all_tasks,
-                args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers)
+                args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers, cache_base_dir, dataset, mode_suffix, split)
             )
             p.start()
             processes.append(p)
@@ -2046,6 +2075,9 @@ def main():
         remaining_need_mentor = any(t == -1 or t > 0 for t in remaining_token_levels)
         remaining_need_intern = any(t == 0 or t > 0 for t in remaining_token_levels)
 
+        # Pass cache parameters for immediate saving in workers
+        cache_base_dir = "/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments" if CACHE_AVAILABLE else None
+
         collect_all_parallel(
             mentor_model_name=mentor_model,
             intern_model_name=intern_model,
@@ -2067,34 +2099,35 @@ def main():
             mentor_api=args.mentor_api,
             openrouter_api_key=args.openrouter_api_key,
             api_max_workers=args.api_max_workers,
+            cache_base_dir=cache_base_dir,
+            dataset=args.dataset,
+            mode_suffix=mode_suffix,
+            split=args.split,
         )
 
-        # Save newly computed single-model results to cache
+        # Note: Cache saving for -1 and 0 is now done immediately in workers after merge
+        # This section is kept as a fallback for any missed saves
         if single_model_cache:
-            logger.info(f"\n{'='*60}")
-            logger.info("Saving new results to single model cache...")
-            logger.info(f"{'='*60}")
-
             for subset in subsets:
                 output_subdir = os.path.join(args.output_dir, subset, args.split)
 
-                # Save mentor results (-1) if newly computed
+                # Check and save mentor results (-1) if not already cached
                 if -1 in remaining_token_levels and subset not in cache_hits["mentor"]:
                     output_file = os.path.join(output_subdir, "tokens-1.json")
-                    if os.path.exists(output_file):
+                    if os.path.exists(output_file) and not single_model_cache.exists(args.dataset, mode_suffix, mentor_model, subset, args.split):
                         with open(output_file, 'r') as f:
                             results = json.load(f)
                         save_to_cache(single_model_cache, results, args.dataset, mode_suffix, mentor_model, subset, args.split)
-                        logger.info(f"  [CACHE SAVE] {subset}/tokens-1 -> {get_model_short_name(mentor_model)}")
+                        logger.info(f"  [CACHE SAVE FALLBACK] {subset}/tokens-1 -> {get_model_short_name(mentor_model)}")
 
-                # Save intern results (0) if newly computed
+                # Check and save intern results (0) if not already cached
                 if 0 in remaining_token_levels and subset not in cache_hits["intern"]:
                     output_file = os.path.join(output_subdir, "tokens0.json")
-                    if os.path.exists(output_file):
+                    if os.path.exists(output_file) and not single_model_cache.exists(args.dataset, mode_suffix, intern_model, subset, args.split):
                         with open(output_file, 'r') as f:
                             results = json.load(f)
                         save_to_cache(single_model_cache, results, args.dataset, mode_suffix, intern_model, subset, args.split)
-                        logger.info(f"  [CACHE SAVE] {subset}/tokens0 -> {get_model_short_name(intern_model)}")
+                        logger.info(f"  [CACHE SAVE FALLBACK] {subset}/tokens0 -> {get_model_short_name(intern_model)}")
 
     logger.info("\nData collection complete!")
 
