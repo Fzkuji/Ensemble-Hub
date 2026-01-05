@@ -99,7 +99,7 @@ Please think through this carefully:"""
         prompts.append(prompt)
 
     # Batch generate
-    responses = mentor.batch_generate(prompts, max_tokens=4096, temperature=0.0)
+    responses = mentor.generate(prompts, max_tokens=4096, temperature=0.0)
 
     # Update data
     updated_count = 0
@@ -108,7 +108,7 @@ Please think through this carefully:"""
         if response and response.strip():
             data[i]['mentor_response'] = response
             # Re-grade
-            answer = sample.get('answer', '')
+            answer = data[i].get('answer', '')
             # Extract answer from response (simple heuristic)
             is_correct = grade_answer(response, answer)
             old_correct = data[i].get('is_correct', False)
