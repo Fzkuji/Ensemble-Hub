@@ -943,8 +943,10 @@ def collect_data_for_token_level(
                 mentor_outputs = mentor_model.generate_mentor_tokens(mentor_prompts, max_tokens=token_level)
 
             # Intern CONTINUES from mentor's output
-            # Check if cross-model scenario (different model families)
-            is_cross_model = mentor_model.model_family != intern_model.model_family
+            # Check if cross-model scenario (different model families or API mentor)
+            # Note: API models (OpenRouter) return message lists, not strings, so always use cross-model
+            mentor_prompt_is_list = mentor_prompts and isinstance(mentor_prompts[0], list)
+            is_cross_model = mentor_prompt_is_list or mentor_model.model_family != intern_model.model_family
 
             if is_cross_model:
                 # Cross-model: build intern-native prompts with mentor's output

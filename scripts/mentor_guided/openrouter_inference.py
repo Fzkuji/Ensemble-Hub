@@ -315,6 +315,17 @@ class _DummyTokenizer:
             # Rough approximation: ~4 chars per token
             return list(range(len(text) // 4))
 
+    def decode(self, tokens: List[int]) -> str:
+        """Decode token IDs back to text."""
+        tiktoken_enc = self._get_tiktoken()
+        if tiktoken_enc:
+            return tiktoken_enc.decode(tokens)
+        else:
+            # Cannot decode without tiktoken - this is a limitation
+            # Return empty string as fallback (caller should handle this)
+            logger.warning("Cannot decode without tiktoken installed")
+            return ""
+
 
 def test_openrouter():
     """Test OpenRouter API connection."""
