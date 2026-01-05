@@ -364,22 +364,192 @@ def save_to_cache(
     cache.save(results, dataset, mode, model_name, subset, split)
 
 
+def import_from_collected(
+    cache: SingleModelCache,
+    collected_dir: str = "/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected",
+) -> Dict[str, int]:
+    """Scan collected directory and import existing results to single model cache.
+
+    This function scans all experiment directories in the collected folder and
+    imports tokens-1.json (mentor results) and tokens0.json (intern results)
+    to the single model cache if they don't already exist.
+
+    Args:
+        cache: SingleModelCache instance
+        collected_dir: Base directory containing experiment results
+
+    Returns:
+        Dict with import statistics: {"imported": count, "skipped": count, "errors": count}
+    """
+    import re
+    from pathlib import Path
+
+    collected_path = Path(collected_dir)
+    if not collected_path.exists():
+        logger.warning(f"Collected directory not found: {collected_dir}")
+        return {"imported": 0, "skipped": 0, "errors": 0}
+
+    stats = {"imported": 0, "skipped": 0, "errors": 0}
+
+    # Pattern to match experiment directories
+    # Format: {dataset}_{mode}_m{mentor}_i{intern} or {dataset}_{mode}_{model}
+    # Examples:
+    #   gsm8k_think_mDeepSeek-R1-Distill-Qwen-32B_iDeepSeek-R1-Distill-Qwen-7B
+    #   hendrycks_math_split_think_mdeepseek-r1_iDeepSeek-R1-Distill-Qwen-7B
+    #   math500_think_DeepSeek-R1-Distill-Qwen-7B
+
+    for exp_dir in collected_path.iterdir():
+        if not exp_dir.is_dir():
+            continue
+
+        dir_name = exp_dir.name
+
+        # Parse directory name to extract dataset, mode, and model info
+        # Try mentor-intern pattern first: {dataset}_{mode}_m{mentor}_i{intern}
+        mentor_intern_match = re.match(
+            r'^(gsm8k|math500|hendrycks_math_split|hendrycks_math_all)_(think|standard)_m(.+?)_i(.+)$',
+            dir_name
+        )
+
+        if mentor_intern_match:
+            dataset_prefix = mentor_intern_match.group(1)
+            mode = mentor_intern_match.group(2)
+            mentor_short = mentor_intern_match.group(3)
+            intern_short = mentor_intern_match.group(4)
+
+            # Convert dataset prefix to dataset name
+            if dataset_prefix == "gsm8k":
+                dataset = "gsm8k"
+            elif dataset_prefix == "math500":
+                dataset = "math500"
+            elif dataset_prefix == "hendrycks_math_all":
+                dataset = "hendrycks_math_all"
+            else:
+                dataset = "hendrycks_math"
+
+            # Scan subsets
+            for subset_dir in exp_dir.iterdir():
+                if not subset_dir.is_dir():
+                    continue
+                subset_name = subset_dir.name
+
+                # Scan splits (train/test)
+                for split_dir in subset_dir.iterdir():
+                    if not split_dir.is_dir():
+                        continue
+                    split_name = split_dir.name
+
+                    # Check tokens-1.json (mentor)
+                    mentor_file = split_dir / "tokens-1.json"
+                    if mentor_file.exists():
+                        if not cache.exists(dataset, mode, mentor_short, subset_name, split_name):
+                            try:
+                                with open(mentor_file, 'r', encoding='utf-8') as f:
+                                    results = json.load(f)
+                                cache.save(results, dataset, mode, mentor_short, subset_name, split_name)
+                                logger.info(f"[IMPORT] {mentor_short}/{subset_name}/{split_name} (mentor) from {dir_name}")
+                                stats["imported"] += 1
+                            except Exception as e:
+                                logger.warning(f"Failed to import {mentor_file}: {e}")
+                                stats["errors"] += 1
+                        else:
+                            stats["skipped"] += 1
+
+                    # Check tokens0.json (intern)
+                    intern_file = split_dir / "tokens0.json"
+                    if intern_file.exists():
+                        if not cache.exists(dataset, mode, intern_short, subset_name, split_name):
+                            try:
+                                with open(intern_file, 'r', encoding='utf-8') as f:
+                                    results = json.load(f)
+                                cache.save(results, dataset, mode, intern_short, subset_name, split_name)
+                                logger.info(f"[IMPORT] {intern_short}/{subset_name}/{split_name} (intern) from {dir_name}")
+                                stats["imported"] += 1
+                            except Exception as e:
+                                logger.warning(f"Failed to import {intern_file}: {e}")
+                                stats["errors"] += 1
+                        else:
+                            stats["skipped"] += 1
+        else:
+            # Try single model pattern: {dataset}_{mode}_{model}
+            single_match = re.match(
+                r'^(gsm8k|math500|hendrycks_math_split|hendrycks_math_all)_(think|standard)_(.+)$',
+                dir_name
+            )
+            if single_match:
+                dataset_prefix = single_match.group(1)
+                mode = single_match.group(2)
+                model_short = single_match.group(3)
+
+                # Skip if it looks like a mentor-intern pattern we missed
+                if '_m' in model_short or '_i' in model_short:
+                    continue
+
+                # Convert dataset prefix
+                if dataset_prefix == "gsm8k":
+                    dataset = "gsm8k"
+                elif dataset_prefix == "math500":
+                    dataset = "math500"
+                elif dataset_prefix == "hendrycks_math_all":
+                    dataset = "hendrycks_math_all"
+                else:
+                    dataset = "hendrycks_math"
+
+                # Scan subsets
+                for subset_dir in exp_dir.iterdir():
+                    if not subset_dir.is_dir():
+                        continue
+                    subset_name = subset_dir.name
+
+                    for split_dir in subset_dir.iterdir():
+                        if not split_dir.is_dir():
+                            continue
+                        split_name = split_dir.name
+
+                        # Check both -1 and 0 (same model for both)
+                        for token_file, token_level in [("tokens-1.json", -1), ("tokens0.json", 0)]:
+                            file_path = split_dir / token_file
+                            if file_path.exists():
+                                if not cache.exists(dataset, mode, model_short, subset_name, split_name):
+                                    try:
+                                        with open(file_path, 'r', encoding='utf-8') as f:
+                                            results = json.load(f)
+                                        cache.save(results, dataset, mode, model_short, subset_name, split_name)
+                                        logger.info(f"[IMPORT] {model_short}/{subset_name}/{split_name} from {dir_name}")
+                                        stats["imported"] += 1
+                                    except Exception as e:
+                                        logger.warning(f"Failed to import {file_path}: {e}")
+                                        stats["errors"] += 1
+                                else:
+                                    stats["skipped"] += 1
+                                break  # Only import once per subset/split
+
+    return stats
+
+
 if __name__ == "__main__":
-    # Test the cache
     import argparse
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     parser = argparse.ArgumentParser(description="Single Model Cache Manager")
     parser.add_argument("--base-dir", type=str,
                         default="/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments")
     parser.add_argument("--list", action="store_true", help="List cached models")
     parser.add_argument("--stats", type=str, help="Show stats for a model")
+    parser.add_argument("--import", dest="do_import", action="store_true",
+                        help="Import results from collected directory to cache")
     parser.add_argument("--dataset", type=str, default="hendrycks_math")
     parser.add_argument("--mode", type=str, default="think")
     args = parser.parse_args()
 
     cache = SingleModelCache(args.base_dir)
 
-    if args.list:
+    if args.do_import:
+        collected_dir = os.path.join(args.base_dir, "collected")
+        print(f"Importing from {collected_dir}...")
+        stats = import_from_collected(cache, collected_dir)
+        print(f"Done: imported={stats['imported']}, skipped={stats['skipped']}, errors={stats['errors']}")
+    elif args.list:
         models = cache.list_cached_models(args.dataset, args.mode)
         print(f"Cached models for {args.dataset}/{args.mode}:")
         for m in models:
@@ -388,4 +558,4 @@ if __name__ == "__main__":
         stats = cache.get_cache_stats(args.dataset, args.mode, args.stats)
         print(json.dumps(stats, indent=2))
     else:
-        print("Use --list or --stats <model_name>")
+        print("Use --list, --stats <model_name>, or --import")

@@ -50,7 +50,7 @@ except ImportError:
 
 # Single model cache for reusing -1 and 0 token level results
 try:
-    from single_model_cache import SingleModelCache, check_and_use_cache, save_to_cache, get_model_short_name
+    from single_model_cache import SingleModelCache, check_and_use_cache, save_to_cache, get_model_short_name, import_from_collected
     CACHE_AVAILABLE = True
 except ImportError:
     CACHE_AVAILABLE = False
@@ -1057,12 +1057,18 @@ def worker_process_all_tasks(
     intern_max_len = intern_max_model_len if intern_max_model_len is not None else max_model_len
 
     # Determine memory utilization
+    # If mentor uses API, intern can use full GPU memory
     # If GPUs don't overlap, use default (0.9); otherwise use specified values
     mentor_gpu_set = set(mentor_gpus)
     intern_gpu_set = set(intern_gpus)
     gpus_overlap = bool(mentor_gpu_set & intern_gpu_set)
 
-    if not gpus_overlap:
+    if mentor_api:
+        # Mentor via API doesn't use GPU memory, intern can use more
+        mentor_mem_util = 0.0  # Not used
+        intern_mem_util = 0.9
+        logger.info(f"[Worker {rank}] Mentor via API - intern memory_util=0.9")
+    elif not gpus_overlap:
         mentor_mem_util = 0.9
         intern_mem_util = 0.9
         logger.info(f"[Worker {rank}] GPUs don't overlap - memory utilization set to 0.9")
@@ -1762,6 +1768,11 @@ def main():
         cache_base_dir = "/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments"
         single_model_cache = SingleModelCache(cache_base_dir)
         logger.info(f"Single model cache enabled: {single_model_cache.cache_dir}")
+        # Auto-import existing results from collected directory
+        collected_dir = os.path.join(cache_base_dir, "collected")
+        import_stats = import_from_collected(single_model_cache, collected_dir)
+        if import_stats["imported"] > 0:
+            logger.info(f"Auto-imported {import_stats['imported']} results to cache")
 
     # Define subsets
     MATH_SUBSETS = [
