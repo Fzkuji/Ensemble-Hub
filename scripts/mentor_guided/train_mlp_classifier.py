@@ -647,11 +647,16 @@ def main():
         if args.eval_subset is None:
             args.eval_subset = args.subset
     else:
-        # Default to algebra if nothing specified
-        if args.train_subset is None:
-            args.train_subset = "algebra"
-        if args.eval_subset is None:
-            args.eval_subset = args.train_subset  # Default eval to same as train
+        # Default to algebra if nothing specified (only for training mode)
+        if not args.eval_only:
+            if args.train_subset is None:
+                args.train_subset = "algebra"
+            if args.eval_subset is None:
+                args.eval_subset = args.train_subset  # Default eval to same as train
+        else:
+            # Eval-only mode: require explicit eval_subset
+            if args.eval_subset is None:
+                raise ValueError("--eval-subset is required when using --eval-only mode")
 
     rank, world_size, local_rank = setup_distributed()
     use_ddp = args.ddp or world_size > 1
