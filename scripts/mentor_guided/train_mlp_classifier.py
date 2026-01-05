@@ -718,9 +718,11 @@ def main():
         eval_all_subsets = (args.eval_subset == "all")
         train_subset_dir = None  # Not used in eval-only mode
 
-        # For eval-only, output_dir should be specified or default to current dir
+        # For eval-only, save results to data_dir/eval_subset/mlp_model so summarize_results.py can find them
         if args.output_dir is None:
-            args.output_dir = "./mlp_eval_results"
+            # Use eval_subset to determine output directory
+            eval_subset_dir = os.path.join(args.data_dir, args.eval_subset)
+            args.output_dir = os.path.join(eval_subset_dir, "mlp_model")
         if is_main_process():
             os.makedirs(args.output_dir, exist_ok=True)
     else:
