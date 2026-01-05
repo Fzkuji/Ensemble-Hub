@@ -712,100 +712,128 @@ def main():
         if is_main_process():
             logger.info(f"Pre-allocated {args.reserve_memory:.1f} GB GPU memory on {device} (will release after model load)")
 
-    train_all_subsets = (args.train_subset == "all")
-    eval_all_subsets = (args.eval_subset == "all")
+    # In eval-only mode, we don't need train_subset setup
+    if args.eval_only:
+        train_all_subsets = False
+        eval_all_subsets = (args.eval_subset == "all")
+        train_subset_dir = None  # Not used in eval-only mode
 
-    if train_all_subsets:
-        # When training on all subsets, output goes to data_dir/all/mlp_model
-        train_subset_dir = os.path.join(args.data_dir, "all")
-        os.makedirs(train_subset_dir, exist_ok=True)
+        # For eval-only, output_dir should be specified or default to current dir
+        if args.output_dir is None:
+            args.output_dir = "./mlp_eval_results"
+        if is_main_process():
+            os.makedirs(args.output_dir, exist_ok=True)
     else:
-        train_subset_dir = os.path.join(args.data_dir, args.train_subset)
-        if not os.path.exists(train_subset_dir):
-            if is_main_process():
-                logger.error(f"Data directory not found: {train_subset_dir}")
-            cleanup_distributed()
-            return
+        # Training mode: set up train_subset_dir
+        train_all_subsets = (args.train_subset == "all")
+        eval_all_subsets = (args.eval_subset == "all")
 
-    if args.output_dir is None:
-        args.output_dir = os.path.join(train_subset_dir, "mlp_model")
-    if is_main_process():
-        os.makedirs(args.output_dir, exist_ok=True)
+        if train_all_subsets:
+            # When training on all subsets, output goes to data_dir/all/mlp_model
+            train_subset_dir = os.path.join(args.data_dir, "all")
+            os.makedirs(train_subset_dir, exist_ok=True)
+        else:
+            train_subset_dir = os.path.join(args.data_dir, args.train_subset)
+            if not os.path.exists(train_subset_dir):
+                if is_main_process():
+                    logger.error(f"Data directory not found: {train_subset_dir}")
+                cleanup_distributed()
+                return
+
+        if args.output_dir is None:
+            args.output_dir = os.path.join(train_subset_dir, "mlp_model")
+        if is_main_process():
+            os.makedirs(args.output_dir, exist_ok=True)
 
     if is_main_process():
         logger.info(f"=== MLP Classifier (Frozen LLM) ===")
-        logger.info(f"Train subset: {args.train_subset}")
+        if not args.eval_only:
+            logger.info(f"Train subset: {args.train_subset}")
         logger.info(f"Eval subset: {args.eval_subset}")
         logger.info(f"Data dir: {args.data_dir}")
         logger.info(f"DDP: {use_ddp}, World size: {world_size}")
+        if args.eval_only:
+            logger.info(f"Mode: Eval-only (skip training)")
 
-    # Load train data
-    if is_main_process():
-        logger.info("Loading training data...")
-    if train_all_subsets:
-        train_data = load_all_subsets_data(args.data_dir, split="train")
-    else:
-        train_data = load_json_data(train_subset_dir, split="train")
-
-    # Check which token levels are available
-    available_levels = [t for t in TOKEN_LEVELS if train_data.get(t)]
-    missing_levels = [t for t in TOKEN_LEVELS if not train_data.get(t)]
-    
-    if not train_data or not available_levels:
+    # Load train data (skip in eval-only mode)
+    if not args.eval_only:
         if is_main_process():
-            logger.error("No training data found!")
-            if missing_levels:
-                logger.error(f"Missing token levels: {missing_levels}")
-                logger.error("Please run data collection to generate missing data files.")
+            logger.info("Loading training data...")
+        if train_all_subsets:
+            train_data = load_all_subsets_data(args.data_dir, split="train")
+        else:
+            train_data = load_json_data(train_subset_dir, split="train")
+
+        # Check which token levels are available
+        available_levels = [t for t in TOKEN_LEVELS if train_data.get(t)]
+        missing_levels = [t for t in TOKEN_LEVELS if not train_data.get(t)]
+
+        if not train_data or not available_levels:
+            if is_main_process():
+                logger.error("No training data found!")
+                if missing_levels:
+                    logger.error(f"Missing token levels: {missing_levels}")
+                    logger.error("Please run data collection to generate missing data files.")
+                    logger.error(f"Example command to collect missing data:")
+                    logger.error(f"  python collect_data_vllm_think.py --split train --gpus 0,1,2,3,4,5,6,7 --token-levels \"{','.join(map(str, missing_levels))}\"")
+            cleanup_distributed()
+            return
+    else:
+        # Eval-only mode: no training data needed
+        train_data = None
+        available_levels = TOKEN_LEVELS  # Assume all levels available for eval
+
+    # Split train/val (skip in eval-only mode)
+    if not args.eval_only:
+        if missing_levels:
+            if is_main_process():
+                logger.error(f"Missing required token levels: {missing_levels}")
+                logger.error(f"Available levels: {available_levels}")
+                logger.error("Training requires all token levels. Please collect missing data first.")
                 logger.error(f"Example command to collect missing data:")
                 logger.error(f"  python collect_data_vllm_think.py --split train --gpus 0,1,2,3,4,5,6,7 --token-levels \"{','.join(map(str, missing_levels))}\"")
-        cleanup_distributed()
-        return
+            cleanup_distributed()
+            return
 
-    if missing_levels:
-        if is_main_process():
-            logger.error(f"Missing required token levels: {missing_levels}")
-            logger.error(f"Available levels: {available_levels}")
-            logger.error("Training requires all token levels. Please collect missing data first.")
-            logger.error(f"Example command to collect missing data:")
-            logger.error(f"  python collect_data_vllm_think.py --split train --gpus 0,1,2,3,4,5,6,7 --token-levels \"{','.join(map(str, missing_levels))}\"")
-        cleanup_distributed()
-        return
+        n_samples = len(train_data[TOKEN_LEVELS[0]])
 
-    # Split train/val (or use all data if --no-val)
-    n_samples = len(train_data[TOKEN_LEVELS[0]])
+        if not args.use_val:
+            # Use all train data for training, load test data for evaluation
+            val_data = train_data  # For threshold search (on train)
+            n_train = n_samples
+            n_val = n_samples
 
-    if not args.use_val:
-        # Use all train data for training, load test data for evaluation
-        val_data = train_data  # For threshold search (on train)
-        n_train = n_samples
-        n_val = n_samples
+            # test_data will be loaded later based on eval_subset (can be per-subset evaluation)
+            test_data = None  # Placeholder, actual loading happens after training
 
-        # test_data will be loaded later based on eval_subset (can be per-subset evaluation)
-        test_data = None  # Placeholder, actual loading happens after training
+            if is_main_process():
+                logger.info(f"No-val mode: Train on all {n_train} samples")
+                logger.info(f"Eval subset: {args.eval_subset} (will evaluate after training)")
+        else:
+            test_data = None  # Not used in normal mode
+            from sklearn.model_selection import train_test_split as sk_split
+            train_idx, val_idx = sk_split(
+                np.arange(n_samples), test_size=args.val_ratio, random_state=42
+            )
 
-        if is_main_process():
-            logger.info(f"No-val mode: Train on all {n_train} samples")
-            logger.info(f"Eval subset: {args.eval_subset} (will evaluate after training)")
+            val_data = {}
+            actual_train_data = {}
+            for tokens in TOKEN_LEVELS:
+                if tokens in train_data:
+                    val_data[tokens] = [train_data[tokens][i] for i in val_idx]
+                    actual_train_data[tokens] = [train_data[tokens][i] for i in train_idx]
+            train_data = actual_train_data
+
+            n_train = len(train_data[TOKEN_LEVELS[0]])
+            n_val = len(val_data[TOKEN_LEVELS[0]])
+            if is_main_process():
+                logger.info(f"Train: {n_train}, Val: {n_val}")
     else:
-        test_data = None  # Not used in normal mode
-        from sklearn.model_selection import train_test_split as sk_split
-        train_idx, val_idx = sk_split(
-            np.arange(n_samples), test_size=args.val_ratio, random_state=42
-        )
-
-        val_data = {}
-        actual_train_data = {}
-        for tokens in TOKEN_LEVELS:
-            if tokens in train_data:
-                val_data[tokens] = [train_data[tokens][i] for i in val_idx]
-                actual_train_data[tokens] = [train_data[tokens][i] for i in train_idx]
-        train_data = actual_train_data
-
-        n_train = len(train_data[TOKEN_LEVELS[0]])
-        n_val = len(val_data[TOKEN_LEVELS[0]])
-        if is_main_process():
-            logger.info(f"Train: {n_train}, Val: {n_val}")
+        # Eval-only mode: no training/val data
+        val_data = None
+        test_data = None
+        n_train = 0
+        n_val = 0
 
     # Load tokenizer
     if is_main_process():
@@ -949,59 +977,68 @@ def main():
                 logger.info(f"  All used memory is locked and will not be released")
 
     # Create datasets (filter train, optionally filter val)
-    filter_uniform = args.filter_data
-    filter_val = filter_uniform and not args.unfiltered_val
-    verbose = is_main_process()
-    train_dataset = MentorDataset(train_data, tokenizer, args.max_length, filter_uniform=filter_uniform, verbose=verbose)
-    val_dataset = MentorDataset(val_data, tokenizer, args.max_length, filter_uniform=filter_val, verbose=verbose)
+    # Create datasets (skip in eval-only mode)
+    if not args.eval_only:
+        filter_uniform = args.filter_data
+        filter_val = filter_uniform and not args.unfiltered_val
+        verbose = is_main_process()
+        train_dataset = MentorDataset(train_data, tokenizer, args.max_length, filter_uniform=filter_uniform, verbose=verbose)
+        val_dataset = MentorDataset(val_data, tokenizer, args.max_length, filter_uniform=filter_val, verbose=verbose)
 
-    # Also filter raw val_data for cascade evaluation (threshold search)
-    if filter_val:
-        val_data_for_cascade = filter_varied_data(val_data, verbose=verbose)
+        # Also filter raw val_data for cascade evaluation (threshold search)
+        if filter_val:
+            val_data_for_cascade = filter_varied_data(val_data, verbose=verbose)
+        else:
+            val_data_for_cascade = val_data
+
+        if verbose:
+            n_cascade_samples = len(val_data_for_cascade[TOKEN_LEVELS[0]])
+            logger.info(f"Training: {len(train_dataset)} samples (filtered={filter_uniform})")
+            logger.info(f"Validation: {len(val_dataset)} samples (filtered={filter_val})")
+            logger.info(f"Cascade eval: {n_cascade_samples} samples (for threshold search)")
+
+        if use_ddp:
+            train_sampler = DistributedSampler(train_dataset, shuffle=True)
+            val_sampler = DistributedSampler(val_dataset, shuffle=False)
+            shuffle = False
+        else:
+            train_sampler = None
+            val_sampler = None
+            shuffle = True
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=shuffle,
+            sampler=train_sampler,
+            collate_fn=lambda b: collate_fn(b, tokenizer),
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            sampler=val_sampler,
+            collate_fn=lambda b: collate_fn(b, tokenizer),
+        )
+
+        # Class weights
+        train_labels = torch.tensor([s['label'] for s in train_dataset.samples])
+        class_counts = torch.bincount(train_labels)
+        class_weights = 1.0 / class_counts.float()
+        class_weights = class_weights / class_weights.sum() * 2
+        class_weights = class_weights.to(device)
+
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+        # Optimizer (only MLP params)
+        classifier_params = classifier_head.module.parameters() if use_ddp else classifier_head.parameters()
+        optimizer = torch.optim.AdamW(classifier_params, lr=args.lr, weight_decay=0.01)
     else:
-        val_data_for_cascade = val_data
-
-    if verbose:
-        n_cascade_samples = len(val_data_for_cascade[TOKEN_LEVELS[0]])
-        logger.info(f"Training: {len(train_dataset)} samples (filtered={filter_uniform})")
-        logger.info(f"Validation: {len(val_dataset)} samples (filtered={filter_val})")
-        logger.info(f"Cascade eval: {n_cascade_samples} samples (for threshold search)")
-
-    if use_ddp:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False)
-        shuffle = False
-    else:
-        train_sampler = None
-        val_sampler = None
-        shuffle = True
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=shuffle,
-        sampler=train_sampler,
-        collate_fn=lambda b: collate_fn(b, tokenizer),
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        sampler=val_sampler,
-        collate_fn=lambda b: collate_fn(b, tokenizer),
-    )
-
-    # Class weights
-    train_labels = torch.tensor([s['label'] for s in train_dataset.samples])
-    class_counts = torch.bincount(train_labels)
-    class_weights = 1.0 / class_counts.float()
-    class_weights = class_weights / class_weights.sum() * 2
-    class_weights = class_weights.to(device)
-
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-
-    # Optimizer (only MLP params)
-    classifier_params = classifier_head.module.parameters() if use_ddp else classifier_head.parameters()
-    optimizer = torch.optim.AdamW(classifier_params, lr=args.lr, weight_decay=0.01)
+        # Eval-only mode: no training setup needed
+        train_loader = None
+        val_loader = None
+        val_data_for_cascade = None
+        criterion = None
+        optimizer = None
 
     # Training
     best_cascade_acc = 0
@@ -1076,8 +1113,25 @@ def main():
         # Also save last model
         torch.save({'classifier': classifier_state}, os.path.join(args.output_dir, "last_model.pt"))
 
-    # Final cascade evaluation on train (for threshold) - skip if using fixed threshold
-    if args.fixed_threshold is not None:
+    # Final cascade evaluation on train (for threshold) - skip if using fixed threshold or eval-only
+    if args.eval_only:
+        # Eval-only mode: use loaded thresholds from checkpoint
+        if loaded_thresholds is not None:
+            final_thresholds = loaded_thresholds
+            if is_main_process():
+                logger.info(f"\nEval-only mode: using loaded thresholds {final_thresholds}")
+        else:
+            # No thresholds in checkpoint, use default 0.5
+            final_thresholds = [0.5] * len(TOKEN_LEVELS)
+            if is_main_process():
+                logger.warning(f"\nNo thresholds in checkpoint, using default 0.5 for all levels")
+        final_cascade_acc = 0.0  # Placeholder, will evaluate on test
+        final_detailed = {
+            'oracle': 0.0,
+            'auc': {t: 0.0 for t in TOKEN_LEVELS},
+            'baseline': {t: 0.0 for t in TOKEN_LEVELS},
+        }
+    elif args.fixed_threshold is not None:
         # No need to evaluate on train, just use fixed threshold
         final_thresholds = [args.fixed_threshold] * len(TOKEN_LEVELS)
         final_cascade_acc = 0.0  # Placeholder, will evaluate on test
