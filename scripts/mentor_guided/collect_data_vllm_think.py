@@ -1999,6 +1999,17 @@ def main():
                     if cache_stats:
                         logger.info(f"  [CACHE HIT] {subset}/tokens-1 (mentor): {cache_stats['accuracy']:.4f}")
                         cache_hits["mentor"].append(subset)
+                    else:
+                        # Check if result exists in output_subdir but not in cache - auto-import to cache
+                        output_file = os.path.join(output_subdir, "tokens-1.json")
+                        if os.path.exists(output_file):
+                            with open(output_file, 'r') as f:
+                                results = json.load(f)
+                            save_to_cache(single_model_cache, results, args.dataset, mode_suffix, mentor_model, subset, args.split)
+                            correct = sum(1 for r in results if r.get('is_correct'))
+                            acc = correct / len(results) if results else 0
+                            logger.info(f"  [CACHE IMPORT] {subset}/tokens-1 (mentor): {acc:.4f} - imported from existing output")
+                            cache_hits["mentor"].append(subset)
 
                 # Check intern cache (0)
                 if 0 in token_levels:
@@ -2009,6 +2020,17 @@ def main():
                     if cache_stats:
                         logger.info(f"  [CACHE HIT] {subset}/tokens0 (intern): {cache_stats['accuracy']:.4f}")
                         cache_hits["intern"].append(subset)
+                    else:
+                        # Check if result exists in output_subdir but not in cache - auto-import to cache
+                        output_file = os.path.join(output_subdir, "tokens0.json")
+                        if os.path.exists(output_file):
+                            with open(output_file, 'r') as f:
+                                results = json.load(f)
+                            save_to_cache(single_model_cache, results, args.dataset, mode_suffix, intern_model, subset, args.split)
+                            correct = sum(1 for r in results if r.get('is_correct'))
+                            acc = correct / len(results) if results else 0
+                            logger.info(f"  [CACHE IMPORT] {subset}/tokens0 (intern): {acc:.4f} - imported from existing output")
+                            cache_hits["intern"].append(subset)
 
             logger.info(f"Cache hits: mentor={len(cache_hits['mentor'])}/{len(subsets)}, intern={len(cache_hits['intern'])}/{len(subsets)}")
 
