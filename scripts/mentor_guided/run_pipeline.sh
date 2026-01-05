@@ -478,7 +478,8 @@ if [ "$RUN_MLP" = true ]; then
         if [ -n "$EVAL_SUBSET" ]; then
             EVAL_FLAG="--eval-subset $EVAL_SUBSET"
         else
-            EVAL_FLAG=""
+            # Use first subset if not specified (for single-subset datasets like AIME, GSM8K)
+            EVAL_FLAG="--eval-subset ${ALL_SUBSETS[0]}"
         fi
         CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
             --ddp $EVAL_FLAG --data-dir $DATA_DIR \
