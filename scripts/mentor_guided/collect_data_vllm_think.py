@@ -193,7 +193,25 @@ DATASET_CONFIGS = {
 }
 
 # Simple system prompt (ACT-E uses simple prompts)
-SYSTEM_PROMPT = """Please reason step by step, and put your final answer within \\boxed{}."""
+SYSTEM_PROMPT_SIMPLE = """Please reason step by step, and put your final answer within \\boxed{}."""
+
+# Structured system prompt with insights and constraints
+SYSTEM_PROMPT_STRUCTURED = """You are a reasoning assistant. Analyze the given problem and follow the structured insights below.
+
+INSIGHTS
+[Thinking Insights]
+1. Goal: <objective, constraints, and required output form>
+2. Planning: <high-level strategy; subproblem decomposition; edge cases>
+3. Retrieval: <relevant facts, formulas, or definitions; N/A if none>
+4. Action: <concrete steps and intermediate calculations>
+
+CONSTRAINTS
+- Keep each component concise.
+- Maintain notational consistency with the original problem.
+- Put your final answer within \\boxed{}."""
+
+# Default prompt
+SYSTEM_PROMPT = SYSTEM_PROMPT_SIMPLE
 
 # =============================================================================
 # Model Family Configurations
@@ -231,16 +249,13 @@ MODEL_FAMILIES = {
         "enable_thinking_param": True,  # Use enable_thinking param in apply_chat_template
     },
     "gpt-oss": {
-        # GPT-OSS uses <thinking>/<final_answer> tags (different from DeepSeek/Qwen's <think>)
-        # Reasoning mode is controlled via system prompt: "Reasoning: high/medium/low/none"
-        "think_start": "<thinking>",
-        "think_end": "</thinking>",
-        "final_answer_start": "<final_answer>",
-        "final_answer_end": "</final_answer>",
-        "template_adds_think": False,  # Need to add "Reasoning: high" to system prompt
-        "reasoning_system_prompt": True,  # Use "Reasoning: high" in system prompt
-        "no_think_system": "Reasoning: none",  # System prompt for no-think mode
-        "think_system": "Reasoning: high",  # System prompt for think mode
+        # GPT-OSS: 20B uses <thinking>/<final_answer>, 120B uses reasoning_details
+        # OpenRouter API converts reasoning_details to <think></think> format (same as DeepSeek/Qwen)
+        # Reasoning mode is controlled via API parameter: reasoning.enabled
+        "think_start": "<think>",
+        "think_end": "</think>",
+        "template_adds_think": False,
+        # Note: Reasoning is enabled via API parameter in OpenRouterInference._make_request
     },
     "default": {
         "think_start": None,
@@ -298,17 +313,18 @@ def build_cross_model_prompt(
     intern_prompt = intern_model.build_chat_prompt(question, use_think=use_think)
 
     # Handle cross-model format conversion
-    # GPT-OSS uses <thinking>/<final_answer> while DeepSeek/Qwen use <think>
+    # Legacy GPT-OSS 20B uses <thinking>/<final_answer> while modern models use <think>
+    # Note: GPT-OSS 120B via OpenRouter API already uses unified <think> format
     intern_family = intern_model.model_family
 
     # Convert mentor output format to intern's expected format if needed
     converted_output = mentor_output
     if mentor_family == "gpt-oss" and intern_family in ("deepseek-r1", "qwen3"):
-        # Convert GPT-OSS format to DeepSeek/Qwen format
+        # Convert legacy GPT-OSS 20B format to DeepSeek/Qwen format (120B already unified)
         converted_output = mentor_output.replace("<thinking>", "<think>").replace("</thinking>", "</think>")
         converted_output = converted_output.replace("<final_answer>", "").replace("</final_answer>", "")
     elif mentor_family in ("deepseek-r1", "qwen3") and intern_family == "gpt-oss":
-        # Convert DeepSeek/Qwen format to GPT-OSS format
+        # Convert DeepSeek/Qwen format to legacy GPT-OSS 20B format
         converted_output = mentor_output.replace("<think>", "<thinking>").replace("</think>", "</thinking>")
 
     # For cross-model scenarios, we need to handle the prompt carefully
@@ -319,11 +335,14 @@ def build_cross_model_prompt(
         else:
             return intern_prompt + "<think>\n" + converted_output
     elif intern_family == "gpt-oss":
-        # GPT-OSS: the reasoning is triggered by system prompt, just append output
+        # GPT-OSS 120B: uses unified <think> format (same as DeepSeek/Qwen)
+        # Legacy 20B: uses <thinking> format
         if converted_output.startswith("<thinking>") or converted_output.strip().startswith("<thinking>"):
             return intern_prompt + converted_output
+        elif converted_output.startswith("<think>") or converted_output.strip().startswith("<think>"):
+            return intern_prompt + converted_output
         else:
-            return intern_prompt + "<thinking>\n" + converted_output
+            return intern_prompt + "<think>\n" + converted_output
     else:
         # DeepSeek-R1 or default: prompt already ends with <think>\n
         return intern_prompt + converted_output
@@ -384,8 +403,8 @@ def extract_thinking_content(text: str, model_family: str = None) -> Tuple[str, 
     """Extract thinking content and final answer from model output.
 
     Handles different model formats:
-    - DeepSeek/Qwen: <think>...</think>
-    - GPT-OSS: <thinking>...</thinking> and <final_answer>...</final_answer>
+    - DeepSeek/Qwen/GPT-OSS: <think>...</think> (unified format)
+    - Legacy GPT-OSS 20B: <thinking>...</thinking> and <final_answer>...</final_answer>
 
     Args:
         text: Model output text
@@ -399,12 +418,12 @@ def extract_thinking_content(text: str, model_family: str = None) -> Tuple[str, 
     # Auto-detect format if not specified
     if model_family is None:
         if "<thinking>" in text:
-            model_family = "gpt-oss"
+            model_family = "gpt-oss-legacy"
         elif "<think>" in text:
-            model_family = "deepseek-r1"  # or qwen3, same format
+            model_family = "unified"  # DeepSeek/Qwen/GPT-OSS 120B
 
-    if model_family == "gpt-oss":
-        # GPT-OSS format: <thinking>...</thinking> and optionally <final_answer>...</final_answer>
+    if model_family == "gpt-oss-legacy":
+        # Legacy GPT-OSS 20B format: <thinking>...</thinking> and optionally <final_answer>...</final_answer>
         thinking_match = re.search(r'<thinking>(.*?)</thinking>', text, re.DOTALL)
         thinking = thinking_match.group(1).strip() if thinking_match else ""
 
@@ -419,7 +438,7 @@ def extract_thinking_content(text: str, model_family: str = None) -> Tuple[str, 
 
         return thinking, remaining.strip()
     else:
-        # DeepSeek/Qwen format: <think>...</think>
+        # Unified format (DeepSeek/Qwen/GPT-OSS 120B): <think>...</think>
         think_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
         thinking = think_match.group(1).strip() if think_match else ""
 
@@ -1581,6 +1600,9 @@ def main():
     # Think mode control
     parser.add_argument("--no-think", action="store_true",
                         help="Disable structured thinking prompt (use standard prompt)")
+    parser.add_argument("--prompt-type", type=str, default="simple",
+                        choices=["simple", "structured"],
+                        help="System prompt type: 'simple' (default) or 'structured' (with insights and constraints)")
     parser.add_argument("--force", action="store_true",
                         help="Force re-collection even if data files already exist")
     # OpenRouter API support for closed-source mentor models
@@ -1594,10 +1616,19 @@ def main():
 
     args = parser.parse_args()
 
+    # Set system prompt based on prompt type
+    global SYSTEM_PROMPT
+    if args.prompt_type == "structured":
+        SYSTEM_PROMPT = SYSTEM_PROMPT_STRUCTURED
+        logger.info("Using STRUCTURED system prompt (with insights and constraints)")
+    else:
+        SYSTEM_PROMPT = SYSTEM_PROMPT_SIMPLE
+        logger.info("Using SIMPLE system prompt")
+
     # Determine mentor and intern models
     mentor_model = args.mentor_model if args.mentor_model else args.model
     intern_model = args.intern_model if args.intern_model else args.model
-    
+
     if mentor_model != intern_model:
         logger.info(f"Using different models: Mentor={mentor_model}, Intern={intern_model}")
     else:

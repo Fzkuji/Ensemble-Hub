@@ -6,6 +6,7 @@
 #   --gpus GPUS           Comma-separated GPU IDs (default: 0,1,2,3,4,5,6,7)
 #   --think               Enable thinking mode (default)
 #   --no-think            Disable thinking mode (standard prompt)
+#   --prompt-type TYPE    Prompt type: simple (default) or structured (with insights)
 #   --model MODEL         Model name (default: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B)
 #   --mentor-model MODEL  Mentor model name (large model for guidance)
 #   --intern-model MODEL  Intern model name (small model for generation)
@@ -65,6 +66,7 @@ cd "$SCRIPT_DIR"
 # Default values
 GPUS="0,1,2,3,4,5,6,7"
 USE_THINK=true
+PROMPT_TYPE="simple"  # simple or structured
 MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 MENTOR_MODEL=""
 INTERN_MODEL=""
@@ -106,6 +108,10 @@ while [[ $# -gt 0 ]]; do
         --no-think)
             USE_THINK=false
             shift
+            ;;
+        --prompt-type)
+            PROMPT_TYPE="$2"
+            shift 2
             ;;
         --model)
             MODEL="$2"
@@ -265,6 +271,13 @@ else
     THINK_FLAG="--no-think"
 fi
 
+# Set prompt type flag
+if [ "$PROMPT_TYPE" = "structured" ]; then
+    PROMPT_TYPE_FLAG="--prompt-type structured"
+else
+    PROMPT_TYPE_FLAG="--prompt-type simple"
+fi
+
 # Set data directory and subsets based on dataset
 case "$DATASET" in
     hendrycks_math)
@@ -410,36 +423,53 @@ check_model_exists() {
 echo ""
 echo "========== Step 1: Collect Data (${NUM_GPUS} GPUs parallel) =========="
 
+# Build force flag for data collection
+FORCE_DATA_FLAG=""
+if [ "$FORCE" = true ]; then
+    FORCE_DATA_FLAG="--force"
+    echo "FORCE mode enabled - will re-collect all data"
+fi
+
 # Check if train data already exists (show which subsets are missing)
 TRAIN_MISSING=()
-for subset in "${DATA_SUBSETS[@]}"; do
-    if ! check_data_exists "$subset" "train"; then
-        TRAIN_MISSING+=("$subset")
-    fi
-done
+if [ "$FORCE" = false ]; then
+    for subset in "${DATA_SUBSETS[@]}"; do
+        if ! check_data_exists "$subset" "train"; then
+            TRAIN_MISSING+=("$subset")
+        fi
+    done
+fi
 
-if [ ${#TRAIN_MISSING[@]} -eq 0 ]; then
+if [ "$FORCE" = true ]; then
+    echo "Collecting train data (FORCE mode - will overwrite existing files)..."
+    python collect_data_vllm_think.py $MODEL_ARGS --split train --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $PROMPT_TYPE_FLAG $DATASET_FLAG $FORCE_DATA_FLAG
+elif [ ${#TRAIN_MISSING[@]} -eq 0 ]; then
     echo "Train data already exists for all subsets, skipping collection..."
 else
     echo "Missing train data for: ${TRAIN_MISSING[*]}"
     echo "Collecting train data (existing files will be skipped)..."
-    python collect_data_vllm_think.py $MODEL_ARGS --split train --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $DATASET_FLAG
+    python collect_data_vllm_think.py $MODEL_ARGS --split train --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $PROMPT_TYPE_FLAG $DATASET_FLAG
 fi
 
 # Check if test data already exists (show which subsets are missing)
 TEST_MISSING=()
-for subset in "${DATA_SUBSETS[@]}"; do
-    if ! check_data_exists "$subset" "test"; then
-        TEST_MISSING+=("$subset")
-    fi
-done
+if [ "$FORCE" = false ]; then
+    for subset in "${DATA_SUBSETS[@]}"; do
+        if ! check_data_exists "$subset" "test"; then
+            TEST_MISSING+=("$subset")
+        fi
+    done
+fi
 
-if [ ${#TEST_MISSING[@]} -eq 0 ]; then
+if [ "$FORCE" = true ]; then
+    echo "Collecting test data (FORCE mode - will overwrite existing files)..."
+    python collect_data_vllm_think.py $MODEL_ARGS --split test --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $PROMPT_TYPE_FLAG $DATASET_FLAG $FORCE_DATA_FLAG
+elif [ ${#TEST_MISSING[@]} -eq 0 ]; then
     echo "Test data already exists for all subsets, skipping collection..."
 else
     echo "Missing test data for: ${TEST_MISSING[*]}"
     echo "Collecting test data (existing files will be skipped)..."
-    python collect_data_vllm_think.py $MODEL_ARGS --split test --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $DATASET_FLAG
+    python collect_data_vllm_think.py $MODEL_ARGS --split test --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $PROMPT_TYPE_FLAG $DATASET_FLAG
 fi
 
 echo ""
