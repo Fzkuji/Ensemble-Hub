@@ -1432,57 +1432,38 @@ def collect_all_parallel(
         need_mentor: Whether mentor model is needed (based on token levels)
         need_intern: Whether intern model is needed (based on token levels)
     """
-    # Determine mode: tensor parallelism (single GPU model) vs data parallelism (both GPU models)
-    # When mentor uses API, only intern needs GPU -> use tensor parallelism for intern
+    # FORCE DATA PARALLELISM (DDP) MODE FOR ALL SCENARIOS
+    # Each GPU loads one complete model instance, no tensor parallelism
     mentor_uses_api = mentor_api is not None
     mentor_needs_gpu = need_mentor and not mentor_uses_api
 
-    # Single model mode: only one model needs GPU (tensor parallelism with all GPUs)
-    # - Only mentor needs GPU (no intern, or intern not needed)
-    # - Only intern needs GPU (mentor uses API, or mentor not needed)
-    single_model_mode = (mentor_needs_gpu and not need_intern) or (need_intern and not mentor_needs_gpu)
+    # Always use data parallelism with world_size = number of GPUs
+    world_size = len(gpus)
 
-    if single_model_mode:
-        # Single model: use tensor parallelism with all GPUs in one worker
-        world_size = 1
-        if mentor_needs_gpu:
-            tensor_gpus = mentor_gpu_ids if mentor_gpu_ids else gpus
-            print(f"\n{'='*60}", flush=True)
-            print(f"[MAIN] Single-model tensor parallelism mode (mentor only)", flush=True)
-            print(f"[MAIN] Mentor model: {mentor_model_name}", flush=True)
-            print(f"[MAIN] Using {len(tensor_gpus)} GPUs for tensor parallelism: {tensor_gpus}", flush=True)
-        else:
-            tensor_gpus = intern_gpu_ids if intern_gpu_ids else gpus
-            print(f"\n{'='*60}", flush=True)
-            if mentor_uses_api:
-                print(f"[MAIN] Hybrid mode: mentor via API, intern via tensor parallelism", flush=True)
-                print(f"[MAIN] Mentor model: {mentor_model_name} (via {mentor_api} API)", flush=True)
-            else:
-                print(f"[MAIN] Single-model tensor parallelism mode (intern only)", flush=True)
-            print(f"[MAIN] Intern model: {intern_model_name}", flush=True)
-            print(f"[MAIN] Using {len(tensor_gpus)} GPUs for tensor parallelism: {tensor_gpus}", flush=True)
-        print(f"[MAIN] Workers: {world_size}", flush=True)
-        print(f"[MAIN] Subsets: {len(all_tasks)}", flush=True)
-        print(f"[MAIN] Token levels: {token_levels}", flush=True)
-        print(f"{'='*60}\n", flush=True)
-    else:
-        # Both models need GPU: use data parallelism
-        world_size = len(gpus)
+    # Validate GPU list lengths (only for models that need GPU)
+    if mentor_needs_gpu and mentor_gpu_ids and len(mentor_gpu_ids) != world_size:
+        raise ValueError(f"mentor_gpu_ids length ({len(mentor_gpu_ids)}) must match gpus length ({world_size})")
+    if need_intern and intern_gpu_ids and len(intern_gpu_ids) != world_size:
+        raise ValueError(f"intern_gpu_ids length ({len(intern_gpu_ids)}) must match gpus length ({world_size})")
 
-        # Validate GPU list lengths (only for models that need GPU)
-        if mentor_needs_gpu and mentor_gpu_ids and len(mentor_gpu_ids) != world_size:
-            raise ValueError(f"mentor_gpu_ids length ({len(mentor_gpu_ids)}) must match gpus length ({world_size})")
-        if need_intern and intern_gpu_ids and len(intern_gpu_ids) != world_size:
-            raise ValueError(f"intern_gpu_ids length ({len(intern_gpu_ids)}) must match gpus length ({world_size})")
-
-        print(f"\n{'='*60}", flush=True)
-        print(f"[MAIN] Data parallelism mode (both models on GPU)", flush=True)
+    print(f"\n{'='*60}", flush=True)
+    print(f"[MAIN] Data parallelism (DDP) mode - each GPU loads one complete model", flush=True)
+    if mentor_needs_gpu and need_intern:
         print(f"[MAIN] Mentor model: {mentor_model_name} (GPU: {mentor_gpu_ids}, memory_util={mentor_memory_util})", flush=True)
         print(f"[MAIN] Intern model: {intern_model_name} (GPU: {intern_gpu_ids}, memory_util={intern_memory_util})", flush=True)
-        print(f"[MAIN] Workers: {world_size}", flush=True)
-        print(f"[MAIN] Subsets: {len(all_tasks)}", flush=True)
-        print(f"[MAIN] Token levels: {token_levels}", flush=True)
-        print(f"{'='*60}\n", flush=True)
+    elif mentor_needs_gpu:
+        print(f"[MAIN] Mentor model: {mentor_model_name} (GPU: {mentor_gpu_ids or gpus}, memory_util={mentor_memory_util})", flush=True)
+        print(f"[MAIN] Intern model: Not needed", flush=True)
+    elif need_intern:
+        if mentor_uses_api:
+            print(f"[MAIN] Mentor model: {mentor_model_name} (via {mentor_api} API)", flush=True)
+        else:
+            print(f"[MAIN] Mentor model: Not needed", flush=True)
+        print(f"[MAIN] Intern model: {intern_model_name} (GPU: {intern_gpu_ids or gpus}, memory_util={intern_memory_util})", flush=True)
+    print(f"[MAIN] Workers: {world_size} (DDP mode)", flush=True)
+    print(f"[MAIN] Subsets: {len(all_tasks)}", flush=True)
+    print(f"[MAIN] Token levels: {token_levels}", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
     # Set spawn method
     try:
@@ -1501,46 +1482,25 @@ def collect_all_parallel(
             if os.path.exists(lock_file):
                 os.remove(lock_file)
 
-    # Start workers
+    # Start workers - DDP mode only, each worker gets one GPU
     processes = []
 
-    if single_model_mode:
-        # Single worker with all GPUs for tensor parallelism
-        rank = 0
-        gpu_id = tensor_gpus[0]  # First GPU as default
-        # Pass full GPU list for tensor parallelism
-        mentor_gpu_list = tensor_gpus if need_mentor else None
-        intern_gpu_list = tensor_gpus if need_intern else None
+    # Multiple workers, each with one GPU per model (DDP mode)
+    for rank, gpu_id in enumerate(gpus):
+        mentor_gpu = [mentor_gpu_ids[rank]] if mentor_gpu_ids else [gpu_id]
+        intern_gpu = [intern_gpu_ids[rank]] if intern_gpu_ids else [gpu_id]
         p = mp.Process(
             target=worker_process_all_tasks,
-            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu_list, intern_gpu_list, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers, cache_base_dir, dataset, mode_suffix, split)
+            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers, cache_base_dir, dataset, mode_suffix, split)
         )
         p.start()
         processes.append(p)
+        gpu_info = []
         if need_mentor:
-            if mentor_api:
-                print(f"[MAIN] Started worker 0 (mentor via {mentor_api} API, PID: {p.pid})", flush=True)
-            else:
-                print(f"[MAIN] Started worker 0 (mentor on GPUs {tensor_gpus}, tp={len(tensor_gpus)}, PID: {p.pid})", flush=True)
-        else:
-            print(f"[MAIN] Started worker 0 (intern on GPUs {tensor_gpus}, tp={len(tensor_gpus)}, PID: {p.pid})", flush=True)
-    else:
-        # Multiple workers, each with one GPU per model
-        for rank, gpu_id in enumerate(gpus):
-            mentor_gpu = [mentor_gpu_ids[rank]] if mentor_gpu_ids else [gpu_id]
-            intern_gpu = [intern_gpu_ids[rank]] if intern_gpu_ids else [gpu_id]
-            p = mp.Process(
-                target=worker_process_all_tasks,
-                args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers, cache_base_dir, dataset, mode_suffix, split)
-            )
-            p.start()
-            processes.append(p)
-            gpu_info = []
-            if need_mentor:
-                gpu_info.append(f"mentor GPU {mentor_gpu}")
-            if need_intern:
-                gpu_info.append(f"intern GPU {intern_gpu}")
-            print(f"[MAIN] Started worker {rank} ({', '.join(gpu_info)}, PID: {p.pid})", flush=True)
+            gpu_info.append(f"mentor GPU {mentor_gpu}")
+        if need_intern:
+            gpu_info.append(f"intern GPU {intern_gpu}")
+        print(f"[MAIN] Started worker {rank} ({', '.join(gpu_info)}, PID: {p.pid})", flush=True)
 
     print(f"\n[MAIN] All {world_size} workers started. Waiting...\n", flush=True)
 
