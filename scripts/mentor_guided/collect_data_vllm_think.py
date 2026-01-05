@@ -175,8 +175,8 @@ DATASET_CONFIGS = {
         "hf_subset": None,
         "splits": ["test"],  # Only test split
         "question_field": "problem",
-        "answer_field": "answer",
-        "answer_parser": None,  # Direct answer
+        "answer_field": "solution",  # Answer is in \boxed{} format
+        "answer_parser": None,  # Use grader to extract from \boxed{}
         "subsets": ["aime24"],  # Single subset
         "extra_fields": [],
     },
@@ -185,8 +185,8 @@ DATASET_CONFIGS = {
         "hf_subset": None,
         "splits": ["test"],  # Only test split
         "question_field": "problem",
-        "answer_field": "answer",
-        "answer_parser": None,  # Direct answer
+        "answer_field": "answer",  # Direct numerical answer
+        "answer_parser": None,
         "subsets": ["aime25"],  # Single subset
         "extra_fields": [],
     },
@@ -2015,11 +2015,11 @@ def main():
         collect_and_save(data, output_subdir, subset_name="gsm8k", split=args.split)
 
     elif args.dataset == "aime24":
-        # AIME 1983-2024 dataset (test only)
+        # AIME 2024 dataset (test only)
         if args.split == "train":
             logger.warning(f"AIME24 only has test split, ignoring --split train")
         logger.info(f"\n{'='*60}")
-        logger.info(f"Processing AIME 1983-2024 (test)")
+        logger.info(f"Processing AIME 2024 (test)")
         logger.info(f"{'='*60}")
 
         data = load_dataset_generic("aime24", split="test")
