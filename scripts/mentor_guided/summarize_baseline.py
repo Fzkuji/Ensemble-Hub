@@ -78,12 +78,17 @@ def compute_stats(data_dir: str, subset: str, split: str = "test"):
             elif 'response' in item:
                 intern_lengths.append(len(item['response']) // 4)
 
+        mentor_len_mean = np.mean(mentor_lengths) if mentor_lengths else 0
+        intern_len_mean = np.mean(intern_lengths) if intern_lengths else 0
+        total_len_mean = mentor_len_mean + intern_len_mean
+
         results[tokens] = {
             'n_samples': len(data),
             'accuracy': accuracy,
             'n_correct': correct,
-            'mentor_length': np.mean(mentor_lengths) if mentor_lengths else 0,
-            'intern_length': np.mean(intern_lengths) if intern_lengths else 0,
+            'mentor_length': mentor_len_mean,
+            'intern_length': intern_len_mean,
+            'total_length': total_len_mean,
         }
 
     # Oracle: 至少一个 token level 正确
@@ -130,13 +135,13 @@ def summarize(data_dir: str, split: str = "test"):
     # 统计变量
     total_stats = {tokens: {'n': 0, 'correct': 0} for tokens in TOKEN_LEVELS}
     total_stats['oracle'] = {'n': 0, 'correct': 0}
-    total_lengths = {tokens: {'mentor': [], 'intern': []} for tokens in TOKEN_LEVELS}
+    total_lengths = {tokens: {'mentor': [], 'intern': [], 'total': []} for tokens in TOKEN_LEVELS}
 
     for subset in subsets:
         stats = compute_stats(data_dir, subset, split)
 
         if not stats:
-            table_data.append([subset] + ["-"] * 15)
+            table_data.append([subset] + ["-"] * 20)  # Updated column count
             continue
 
         n = stats[0]['n_samples'] if 0 in stats else 0
@@ -146,24 +151,28 @@ def summarize(data_dir: str, split: str = "test"):
         # T=-1 (Mentor only)
         if -1 in stats:
             s = stats[-1]
-            row.extend([f"{s['accuracy']:.4f}", f"{s['mentor_length']:.1f}"])
+            row.extend([f"{s['accuracy']:.4f}", f"{s['mentor_length']:.1f}", f"{s['total_length']:.1f}"])
             total_stats[-1]['n'] += n
             total_stats[-1]['correct'] += s['n_correct']
             if s['mentor_length'] > 0:
                 total_lengths[-1]['mentor'].append(s['mentor_length'])
+            if s['total_length'] > 0:
+                total_lengths[-1]['total'].append(s['total_length'])
         else:
-            row.extend(["-", "-"])
+            row.extend(["-", "-", "-"])
 
         # T=0 (Intern only)
         if 0 in stats:
             s = stats[0]
-            row.extend([f"{s['accuracy']:.4f}", f"{s['intern_length']:.1f}"])
+            row.extend([f"{s['accuracy']:.4f}", f"{s['intern_length']:.1f}", f"{s['total_length']:.1f}"])
             total_stats[0]['n'] += n
             total_stats[0]['correct'] += s['n_correct']
             if s['intern_length'] > 0:
                 total_lengths[0]['intern'].append(s['intern_length'])
+            if s['total_length'] > 0:
+                total_lengths[0]['total'].append(s['total_length'])
         else:
-            row.extend(["-", "-"])
+            row.extend(["-", "-", "-"])
 
         # T=100, 500, 1000
         for tokens in [100, 500, 1000]:
@@ -171,15 +180,18 @@ def summarize(data_dir: str, split: str = "test"):
                 s = stats[tokens]
                 row.extend([f"{s['accuracy']:.4f}",
                            f"{s['mentor_length']:.1f}" if s['mentor_length'] > 0 else "-",
-                           f"{s['intern_length']:.1f}" if s['intern_length'] > 0 else "-"])
+                           f"{s['intern_length']:.1f}" if s['intern_length'] > 0 else "-",
+                           f"{s['total_length']:.1f}" if s['total_length'] > 0 else "-"])
                 total_stats[tokens]['n'] += n
                 total_stats[tokens]['correct'] += s['n_correct']
                 if s['mentor_length'] > 0:
                     total_lengths[tokens]['mentor'].append(s['mentor_length'])
                 if s['intern_length'] > 0:
                     total_lengths[tokens]['intern'].append(s['intern_length'])
+                if s['total_length'] > 0:
+                    total_lengths[tokens]['total'].append(s['total_length'])
             else:
-                row.extend(["-", "-", "-"])
+                row.extend(["-", "-", "-", "-"])
 
         # Oracle
         if 'oracle' in stats:
@@ -201,17 +213,19 @@ def summarize(data_dir: str, split: str = "test"):
     if total_stats[-1]['n'] > 0:
         acc = total_stats[-1]['correct'] / total_stats[-1]['n']
         m_len = np.mean(total_lengths[-1]['mentor']) if total_lengths[-1]['mentor'] else 0
-        total_row.extend([f"{acc:.4f}", f"{m_len:.1f}" if m_len > 0 else "-"])
+        t_len = np.mean(total_lengths[-1]['total']) if total_lengths[-1]['total'] else 0
+        total_row.extend([f"{acc:.4f}", f"{m_len:.1f}" if m_len > 0 else "-", f"{t_len:.1f}" if t_len > 0 else "-"])
     else:
-        total_row.extend(["-", "-"])
+        total_row.extend(["-", "-", "-"])
 
     # T=0
     if total_stats[0]['n'] > 0:
         acc = total_stats[0]['correct'] / total_stats[0]['n']
         i_len = np.mean(total_lengths[0]['intern']) if total_lengths[0]['intern'] else 0
-        total_row.extend([f"{acc:.4f}", f"{i_len:.1f}" if i_len > 0 else "-"])
+        t_len = np.mean(total_lengths[0]['total']) if total_lengths[0]['total'] else 0
+        total_row.extend([f"{acc:.4f}", f"{i_len:.1f}" if i_len > 0 else "-", f"{t_len:.1f}" if t_len > 0 else "-"])
     else:
-        total_row.extend(["-", "-"])
+        total_row.extend(["-", "-", "-"])
 
     # T=100, 500, 1000
     for tokens in [100, 500, 1000]:
@@ -219,11 +233,13 @@ def summarize(data_dir: str, split: str = "test"):
             acc = total_stats[tokens]['correct'] / total_stats[tokens]['n']
             m_len = np.mean(total_lengths[tokens]['mentor']) if total_lengths[tokens]['mentor'] else 0
             i_len = np.mean(total_lengths[tokens]['intern']) if total_lengths[tokens]['intern'] else 0
+            t_len = np.mean(total_lengths[tokens]['total']) if total_lengths[tokens]['total'] else 0
             total_row.extend([f"{acc:.4f}",
                              f"{m_len:.1f}" if m_len > 0 else "-",
-                             f"{i_len:.1f}" if i_len > 0 else "-"])
+                             f"{i_len:.1f}" if i_len > 0 else "-",
+                             f"{t_len:.1f}" if t_len > 0 else "-"])
         else:
-            total_row.extend(["-", "-", "-"])
+            total_row.extend(["-", "-", "-", "-"])
 
     # Oracle
     if total_stats['oracle']['n'] > 0:
@@ -237,11 +253,11 @@ def summarize(data_dir: str, split: str = "test"):
     # 表头
     headers = [
         "Subset", "N",
-        "T-1(M)", "M_len",
-        "T0(I)", "I_len",
-        "T100", "T100_m", "T100_i",
-        "T500", "T500_m", "T500_i",
-        "T1000", "T1000_m", "T1000_i",
+        "T-1(M)", "M_len", "M_total",
+        "T0(I)", "I_len", "I_total",
+        "T100", "T100_m", "T100_i", "T100_total",
+        "T500", "T500_m", "T500_i", "T500_total",
+        "T1000", "T1000_m", "T1000_i", "T1000_total",
         "Oracle"
     ]
 
@@ -251,6 +267,7 @@ def summarize(data_dir: str, split: str = "test"):
     print("  T100/500/1000 = Mentor generates N tokens, then Intern continues")
     print("  Oracle = Best possible (if we knew which level to use)")
     print("  M_len/I_len = Average generation length (tokens)")
+    print("  *_total = Total length (mentor + intern, shows overall computational cost)")
 
 
 def main():
