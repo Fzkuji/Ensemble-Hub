@@ -171,7 +171,7 @@ DATASET_CONFIGS = {
         "extra_fields": [],
     },
     "aime24": {
-        "hf_path": "math-ai/aime_1983_2024",
+        "hf_path": "math-ai/aime24",
         "hf_subset": None,
         "splits": ["test"],  # Only test split
         "question_field": "problem",
@@ -181,7 +181,7 @@ DATASET_CONFIGS = {
         "extra_fields": [],
     },
     "aime25": {
-        "hf_path": "AI-MO/aimo-validation-aime",
+        "hf_path": "math-ai/aime25",
         "hf_subset": None,
         "splits": ["test"],  # Only test split
         "question_field": "problem",
