@@ -339,6 +339,12 @@ else
     DATA_SUBSETS=("${ALL_SUBSETS[@]}")
 fi
 
+# Build subset flag for data collection
+SUBSET_FLAG=""
+if [ -n "$TRAIN_SUBSET" ] && [ "$TRAIN_SUBSET" != "all" ]; then
+    SUBSET_FLAG="--subset $TRAIN_SUBSET"
+fi
+
 # Token levels: -1 = mentor only, 0 = intern only, others = mentor hint + intern
 TOKEN_LEVELS="-1,0,100,500,1000"
 
@@ -442,13 +448,13 @@ fi
 
 if [ "$FORCE" = true ]; then
     echo "Collecting train data (FORCE mode - will overwrite existing files)..."
-    python collect_data_vllm_think.py $MODEL_ARGS --split train --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $PROMPT_TYPE_FLAG $DATASET_FLAG $FORCE_DATA_FLAG
+    python collect_data_vllm_think.py $MODEL_ARGS --split train --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $PROMPT_TYPE_FLAG $DATASET_FLAG $SUBSET_FLAG $FORCE_DATA_FLAG
 elif [ ${#TRAIN_MISSING[@]} -eq 0 ]; then
     echo "Train data already exists for all subsets, skipping collection..."
 else
     echo "Missing train data for: ${TRAIN_MISSING[*]}"
     echo "Collecting train data (existing files will be skipped)..."
-    python collect_data_vllm_think.py $MODEL_ARGS --split train --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $PROMPT_TYPE_FLAG $DATASET_FLAG
+    python collect_data_vllm_think.py $MODEL_ARGS --split train --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $PROMPT_TYPE_FLAG $DATASET_FLAG $SUBSET_FLAG
 fi
 
 # Check if test data already exists (show which subsets are missing)
@@ -463,13 +469,13 @@ fi
 
 if [ "$FORCE" = true ]; then
     echo "Collecting test data (FORCE mode - will overwrite existing files)..."
-    python collect_data_vllm_think.py $MODEL_ARGS --split test --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $PROMPT_TYPE_FLAG $DATASET_FLAG $FORCE_DATA_FLAG
+    python collect_data_vllm_think.py $MODEL_ARGS --split test --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $PROMPT_TYPE_FLAG $DATASET_FLAG $SUBSET_FLAG $FORCE_DATA_FLAG
 elif [ ${#TEST_MISSING[@]} -eq 0 ]; then
     echo "Test data already exists for all subsets, skipping collection..."
 else
     echo "Missing test data for: ${TEST_MISSING[*]}"
     echo "Collecting test data (existing files will be skipped)..."
-    python collect_data_vllm_think.py $MODEL_ARGS --split test --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $PROMPT_TYPE_FLAG $DATASET_FLAG
+    python collect_data_vllm_think.py $MODEL_ARGS --split test --gpus $GPUS "--token-levels=$TOKEN_LEVELS" $THINK_FLAG $PROMPT_TYPE_FLAG $DATASET_FLAG $SUBSET_FLAG
 fi
 
 echo ""
