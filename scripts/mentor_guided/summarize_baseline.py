@@ -7,10 +7,28 @@
 import argparse
 import json
 import os
+import re
 import numpy as np
 from tabulate import tabulate
 
-TOKEN_LEVELS = [-1, 0, 100, 500, 1000]
+
+def detect_token_levels(data_dir: str, split: str = "test"):
+    """Auto-detect all available token levels from data directory."""
+    token_levels = set()
+
+    if not os.path.exists(data_dir):
+        return []
+
+    for name in os.listdir(data_dir):
+        subset_dir = os.path.join(data_dir, name, split)
+        if os.path.isdir(subset_dir):
+            # Find all tokens*.json files
+            for filename in os.listdir(subset_dir):
+                match = re.match(r'tokens(-?\d+)\.json', filename)
+                if match:
+                    token_levels.add(int(match.group(1)))
+
+    return sorted(token_levels)
 
 
 def detect_subsets(data_dir: str, split: str = "test"):
@@ -29,7 +47,7 @@ def detect_subsets(data_dir: str, split: str = "test"):
     return sorted(subsets)
 
 
-def compute_stats(data_dir: str, subset: str, split: str = "test"):
+def compute_stats(data_dir: str, subset: str, split: str = "test", token_levels=None):
     """计算单个子集的统计信息"""
     subset_dir = os.path.join(data_dir, subset, split)
 
@@ -38,7 +56,7 @@ def compute_stats(data_dir: str, subset: str, split: str = "test"):
 
     results = {}
 
-    for tokens in TOKEN_LEVELS:
+    for tokens in token_levels:
         filepath = os.path.join(subset_dir, f"tokens{tokens}.json")
         if not os.path.exists(filepath):
             continue
@@ -98,14 +116,14 @@ def compute_stats(data_dir: str, subset: str, split: str = "test"):
 
         # 加载所有数据
         all_data = {}
-        for tokens in TOKEN_LEVELS:
+        for tokens in token_levels:
             filepath = os.path.join(subset_dir, f"tokens{tokens}.json")
             if os.path.exists(filepath):
                 with open(filepath, 'r') as f:
                     all_data[tokens] = json.load(f)
 
         for i in range(n_samples):
-            for tokens in TOKEN_LEVELS:
+            for tokens in token_levels:
                 if tokens in all_data and all_data[tokens][i].get('is_correct', False):
                     oracle_correct += 1
                     break
@@ -121,67 +139,69 @@ def compute_stats(data_dir: str, subset: str, split: str = "test"):
 def summarize(data_dir: str, split: str = "test"):
     """汇总所有子集的结果"""
     subsets = detect_subsets(data_dir, split)
+    token_levels = detect_token_levels(data_dir, split)
 
     if not subsets:
         print(f"No subsets found in {data_dir}")
         return
 
+    if not token_levels:
+        print(f"No token level data found in {data_dir}")
+        return
+
     print(f"\n**Baseline Results Summary** ({split} split)")
-    print(f"Data: {data_dir}\n")
+    print(f"Data: {data_dir}")
+    print(f"Token levels: {token_levels}\n")
 
     # 准备表格数据
     table_data = []
 
     # 统计变量
-    total_stats = {tokens: {'n': 0, 'correct': 0} for tokens in TOKEN_LEVELS}
+    total_stats = {tokens: {'n': 0, 'correct': 0} for tokens in token_levels}
     total_stats['oracle'] = {'n': 0, 'correct': 0}
-    total_lengths = {tokens: {'mentor': [], 'intern': [], 'total': []} for tokens in TOKEN_LEVELS}
+    total_lengths = {tokens: {'mentor': [], 'intern': [], 'total': []} for tokens in token_levels}
 
     for subset in subsets:
-        stats = compute_stats(data_dir, subset, split)
+        stats = compute_stats(data_dir, subset, split, token_levels)
 
         if not stats:
-            table_data.append([subset] + ["-"] * 20)  # Updated column count
+            # Calculate number of columns needed
+            num_cols = 2 + sum(4 if t > 0 else 3 for t in token_levels) + 1
+            table_data.append([subset] + ["-"] * num_cols)
             continue
 
-        n = stats[0]['n_samples'] if 0 in stats else 0
-
+        # Get sample count
+        n = next((stats[t]['n_samples'] for t in token_levels if t in stats), 0)
         row = [subset, n]
 
-        # T=-1 (Mentor only)
-        if -1 in stats:
-            s = stats[-1]
-            row.extend([f"{s['accuracy']:.4f}", f"{s['mentor_length']:.1f}", f"{s['total_length']:.1f}"])
-            total_stats[-1]['n'] += n
-            total_stats[-1]['correct'] += s['n_correct']
-            if s['mentor_length'] > 0:
-                total_lengths[-1]['mentor'].append(s['mentor_length'])
-            if s['total_length'] > 0:
-                total_lengths[-1]['total'].append(s['total_length'])
-        else:
-            row.extend(["-", "-", "-"])
-
-        # T=0 (Intern only)
-        if 0 in stats:
-            s = stats[0]
-            row.extend([f"{s['accuracy']:.4f}", f"{s['intern_length']:.1f}", f"{s['total_length']:.1f}"])
-            total_stats[0]['n'] += n
-            total_stats[0]['correct'] += s['n_correct']
-            if s['intern_length'] > 0:
-                total_lengths[0]['intern'].append(s['intern_length'])
-            if s['total_length'] > 0:
-                total_lengths[0]['total'].append(s['total_length'])
-        else:
-            row.extend(["-", "-", "-"])
-
-        # T=100, 500, 1000
-        for tokens in [100, 500, 1000]:
+        # Add stats for each token level
+        for tokens in token_levels:
             if tokens in stats:
                 s = stats[tokens]
-                row.extend([f"{s['accuracy']:.4f}",
-                           f"{s['mentor_length']:.1f}" if s['mentor_length'] > 0 else "-",
-                           f"{s['intern_length']:.1f}" if s['intern_length'] > 0 else "-",
-                           f"{s['total_length']:.1f}" if s['total_length'] > 0 else "-"])
+                if tokens == -1:
+                    # Mentor-only: show accuracy, mentor length, total
+                    row.extend([
+                        f"{s['accuracy']:.4f}",
+                        f"{s['mentor_length']:.1f}",
+                        f"{s['total_length']:.1f}"
+                    ])
+                elif tokens == 0:
+                    # Intern-only: show accuracy, intern length, total
+                    row.extend([
+                        f"{s['accuracy']:.4f}",
+                        f"{s['intern_length']:.1f}",
+                        f"{s['total_length']:.1f}"
+                    ])
+                else:
+                    # Collaboration: show accuracy, mentor length, intern length, total
+                    row.extend([
+                        f"{s['accuracy']:.4f}",
+                        f"{s['mentor_length']:.1f}" if s['mentor_length'] > 0 else "-",
+                        f"{s['intern_length']:.1f}" if s['intern_length'] > 0 else "-",
+                        f"{s['total_length']:.1f}" if s['total_length'] > 0 else "-"
+                    ])
+
+                # Update totals
                 total_stats[tokens]['n'] += n
                 total_stats[tokens]['correct'] += s['n_correct']
                 if s['mentor_length'] > 0:
@@ -191,7 +211,11 @@ def summarize(data_dir: str, split: str = "test"):
                 if s['total_length'] > 0:
                     total_lengths[tokens]['total'].append(s['total_length'])
             else:
-                row.extend(["-", "-", "-", "-"])
+                # Missing data
+                if tokens == -1 or tokens == 0:
+                    row.extend(["-", "-", "-"])
+                else:
+                    row.extend(["-", "-", "-", "-"])
 
         # Oracle
         if 'oracle' in stats:
@@ -204,42 +228,42 @@ def summarize(data_dir: str, split: str = "test"):
 
         table_data.append(row)
 
-    # TOTAL 行
+    # TOTAL row
     total_row = ["TOTAL"]
-    total_n = total_stats[0]['n'] if 0 in total_stats and total_stats[0]['n'] > 0 else sum(s['n'] for s in total_stats.values() if isinstance(s, dict) and 'n' in s) // len(TOKEN_LEVELS)
+    total_n = next((total_stats[t]['n'] for t in token_levels if total_stats[t]['n'] > 0), 0)
     total_row.append(total_n)
 
-    # T=-1
-    if total_stats[-1]['n'] > 0:
-        acc = total_stats[-1]['correct'] / total_stats[-1]['n']
-        m_len = np.mean(total_lengths[-1]['mentor']) if total_lengths[-1]['mentor'] else 0
-        t_len = np.mean(total_lengths[-1]['total']) if total_lengths[-1]['total'] else 0
-        total_row.extend([f"{acc:.4f}", f"{m_len:.1f}" if m_len > 0 else "-", f"{t_len:.1f}" if t_len > 0 else "-"])
-    else:
-        total_row.extend(["-", "-", "-"])
-
-    # T=0
-    if total_stats[0]['n'] > 0:
-        acc = total_stats[0]['correct'] / total_stats[0]['n']
-        i_len = np.mean(total_lengths[0]['intern']) if total_lengths[0]['intern'] else 0
-        t_len = np.mean(total_lengths[0]['total']) if total_lengths[0]['total'] else 0
-        total_row.extend([f"{acc:.4f}", f"{i_len:.1f}" if i_len > 0 else "-", f"{t_len:.1f}" if t_len > 0 else "-"])
-    else:
-        total_row.extend(["-", "-", "-"])
-
-    # T=100, 500, 1000
-    for tokens in [100, 500, 1000]:
+    for tokens in token_levels:
         if total_stats[tokens]['n'] > 0:
             acc = total_stats[tokens]['correct'] / total_stats[tokens]['n']
             m_len = np.mean(total_lengths[tokens]['mentor']) if total_lengths[tokens]['mentor'] else 0
             i_len = np.mean(total_lengths[tokens]['intern']) if total_lengths[tokens]['intern'] else 0
             t_len = np.mean(total_lengths[tokens]['total']) if total_lengths[tokens]['total'] else 0
-            total_row.extend([f"{acc:.4f}",
-                             f"{m_len:.1f}" if m_len > 0 else "-",
-                             f"{i_len:.1f}" if i_len > 0 else "-",
-                             f"{t_len:.1f}" if t_len > 0 else "-"])
+
+            if tokens == -1:
+                total_row.extend([
+                    f"{acc:.4f}",
+                    f"{m_len:.1f}" if m_len > 0 else "-",
+                    f"{t_len:.1f}" if t_len > 0 else "-"
+                ])
+            elif tokens == 0:
+                total_row.extend([
+                    f"{acc:.4f}",
+                    f"{i_len:.1f}" if i_len > 0 else "-",
+                    f"{t_len:.1f}" if t_len > 0 else "-"
+                ])
+            else:
+                total_row.extend([
+                    f"{acc:.4f}",
+                    f"{m_len:.1f}" if m_len > 0 else "-",
+                    f"{i_len:.1f}" if i_len > 0 else "-",
+                    f"{t_len:.1f}" if t_len > 0 else "-"
+                ])
         else:
-            total_row.extend(["-", "-", "-", "-"])
+            if tokens == -1 or tokens == 0:
+                total_row.extend(["-", "-", "-"])
+            else:
+                total_row.extend(["-", "-", "-", "-"])
 
     # Oracle
     if total_stats['oracle']['n'] > 0:
@@ -250,21 +274,23 @@ def summarize(data_dir: str, split: str = "test"):
 
     table_data.append(total_row)
 
-    # 表头
-    headers = [
-        "Subset", "N",
-        "T-1(M)", "M_len", "M_total",
-        "T0(I)", "I_len", "I_total",
-        "T100", "T100_m", "T100_i", "T100_total",
-        "T500", "T500_m", "T500_i", "T500_total",
-        "T1000", "T1000_m", "T1000_i", "T1000_total",
-        "Oracle"
-    ]
+    # Generate headers dynamically
+    headers = ["Subset", "N"]
+
+    for tokens in token_levels:
+        if tokens == -1:
+            headers.extend(["T-1(M)", "M_len", "M_total"])
+        elif tokens == 0:
+            headers.extend(["T0(I)", "I_len", "I_total"])
+        else:
+            headers.extend([f"T{tokens}", f"T{tokens}_m", f"T{tokens}_i", f"T{tokens}_total"])
+
+    headers.append("Oracle")
 
     print(tabulate(table_data, headers=headers, tablefmt="pipe", numalign="right", stralign="left"))
     print("\nLegend:")
     print("  T-1 = Mentor only, T0 = Intern only")
-    print("  T100/500/1000 = Mentor generates N tokens, then Intern continues")
+    print("  T<N> = Mentor generates N tokens, then Intern continues")
     print("  Oracle = Best possible (if we knew which level to use)")
     print("  M_len/I_len = Average generation length (tokens)")
     print("  *_total = Total length (mentor + intern, shows overall computational cost)")
