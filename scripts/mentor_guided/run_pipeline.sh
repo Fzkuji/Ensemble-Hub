@@ -33,6 +33,7 @@
 #   --mlp-checkpoint PATH Path to MLP checkpoint for cross-dataset evaluation (skips training)
 #   --ppl-checkpoint PATH Path to PPL checkpoint for cross-dataset evaluation (skips training)
 #   --lora-checkpoint PATH Path to LoRA checkpoint for cross-dataset evaluation (skips training)
+#   --token-levels LEVELS Comma-separated token levels (default: -1,0,100,500,1000)
 #
 # Examples:
 #   ./run_pipeline.sh --think                                    # Think mode, 8 GPUs, all subsets
@@ -94,6 +95,7 @@ METHODS="mlp,ppl,lora,ensemble"  # Default: run all methods
 MLP_CHECKPOINT=""  # Path to MLP checkpoint for cross-dataset evaluation
 PPL_CHECKPOINT=""  # Path to PPL checkpoint for cross-dataset evaluation
 LORA_CHECKPOINT=""  # Path to LoRA checkpoint for cross-dataset evaluation
+TOKEN_LEVELS_ARG=""  # Custom token levels (e.g., "-1,0,100,200,300,400,500,600,800,1000")
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -216,6 +218,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --lora-checkpoint)
             LORA_CHECKPOINT="$2"
+            shift 2
+            ;;
+        --token-levels)
+            TOKEN_LEVELS_ARG="$2"
             shift 2
             ;;
         *)
@@ -347,7 +353,11 @@ if [ -n "$TRAIN_SUBSET" ] && [ "$TRAIN_SUBSET" != "all" ]; then
 fi
 
 # Token levels: -1 = mentor only, 0 = intern only, others = mentor hint + intern
-TOKEN_LEVELS="-1,0,100,500,1000"
+if [ -n "$TOKEN_LEVELS_ARG" ]; then
+    TOKEN_LEVELS="$TOKEN_LEVELS_ARG"
+else
+    TOKEN_LEVELS="-1,0,100,500,1000"
+fi
 
 # Parse GPU count
 IFS=',' read -ra GPU_ARRAY <<< "$GPUS"
@@ -505,6 +515,7 @@ SKIP_EPOCH_CASCADE_FLAG=""
 if [ "$SKIP_EPOCH_CASCADE" = true ]; then
     SKIP_EPOCH_CASCADE_FLAG="--skip-epoch-cascade"
 fi
+TOKEN_LEVELS_FLAG="--token-levels $TOKEN_LEVELS"
 
 echo ""
 echo "========== Step 3: Train MLP Classifiers =========="
@@ -528,7 +539,7 @@ if [ "$RUN_MLP" = true ]; then
         CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
             --ddp $EVAL_FLAG --data-dir $DATA_DIR \
             --load-checkpoint "$MLP_CHECKPOINT" --eval-only \
-            --pooling $POOLING
+            --pooling $POOLING $TOKEN_LEVELS_FLAG
     elif [ -n "$TRAIN_SUBSET" ]; then
         # Specific train subset specified
         if [ "$TRAIN_SUBSET" = "all" ]; then
@@ -545,7 +556,7 @@ if [ "$RUN_MLP" = true ]; then
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
                 --ddp --train-subset $TRAIN_SUBSET --eval-subset $EVAL_SUBSET --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
                 --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
-                --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG $SKIP_EPOCH_CASCADE_FLAG
+                --pooling $POOLING --dropout $DROPOUT $TOKEN_LEVELS_FLAG $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG $SKIP_EPOCH_CASCADE_FLAG
         fi
     else
         # No train subset specified - train each subset individually
@@ -557,7 +568,7 @@ if [ "$RUN_MLP" = true ]; then
                 CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_mlp_classifier.py \
                     --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR --lr $LR --epochs $EPOCHS \
                     --batch-size $BATCH_SIZE --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK \
-                    --pooling $POOLING --dropout $DROPOUT $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG $SKIP_EPOCH_CASCADE_FLAG
+                    --pooling $POOLING --dropout $DROPOUT $TOKEN_LEVELS_FLAG $FILTER_FLAG $NO_VAL_FLAG $FIXED_THRESHOLD_FLAG $UNFILTERED_VAL_FLAG $SKIP_EPOCH_CASCADE_FLAG
             fi
         done
     fi
@@ -581,7 +592,7 @@ if [ "$RUN_PPL" = true ]; then
         else
             echo ">>> Training PPL: train=$TRAIN_SUBSET, eval=$EVAL_SUBSET (no_val=$NO_VAL)"
             CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_ppl_classifier.py \
-                --ddp --train-subset $TRAIN_SUBSET --eval-subset $EVAL_SUBSET --data-dir $DATA_DIR $NO_VAL_FLAG
+                --ddp --train-subset $TRAIN_SUBSET --eval-subset $EVAL_SUBSET --data-dir $DATA_DIR $TOKEN_LEVELS_FLAG $NO_VAL_FLAG
         fi
     else
         # No train subset specified - train each subset individually
@@ -591,7 +602,7 @@ if [ "$RUN_PPL" = true ]; then
             else
                 echo ">>> Training PPL: $subset (no_val=$NO_VAL)"
                 CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS train_ppl_classifier.py \
-                    --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR $NO_VAL_FLAG
+                    --ddp --train-subset $subset --eval-subset $subset --data-dir $DATA_DIR $TOKEN_LEVELS_FLAG $NO_VAL_FLAG
             fi
         done
     fi
@@ -638,7 +649,7 @@ if [ "$RUN_LORA" = true ]; then
                 echo ">>> Training LoRA: train=all, eval=$EVAL_SUBSET"
                 CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
                     --ddp --subset all --eval-subset "$EVAL_SUBSET" --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
-                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $TOKEN_LEVELS_FLAG $NO_VAL_FLAG
             fi
         else
             LORA_MODEL_DIR="$TRAIN_SUBSET"
@@ -648,7 +659,7 @@ if [ "$RUN_LORA" = true ]; then
                 echo ">>> Training LoRA: $TRAIN_SUBSET"
                 CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
                     --ddp --subset $TRAIN_SUBSET --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
-                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $TOKEN_LEVELS_FLAG $NO_VAL_FLAG
             fi
         fi
     else
@@ -660,7 +671,7 @@ if [ "$RUN_LORA" = true ]; then
                 echo ">>> Training LoRA: $subset"
                 CUDA_VISIBLE_DEVICES=$GPUS torchrun --nproc_per_node=$NUM_GPUS --master_port=29505 train_lora_classifier.py \
                     --ddp --subset $subset --data-dir $DATA_DIR --epochs $EPOCHS --batch-size $BATCH_SIZE \
-                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $NO_VAL_FLAG
+                    --reserve-memory $RESERVE_MEMORY --memory-lock $MEMORY_LOCK $TOKEN_LEVELS_FLAG $NO_VAL_FLAG
             fi
         done
     fi

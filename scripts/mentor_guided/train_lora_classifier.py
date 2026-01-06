@@ -726,8 +726,14 @@ def main():
                         help="Batch size for cascade evaluation (default: 16)")
     parser.add_argument("--pooling", type=str, default="mean_logits",
                         help="Pooling strategy: mean_logits (per-token classify then average logits)")
+    parser.add_argument("--token-levels", type=str, default="0,100,500,1000",
+                        help="Comma-separated list of token levels to use (default: 0,100,500,1000)")
 
     args = parser.parse_args()
+
+    # Parse token levels
+    global TOKEN_LEVELS
+    TOKEN_LEVELS = [int(x.strip()) for x in args.token_levels.split(',')]
 
     # Setup distributed training first (needed to determine device for memory locking)
     rank, world_size, local_rank = setup_distributed()

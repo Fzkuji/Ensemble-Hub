@@ -542,8 +542,14 @@ def main():
                         help="Pre-allocate GPU memory in GB to prevent others from using it (released after model load)")
     parser.add_argument("--memory-lock", type=float, default=0,
                         help="Lock GPU memory at this fraction (0.0-1.0, e.g., 0.9 for 90%%). Keeps memory occupied throughout training.")
+    parser.add_argument("--token-levels", type=str, default="0,100,500,1000",
+                        help="Comma-separated list of token levels to use (default: 0,100,500,1000)")
 
     args = parser.parse_args()
+
+    # Parse token levels
+    global TOKEN_LEVELS
+    TOKEN_LEVELS = [int(x.strip()) for x in args.token_levels.split(',')]
 
     # Handle legacy --subset argument
     if args.train_subset is None and args.subset is not None:

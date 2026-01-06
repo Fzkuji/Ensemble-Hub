@@ -637,8 +637,16 @@ def main():
                         help="Path to checkpoint (best_model.pt) to load for evaluation on different dataset")
     parser.add_argument("--eval-only", action="store_true",
                         help="Only evaluate using loaded checkpoint, skip training")
+    parser.add_argument("--token-levels", type=str, default="0,100,500,1000",
+                        help="Comma-separated list of token levels to use (default: 0,100,500,1000)")
 
     args = parser.parse_args()
+
+    # Parse token levels
+    global TOKEN_LEVELS
+    TOKEN_LEVELS = [int(x.strip()) for x in args.token_levels.split(',')]
+    if is_main_process():
+        logger.info(f"Using token levels: {TOKEN_LEVELS}")
 
     # Handle subset arguments: --subset sets both, individual args override
     if args.subset is not None:
