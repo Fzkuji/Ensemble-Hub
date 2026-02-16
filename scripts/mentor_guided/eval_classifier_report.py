@@ -691,10 +691,17 @@ def main():
 
         # Also check for unified "all" model
         if not os.path.exists(model_dir):
-            model_dir = os.path.join(args.data_dir, "all", model_dir_name)
-        if not os.path.exists(model_dir):
-            logger.warning(f"No model found for {subset} at {model_dir}, skipping.")
-            continue
+            alt_model_dir = os.path.join(args.data_dir, "all", model_dir_name)
+            if os.path.exists(alt_model_dir):
+                model_dir = alt_model_dir
+            else:
+                logger.warning(
+                    f"No model found for {subset}, checked:\n"
+                    f"  1) {os.path.join(subset_dir, model_dir_name)}\n"
+                    f"  2) {alt_model_dir}\n"
+                    f"  Skipping."
+                )
+                continue
 
         data = load_json_data(subset_dir, split=args.split)
         if data is None:
@@ -905,6 +912,15 @@ def main():
                 break  # Only need one model for feature importance
 
     # Save JSON report
+    if not all_results:
+        logger.error(
+            "No subsets were evaluated. Check that:\n"
+            f"  1) --data-dir points to the correct directory (got: {args.data_dir})\n"
+            f"  2) Trained {args.classifier} classifiers exist in {{subset}}/{model_dir_name}/ or all/{model_dir_name}/\n"
+            f"  3) Test data exists in {{subset}}/{args.split}/tokens*.json"
+        )
+        return
+
     output_path = args.output or os.path.join(args.data_dir, f"{args.classifier}_classifier_report.json")
     # Convert numpy types for JSON serialization
     def convert(obj):
@@ -916,6 +932,7 @@ def main():
             return obj.tolist()
         return obj
 
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(all_results, f, indent=2, default=convert)
     logger.info(f"\nFull report saved to {output_path}")
