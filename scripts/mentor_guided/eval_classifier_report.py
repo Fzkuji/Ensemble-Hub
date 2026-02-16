@@ -17,21 +17,15 @@ Usage:
         --classifier ppl \
         --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 
-    # Evaluate MLP classifier on all subsets
+    # Use pre-saved predictions from train_ppl_classifier.py (NO GPU needed)
     python eval_classifier_report.py \
         --data-dir /path/to/hendrycks_math_split \
-        --classifier mlp \
-        --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+        --from-saved
 
     # Evaluate on a single subset
     python eval_classifier_report.py \
         --data-dir /path/to/hendrycks_math_split \
         --classifier ppl --subset algebra
-
-    # Use pre-saved results (no GPU needed) — reads results.json
-    python eval_classifier_report.py \
-        --data-dir /path/to/hendrycks_math_split \
-        --from-saved
 """
 
 import argparse
@@ -575,7 +569,7 @@ def print_feature_importance(fi: Dict[str, float], top_n: int = 15):
 
 def evaluate_subset(
     subset: str,
-    data: Dict[int, List[Dict]],
+    data: Optional[Dict[int, List[Dict]]],
     probs: np.ndarray,
     gt: np.ndarray,
 ) -> Dict:
@@ -614,23 +608,24 @@ def evaluate_subset(
 
     # 5) Stage distribution by difficulty (if available)
     diff_dist = {}
-    difficulties = []
-    for i in range(n_samples):
-        d = parse_difficulty(data[TOKEN_LEVELS[0]][i])
-        difficulties.append(d)
+    if data and TOKEN_LEVELS[0] in data:
+        difficulties = []
+        for i in range(min(n_samples, len(data[TOKEN_LEVELS[0]]))):
+            d = parse_difficulty(data[TOKEN_LEVELS[0]][i])
+            difficulties.append(d)
 
-    if any(d is not None for d in difficulties):
-        for level in DIFFICULTY_LEVELS:
-            indices = [i for i, d in enumerate(difficulties) if d == level]
-            if indices:
-                sub_decisions = decisions[indices]
-                sub_gt = gt[indices]
-                sub_correct = float(np.mean([sub_gt[j, sub_decisions[j]] for j in range(len(indices))]))
-                diff_dist[level] = {
-                    "n_samples": len(indices),
-                    "stage_distribution": compute_stage_distribution(sub_decisions, n_stages),
-                    "cascade_accuracy": sub_correct,
-                }
+        if any(d is not None for d in difficulties):
+            for level in DIFFICULTY_LEVELS:
+                indices = [i for i, d in enumerate(difficulties) if d == level]
+                if indices:
+                    sub_decisions = decisions[indices]
+                    sub_gt = gt[indices]
+                    sub_correct = float(np.mean([sub_gt[j, sub_decisions[j]] for j in range(len(indices))]))
+                    diff_dist[level] = {
+                        "n_samples": len(indices),
+                        "stage_distribution": compute_stage_distribution(sub_decisions, n_stages),
+                        "cascade_accuracy": sub_correct,
+                    }
 
     return {
         "subset": subset,
@@ -669,6 +664,10 @@ def main():
     parser.add_argument("--output", type=str, default=None,
                         help="Output JSON path (default: data_dir/classifier_report.json)")
     parser.add_argument("--no-latex", action="store_true", help="Skip LaTeX output")
+    parser.add_argument("--from-saved", action="store_true",
+                        help="Load pre-saved predictions from train_ppl_classifier.py (no GPU needed)")
+    parser.add_argument("--model-dir-pattern", type=str, default=None,
+                        help="Glob pattern to find model dirs (e.g., 'ppl_model' or 'all/ppl_model')")
 
     args = parser.parse_args()
 
@@ -685,39 +684,85 @@ def main():
     agg_decisions_list = []
     agg_data_list = []
 
+    # Auto-detect subsets from data directory
+    if not args.subset:
+        detected = [d for d in os.listdir(args.data_dir)
+                     if os.path.isdir(os.path.join(args.data_dir, d))
+                     and d not in ("all", "all_test", "__pycache__")]
+        if detected:
+            eval_subsets = sorted(detected)
+            logger.info(f"Auto-detected subsets: {eval_subsets}")
+
     for subset in eval_subsets:
         subset_dir = os.path.join(args.data_dir, subset)
-        model_dir = os.path.join(subset_dir, model_dir_name)
 
-        # Also check for unified "all" model
-        if not os.path.exists(model_dir):
-            alt_model_dir = os.path.join(args.data_dir, "all", model_dir_name)
-            if os.path.exists(alt_model_dir):
-                model_dir = alt_model_dir
-            else:
+        if args.from_saved:
+            # --from-saved mode: load pre-computed predictions from train_ppl_classifier.py
+            # Search multiple possible locations for test_predictions_{subset}.npz
+            pred_file = None
+            search_paths = [
+                os.path.join(subset_dir, model_dir_name, f"test_predictions_{subset}.npz"),
+                os.path.join(args.data_dir, "all", model_dir_name, f"test_predictions_{subset}.npz"),
+                # Also check if trained per-subset and saved there
+                os.path.join(subset_dir, model_dir_name, "test_predictions.npz"),
+            ]
+            for p in search_paths:
+                if os.path.exists(p):
+                    pred_file = p
+                    break
+
+            if pred_file is None:
                 logger.warning(
-                    f"No model found for {subset}, checked:\n"
-                    f"  1) {os.path.join(subset_dir, model_dir_name)}\n"
-                    f"  2) {alt_model_dir}\n"
-                    f"  Skipping."
+                    f"No saved predictions for {subset}, checked:\n"
+                    + "\n".join(f"  - {p}" for p in search_paths)
+                    + "\n  Skipping. Run train_ppl_classifier.py first."
                 )
                 continue
 
-        data = load_json_data(subset_dir, split=args.split)
-        if data is None:
-            logger.warning(f"No {args.split} data for {subset}, skipping.")
-            continue
+            logger.info(f"Loading saved predictions from {pred_file}")
+            saved = np.load(pred_file)
+            probs = saved["probs"]
+            gt = saved["gt"]
+            n_samples = probs.shape[0]
 
-        n_samples = len(data[TOKEN_LEVELS[0]])
-        logger.info(f"Evaluating {subset} ({n_samples} samples, classifier={args.classifier}) ...")
+            # Load JSON data for difficulty parsing (optional, non-fatal)
+            data = load_json_data(subset_dir, split=args.split)
 
-        # Get predictions
-        if args.classifier == "ppl":
-            probs, gt = get_predictions_ppl(data, model_dir, args.model_path, args.device, args.max_length)
-        elif args.classifier == "mlp":
-            probs, gt = get_predictions_mlp(data, model_dir, args.model_path, args.device, args.max_length)
         else:
-            raise ValueError(f"Unsupported classifier: {args.classifier}")
+            # Live inference mode: extract features using GPU
+            model_dir = os.path.join(subset_dir, model_dir_name)
+
+            # Also check for unified "all" model
+            if not os.path.exists(model_dir):
+                alt_model_dir = os.path.join(args.data_dir, "all", model_dir_name)
+                if os.path.exists(alt_model_dir):
+                    model_dir = alt_model_dir
+                else:
+                    logger.warning(
+                        f"No model found for {subset}, checked:\n"
+                        f"  1) {os.path.join(subset_dir, model_dir_name)}\n"
+                        f"  2) {alt_model_dir}\n"
+                        f"  Skipping."
+                    )
+                    continue
+
+            data = load_json_data(subset_dir, split=args.split)
+            if data is None:
+                logger.warning(f"No {args.split} data for {subset}, skipping.")
+                continue
+
+            n_samples = len(data[TOKEN_LEVELS[0]])
+            logger.info(f"Evaluating {subset} ({n_samples} samples, classifier={args.classifier}) ...")
+
+            # Get predictions
+            if args.classifier == "ppl":
+                probs, gt = get_predictions_ppl(data, model_dir, args.model_path, args.device, args.max_length)
+            elif args.classifier == "mlp":
+                probs, gt = get_predictions_mlp(data, model_dir, args.model_path, args.device, args.max_length)
+            else:
+                raise ValueError(f"Unsupported classifier: {args.classifier}")
+
+        n_samples = probs.shape[0]
 
         result = evaluate_subset(subset, data, probs, gt)
         all_results[subset] = result
@@ -725,7 +770,8 @@ def main():
 
         agg_probs_list.append(probs)
         agg_gt_list.append(gt)
-        agg_data_list.extend([data[TOKEN_LEVELS[0]][i] for i in range(n_samples)])
+        if data:
+            agg_data_list.extend([data[TOKEN_LEVELS[0]][i] for i in range(len(data[TOKEN_LEVELS[0]]))])
 
         # Per-subset output
         print_section(f"Results: {subset} (N={n_samples})")
@@ -879,8 +925,8 @@ def main():
                 print(r"\end{tabular}")
                 print(r"\end{table}")
 
-    # Feature importance (PPL only)
-    if args.classifier == "ppl":
+    # Feature importance (PPL only, also works in --from-saved mode)
+    if args.classifier == "ppl" or args.from_saved:
         # Try per-subset or unified model
         for subset in eval_subsets:
             model_dir = os.path.join(args.data_dir, subset, model_dir_name)
@@ -913,15 +959,24 @@ def main():
 
     # Save JSON report
     if not all_results:
-        logger.error(
-            "No subsets were evaluated. Check that:\n"
-            f"  1) --data-dir points to the correct directory (got: {args.data_dir})\n"
-            f"  2) Trained {args.classifier} classifiers exist in {{subset}}/{model_dir_name}/ or all/{model_dir_name}/\n"
-            f"  3) Test data exists in {{subset}}/{args.split}/tokens*.json"
-        )
+        if args.from_saved:
+            logger.error(
+                "No subsets were evaluated. Check that:\n"
+                f"  1) --data-dir points to the correct directory (got: {args.data_dir})\n"
+                f"  2) test_predictions_{{subset}}.npz files exist in {{subset}}/{model_dir_name}/ or all/{model_dir_name}/\n"
+                f"  Run train_ppl_classifier.py first to generate predictions."
+            )
+        else:
+            logger.error(
+                "No subsets were evaluated. Check that:\n"
+                f"  1) --data-dir points to the correct directory (got: {args.data_dir})\n"
+                f"  2) Trained {args.classifier} classifiers exist in {{subset}}/{model_dir_name}/ or all/{model_dir_name}/\n"
+                f"  3) Test data exists in {{subset}}/{args.split}/tokens*.json"
+            )
         return
 
-    output_path = args.output or os.path.join(args.data_dir, f"{args.classifier}_classifier_report.json")
+    report_name = "saved" if args.from_saved else args.classifier
+    output_path = args.output or os.path.join(args.data_dir, f"{report_name}_classifier_report.json")
     # Convert numpy types for JSON serialization
     def convert(obj):
         if isinstance(obj, (np.integer,)):

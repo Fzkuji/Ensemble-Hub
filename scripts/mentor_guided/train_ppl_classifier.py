@@ -940,6 +940,16 @@ def main():
 
             logger.info(f"  Test Cascade Accuracy: {test_cascade_acc:.4f} (Oracle: {test_detailed['oracle']:.4f})")
 
+            # Save per-sample predictions for detailed evaluation (eval_classifier_report.py --from-saved)
+            n_test = len(X_test) // len(TOKEN_LEVELS)
+            X_test_scaled = scaler.transform(X_test)
+            test_probs = clf.predict_proba(X_test_scaled)[:, 1].reshape(n_test, len(TOKEN_LEVELS))
+            test_gt = y_test.reshape(n_test, len(TOKEN_LEVELS))
+            pred_path = os.path.join(args.output_dir, f"test_predictions_{eval_sub}.npz")
+            np.savez(pred_path, probs=test_probs, gt=test_gt, thresholds=thresholds,
+                     token_levels=TOKEN_LEVELS)
+            logger.info(f"  Test predictions saved to {pred_path}")
+
             test_results_per_subset[eval_sub] = {
                 'cascade_acc': test_cascade_acc,
                 'oracle_acc': test_detailed['oracle'],
