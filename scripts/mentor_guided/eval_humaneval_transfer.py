@@ -2,22 +2,19 @@
 """
 Evaluate MATH-trained PPL Classifier on HumanEval (Cross-Domain Transfer)
 
+DESIGN NOTE: HumanEval has NO train/test split in our pipeline.
+The classifier is trained on MATH data and evaluated on the full HumanEval set
+(164 problems) for cross-domain transfer. No HumanEval splitting is needed.
+
 Loads the PPL classifier trained on MATH data, extracts distributional features
 from HumanEval collected data using a HuggingFace model, and evaluates whether
 the classifier generalizes across domains.
 
 Usage:
-    # After collecting HumanEval data with collect_humaneval_vllm.py:
     python eval_humaneval_transfer.py \
         --math-model-dir /path/to/hendrycks_math_split/all/ppl_model \
-        --humaneval-data-dir /path/to/humaneval_collected/humaneval/test \
+        --humaneval-data-dir /path/to/humaneval_collected/humaneval \
         --hf-model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-
-    # Use specific math subset's classifier
-    python eval_humaneval_transfer.py \
-        --math-model-dir /path/to/hendrycks_math_split/algebra/ppl_model \
-        --humaneval-data-dir /path/to/humaneval_collected/humaneval/test \
-        --hf-model /path/to/local/model
 """
 
 import argparse

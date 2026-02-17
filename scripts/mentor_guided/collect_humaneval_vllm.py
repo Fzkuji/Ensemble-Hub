@@ -2,6 +2,10 @@
 """
 HumanEval Post-Processing: Re-evaluate correctness via code execution.
 
+DESIGN NOTE: HumanEval has NO train/test split in our pipeline.
+The classifier is trained on MATH data and evaluated on the full HumanEval set
+(164 problems) for cross-domain transfer. No HumanEval splitting is needed.
+
 After collecting HumanEval data with collect_data_vllm_think.py --dataset humaneval,
 the is_correct field uses the math grader (wrong for code). This script fixes it
 by extracting code from responses and running HumanEval test cases.
@@ -9,18 +13,12 @@ by extracting code from responses and running HumanEval test cases.
 Usage:
     # Re-evaluate correctness for collected HumanEval data
     python collect_humaneval_vllm.py --reeval \
-        --data-dir ../../data/acte_experiments/collected/humaneval_think_model/humaneval/test
+        --data-dir ../../data/acte_experiments/collected/humaneval_think_model/humaneval
 
     # Re-evaluate with custom timeout
     python collect_humaneval_vllm.py --reeval \
-        --data-dir ../../data/acte_experiments/collected/humaneval_think_model/humaneval/test \
+        --data-dir ../../data/acte_experiments/collected/humaneval_think_model/humaneval \
         --exec-timeout 15
-
-    # Re-evaluate both train and test splits
-    python collect_humaneval_vllm.py --reeval \
-        --data-dir ../../data/acte_experiments/collected/humaneval_think_model/humaneval/train
-    python collect_humaneval_vllm.py --reeval \
-        --data-dir ../../data/acte_experiments/collected/humaneval_think_model/humaneval/test
 """
 
 import argparse

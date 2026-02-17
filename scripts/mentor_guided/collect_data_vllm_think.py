@@ -770,39 +770,42 @@ def load_gsm8k(split: str = "test") -> List[Dict[str, Any]]:
     return data
 
 
-def load_humaneval(split: str = "test") -> List[Dict[str, Any]]:
-    """Load HumanEval dataset from local JSON files.
+def load_humaneval() -> List[Dict[str, Any]]:
+    """Load the full HumanEval dataset (no train/test split).
 
-    Args:
-        split: "train" or "test"
+    HumanEval is used purely as an evaluation target for cross-domain transfer.
+    The classifier is trained on MATH data and tested on the entire HumanEval set.
+    No splitting is needed or desired.
 
     Returns:
-        List of HumanEval problems
+        List of all 164 HumanEval problems
     """
-    # Look for data in repo directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(os.path.dirname(script_dir))
     data_dir = os.path.join(repo_root, "data", "acte_experiments", "humaneval")
 
-    json_path = os.path.join(data_dir, f"{split}.json")
-    if not os.path.exists(json_path):
-        raise FileNotFoundError(f"HumanEval data not found: {json_path}")
-
-    with open(json_path, 'r') as f:
-        raw_data = json.load(f)
-
     data = []
-    for item in raw_data:
-        data.append({
-            'question': item['prompt'],
-            'ground_truth': item['canonical_solution'],
-            'task_id': item['task_id'],
-            'test': item['test'],
-            'entry_point': item['entry_point'],
-            'subset': 'humaneval',
-        })
+    for json_file in ["train.json", "test.json"]:
+        json_path = os.path.join(data_dir, json_file)
+        if not os.path.exists(json_path):
+            logger.warning(f"HumanEval file not found: {json_path}")
+            continue
+        with open(json_path, 'r') as f:
+            raw_data = json.load(f)
+        for item in raw_data:
+            data.append({
+                'question': item['prompt'],
+                'ground_truth': item['canonical_solution'],
+                'task_id': item['task_id'],
+                'test': item['test'],
+                'entry_point': item['entry_point'],
+                'subset': 'humaneval',
+            })
 
-    logger.info(f"Loaded {len(data)} HumanEval problems from {json_path}")
+    if not data:
+        raise FileNotFoundError(f"No HumanEval data found in {data_dir}")
+
+    logger.info(f"Loaded {len(data)} HumanEval problems (full dataset, no split)")
     return data
 
 
@@ -2088,16 +2091,17 @@ def main():
         collect_and_save(data, output_subdir, subset_name="aime25", split="test")
 
     elif args.dataset == "humaneval":
-        # HumanEval code generation dataset
+        # HumanEval: full dataset, no train/test split.
+        # Classifier is trained on MATH; HumanEval is only used for cross-domain evaluation.
         logger.info(f"\n{'='*60}")
-        logger.info(f"Processing HumanEval ({args.split})")
+        logger.info(f"Processing HumanEval (full dataset, no split)")
         logger.info(f"NOTE: is_correct uses math grader during collection.")
         logger.info(f"Run collect_humaneval_vllm.py --reeval to fix correctness via code execution.")
         logger.info(f"{'='*60}")
 
-        data = load_humaneval(args.split)
-        output_subdir = os.path.join(args.output_dir, "humaneval", args.split)
-        collect_and_save(data, output_subdir, subset_name="humaneval", split=args.split)
+        data = load_humaneval()
+        output_subdir = os.path.join(args.output_dir, "humaneval")
+        collect_and_save(data, output_subdir, subset_name="humaneval")
 
     else:
         # hendrycks_math by subset (supports comma-separated list)
