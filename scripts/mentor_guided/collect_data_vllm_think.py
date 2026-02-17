@@ -196,6 +196,8 @@ DATASET_CONFIGS = {
 SYSTEM_PROMPT_SIMPLE = """Please reason step by step, and put your final answer within \\boxed{}."""
 
 # Structured system prompt with insights and constraints
+SYSTEM_PROMPT_CODE = """Complete the following Python function. Think step by step, then write the implementation."""
+
 SYSTEM_PROMPT_STRUCTURED = """You are a reasoning assistant. Analyze the given problem and follow the structured insights below.
 
 INSIGHTS
@@ -768,6 +770,42 @@ def load_gsm8k(split: str = "test") -> List[Dict[str, Any]]:
     return data
 
 
+def load_humaneval(split: str = "test") -> List[Dict[str, Any]]:
+    """Load HumanEval dataset from local JSON files.
+
+    Args:
+        split: "train" or "test"
+
+    Returns:
+        List of HumanEval problems
+    """
+    # Look for data in repo directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(os.path.dirname(script_dir))
+    data_dir = os.path.join(repo_root, "data", "acte_experiments", "humaneval")
+
+    json_path = os.path.join(data_dir, f"{split}.json")
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"HumanEval data not found: {json_path}")
+
+    with open(json_path, 'r') as f:
+        raw_data = json.load(f)
+
+    data = []
+    for item in raw_data:
+        data.append({
+            'question': item['prompt'],
+            'ground_truth': item['canonical_solution'],
+            'task_id': item['task_id'],
+            'test': item['test'],
+            'entry_point': item['entry_point'],
+            'subset': 'humaneval',
+        })
+
+    logger.info(f"Loaded {len(data)} HumanEval problems from {json_path}")
+    return data
+
+
 def load_dataset_generic(dataset_name: str, split: str = "test", subset: Optional[str] = None) -> List[Dict[str, Any]]:
     """Generic dataset loader using DATASET_CONFIGS.
 
@@ -918,7 +956,7 @@ def collect_data_for_token_level(
             for item, response in zip(batch, responses):
                 is_correct = check_math_correctness(response, item['ground_truth'])
                 mentor_length = len(mentor_model.tokenizer.encode(response)) if response else 0
-                results.append({
+                result_entry = {
                     'question': item['question'],
                     'ground_truth': item['ground_truth'],
                     'mentor_tokens': -1,  # indicates mentor only
@@ -929,7 +967,11 @@ def collect_data_for_token_level(
                     'intern_length': 0,  # no intern
                     'subset': item.get('subset', ''),
                     'level': item.get('level', ''),
-                })
+                }
+                # Preserve extra fields (e.g., task_id for HumanEval)
+                if 'task_id' in item:
+                    result_entry['task_id'] = item['task_id']
+                results.append(result_entry)
         elif token_level == 0:
             # No mentor - intern generates from scratch
             prompts = [intern_model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
@@ -939,7 +981,7 @@ def collect_data_for_token_level(
                 is_correct = check_math_correctness(response, item['ground_truth'])
                 # Calculate token length
                 intern_length = len(intern_model.tokenizer.encode(response)) if response else 0
-                results.append({
+                result_entry = {
                     'question': item['question'],
                     'ground_truth': item['ground_truth'],
                     'mentor_tokens': 0,
@@ -950,7 +992,10 @@ def collect_data_for_token_level(
                     'intern_length': intern_length,
                     'subset': item.get('subset', ''),
                     'level': item.get('level', ''),
-                })
+                }
+                if 'task_id' in item:
+                    result_entry['task_id'] = item['task_id']
+                results.append(result_entry)
         else:
             # Mentor generates first N tokens (or truncate from cache)
             mentor_prompts = [mentor_model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
@@ -1000,7 +1045,7 @@ def collect_data_for_token_level(
                 mentor_length = len(mentor_model.tokenizer.encode(mentor_output)) if mentor_output else 0
                 intern_length = len(intern_model.tokenizer.encode(intern_continuation)) if intern_continuation else 0
 
-                results.append({
+                result_entry = {
                     'question': item['question'],
                     'ground_truth': item['ground_truth'],
                     'mentor_tokens': token_level,
@@ -1011,7 +1056,10 @@ def collect_data_for_token_level(
                     'intern_length': intern_length,
                     'subset': item.get('subset', ''),
                     'level': item.get('level', ''),
-                })
+                }
+                if 'task_id' in item:
+                    result_entry['task_id'] = item['task_id']
+                results.append(result_entry)
 
     return results
 
@@ -1525,8 +1573,8 @@ def main():
     parser.add_argument("--intern-model", type=str, default=None,
                         help="Intern model name (small model, e.g., 7B). If not set, uses --model")
     parser.add_argument("--dataset", type=str, default="hendrycks_math",
-                        choices=["hendrycks_math", "math500", "hendrycks_math_all", "gsm8k", "aime24", "aime25"],
-                        help="Dataset: hendrycks_math (by subset), math500 (MATH-500), hendrycks_math_all (all subsets merged), gsm8k (GSM8K), aime24 (AIME 1983-2024), aime25 (AIME 2025)")
+                        choices=["hendrycks_math", "math500", "hendrycks_math_all", "gsm8k", "aime24", "aime25", "humaneval"],
+                        help="Dataset: hendrycks_math (by subset), math500 (MATH-500), hendrycks_math_all (all subsets merged), gsm8k (GSM8K), aime24 (AIME 1983-2024), aime25 (AIME 2025), humaneval (HumanEval code)")
     parser.add_argument("--subset", type=str, default=None,
                         help="Specific subset(s) for hendrycks_math (e.g., 'algebra' or 'geometry,algebra' for multiple). If None, process all subsets")
     parser.add_argument("--split", type=str, default="test",
@@ -1561,8 +1609,8 @@ def main():
     parser.add_argument("--no-think", action="store_true",
                         help="Disable structured thinking prompt (use standard prompt)")
     parser.add_argument("--prompt-type", type=str, default="simple",
-                        choices=["simple", "structured"],
-                        help="System prompt type: 'simple' (default) or 'structured' (with insights and constraints)")
+                        choices=["simple", "structured", "code"],
+                        help="System prompt type: 'simple' (default), 'structured' (with insights), or 'code' (for code generation)")
     parser.add_argument("--force", action="store_true",
                         help="Force re-collection even if data files already exist")
     # OpenRouter API support for closed-source mentor models
@@ -1581,9 +1629,17 @@ def main():
     if args.prompt_type == "structured":
         SYSTEM_PROMPT = SYSTEM_PROMPT_STRUCTURED
         logger.info("Using STRUCTURED system prompt (with insights and constraints)")
+    elif args.prompt_type == "code":
+        SYSTEM_PROMPT = SYSTEM_PROMPT_CODE
+        logger.info("Using CODE system prompt (for code generation)")
     else:
         SYSTEM_PROMPT = SYSTEM_PROMPT_SIMPLE
         logger.info("Using SIMPLE system prompt")
+
+    # Auto-set code prompt for humaneval dataset
+    if args.dataset == "humaneval" and args.prompt_type == "simple":
+        SYSTEM_PROMPT = SYSTEM_PROMPT_CODE
+        logger.info("Auto-switched to CODE system prompt for humaneval dataset")
 
     # Determine mentor and intern models
     mentor_model = args.mentor_model if args.mentor_model else args.model
@@ -1774,6 +1830,8 @@ def main():
             args.output_dir = f"{base_dir}/aime24_{mode_suffix}_{exp_name}"
         elif args.dataset == "aime25":
             args.output_dir = f"{base_dir}/aime25_{mode_suffix}_{exp_name}"
+        elif args.dataset == "humaneval":
+            args.output_dir = f"{base_dir}/humaneval_{mode_suffix}_{exp_name}"
         else:
             # Default: hendrycks_math
             args.output_dir = f"{base_dir}/hendrycks_math_split_{mode_suffix}_{exp_name}"
@@ -2028,6 +2086,18 @@ def main():
         data = load_dataset_generic("aime25", split="test")
         output_subdir = os.path.join(args.output_dir, "aime25", "test")
         collect_and_save(data, output_subdir, subset_name="aime25", split="test")
+
+    elif args.dataset == "humaneval":
+        # HumanEval code generation dataset
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing HumanEval ({args.split})")
+        logger.info(f"NOTE: is_correct uses math grader during collection.")
+        logger.info(f"Run collect_humaneval_vllm.py --reeval to fix correctness via code execution.")
+        logger.info(f"{'='*60}")
+
+        data = load_humaneval(args.split)
+        output_subdir = os.path.join(args.output_dir, "humaneval", args.split)
+        collect_and_save(data, output_subdir, subset_name="humaneval", split=args.split)
 
     else:
         # hendrycks_math by subset (supports comma-separated list)
