@@ -102,7 +102,7 @@ def main():
     if args.output_dir is None:
         model_short = args.model.split('/')[-1]
         base = "/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected"
-        args.output_dir = os.path.join(base, f"truncated_cot_{model_short}")
+        args.output_dir = os.path.join(base, f"truncated_cot_{args.dataset}_{model_short}")
     os.makedirs(args.output_dir, exist_ok=True)
     logger.info(f"Output directory: {args.output_dir}")
 
