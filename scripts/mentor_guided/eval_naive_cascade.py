@@ -102,8 +102,9 @@ def compute_stats(token_logprobs, token_entropies):
     }
 
 
-def extract_t0_features(model, tokenizer, items, device, max_length=1024):
+def extract_t0_features(model, tokenizer, items, max_length=1024):
     """Extract PPL/entropy features at T0 (no hints) for each sample."""
+    device = next(model.parameters()).device
     features = []
     for item in tqdm(items, desc="Extracting T0 features", ncols=80):
         question = item['question']
@@ -155,7 +156,8 @@ def main():
                         help="Path to truncated CoT full_reasoning_test.json (32B full results)")
     parser.add_argument("--llm-path", default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
                         help="7B model path for feature extraction")
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--gpus", default="0",
+                        help="Comma-separated GPU indices for 7B model (e.g. '4,5,6,7')")
     parser.add_argument("--max-length", type=int, default=1024)
     parser.add_argument("--split", default="test")
     parser.add_argument("--subsets", default=None,
@@ -164,6 +166,10 @@ def main():
                         help="Classifier threshold at T0 to decide escalation "
                              "(default: use saved threshold from classifier.pkl)")
     args = parser.parse_args()
+
+    # Set visible GPUs before loading any model
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+    logger.info(f"Using GPUs: {args.gpus}")
 
     # ------------------------------------------------------------------
     # Load classifier
@@ -210,7 +216,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
-        args.llm_path, torch_dtype=torch.float16, device_map=args.device
+        args.llm_path, torch_dtype=torch.float16, device_map="auto"
     )
     model.eval()
 
@@ -233,7 +239,7 @@ def main():
         logger.info(f"[{subset}] Loaded {len(t0_items)} T0 samples")
 
         # Extract T0 features using 7B
-        feats = extract_t0_features(model, tokenizer, t0_items, args.device, args.max_length)
+        feats = extract_t0_features(model, tokenizer, t0_items, args.max_length)
         feats_scaled = scaler.transform(feats)
         probs = clf.predict_proba(feats_scaled)[:, 1]  # P(correct)
 
