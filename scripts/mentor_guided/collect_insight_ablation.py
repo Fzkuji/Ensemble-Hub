@@ -139,6 +139,11 @@ def main():
                         help="GPU(s) for mentor model (e.g., '2' or '2,3')")
     parser.add_argument("--intern-gpus", type=str, required=True,
                         help="GPU(s) for intern model (e.g., '3' or '4,5')")
+    parser.add_argument("--dataset", type=str, default="hendrycks_math",
+                        choices=["hendrycks_math", "math500", "gsm8k"],
+                        help="Dataset (default: hendrycks_math)")
+    parser.add_argument("--subset", type=str, default=None,
+                        help="Specific MATH subset (e.g., 'algebra'). If None, use all subsets")
     parser.add_argument("--token-level", type=int, default=500,
                         help="Mentor token budget (default: 500)")
     parser.add_argument("--split", type=str, default="test")
@@ -164,9 +169,12 @@ def main():
         base = "/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected"
         mentor_short = args.mentor_model.split('/')[-1]
         intern_short = args.intern_model.split('/')[-1]
+        dataset_tag = args.dataset
+        if args.subset:
+            dataset_tag = f"{args.dataset}_{args.subset}"
         args.output_dir = os.path.join(
             base,
-            f"insight_ablation_{args.variant}_m{mentor_short}_i{intern_short}",
+            f"insight_ablation_{args.variant}_{dataset_tag}_m{mentor_short}_i{intern_short}",
         )
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -200,8 +208,15 @@ def main():
         gpu_memory_utilization=args.intern_memory_util,
     )
 
-    # Load MATH test data (all subsets)
-    data = pipeline.load_hendrycks_math_all(args.split)
+    # Load data
+    if args.dataset == "math500":
+        data = pipeline.load_math500()
+    elif args.dataset == "gsm8k":
+        data = pipeline.load_gsm8k(args.split)
+    elif args.subset:
+        data = pipeline.load_hendrycks_math_subset(args.subset, args.split)
+    else:
+        data = pipeline.load_hendrycks_math_all(args.split)
     logger.info(f"Loaded {len(data)} problems")
 
     # Collect data at the specified token level
