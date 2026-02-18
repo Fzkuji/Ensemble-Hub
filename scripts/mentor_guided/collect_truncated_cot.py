@@ -45,8 +45,12 @@ MATH_SUBSETS = [
 
 
 def extract_boxed_answer(text: str) -> str:
-    """Extract answer from \\boxed{}."""
-    start = text.find(r'\boxed{')
+    """Extract the LAST \\boxed{} answer from text.
+
+    Uses rfind to get the last occurrence, since R1-style models may write
+    trial \\boxed{} answers during <think> that differ from the final answer.
+    """
+    start = text.rfind(r'\boxed{')
     if start == -1:
         return ""
     i = start + len(r'\boxed{')
@@ -88,6 +92,10 @@ def main():
     parser.add_argument("--token-levels", type=str, default="100,500,1000",
                         help="Comma-separated thinking token budgets")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="Sampling temperature (default: 0.0 for greedy)")
+    parser.add_argument("--top-p", type=float, default=1.0,
+                        help="Top-p sampling (default: 1.0 for greedy)")
     parser.add_argument("--skip-full", action="store_true",
                         help="Skip full reasoning (only run truncated)")
     parser.add_argument("--force", action="store_true",
@@ -105,6 +113,7 @@ def main():
         args.output_dir = os.path.join(base, f"truncated_cot_{args.dataset}_{model_short}")
     os.makedirs(args.output_dir, exist_ok=True)
     logger.info(f"Output directory: {args.output_dir}")
+    logger.info(f"Temperature: {args.temperature}, Top-p: {args.top_p}")
 
     # Import from existing codebase
     from collect_data_vllm_think import (
@@ -145,7 +154,7 @@ def main():
             batch = data[batch_start:batch_start + args.batch_size]
             prompts = [model.build_chat_prompt(item['question'], use_think=True)
                        for item in batch]
-            responses = model.generate(prompts, max_tokens=8192)
+            responses = model.generate(prompts, max_tokens=8192, temperature=args.temperature, top_p=args.top_p)
 
             for item, prompt, response in zip(batch, prompts, responses):
                 full_cache[item['question']] = response
@@ -201,7 +210,7 @@ def main():
             batch = data[batch_start:batch_start + args.batch_size]
             prompts = [model.build_chat_prompt(item['question'], use_think=True)
                        for item in batch]
-            responses = model.generate(prompts, max_tokens=8192)
+            responses = model.generate(prompts, max_tokens=8192, temperature=args.temperature, top_p=args.top_p)
             for item, response in zip(batch, responses):
                 full_cache[item['question']] = response
 
@@ -249,7 +258,7 @@ def main():
                                 desc=f"T{N} answers", unit="batch"):
             batch = cont_data[batch_start:batch_start + args.batch_size]
             batch_prompts = [d['cont_prompt'] for d in batch]
-            answers = model.generate(batch_prompts, max_tokens=2048)
+            answers = model.generate(batch_prompts, max_tokens=2048, temperature=args.temperature, top_p=args.top_p)
             all_answers.extend(answers)
 
         # Grade and save
