@@ -45,12 +45,8 @@ MATH_SUBSETS = [
 
 
 def extract_boxed_answer(text: str) -> str:
-    """Extract the LAST \\boxed{} answer from text.
-
-    Uses rfind to get the last occurrence, since R1-style models may write
-    trial \\boxed{} answers during <think> that differ from the final answer.
-    """
-    start = text.rfind(r'\boxed{')
+    """Extract answer from \\boxed{}."""
+    start = text.find(r'\boxed{')
     if start == -1:
         return ""
     i = start + len(r'\boxed{')
