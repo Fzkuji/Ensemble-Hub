@@ -393,8 +393,18 @@ def build_intern_prompt_with_insights(
     # Clean the mentor's thinking content
     thinking_content = clean_mentor_thinking(mentor_output)
 
-    # Build the user message with insights as context
-    user_message = f"{question}\n\n[Thinking Insights]\n{thinking_content}"
+    # Build the user message with structured insight framework
+    user_message = (
+        f"{question}\n\n"
+        f"[Thinking Insights]\n"
+        f"The following reasoning insights are provided to guide your solution. "
+        f"Interpret them using this framework:\n"
+        f"- Goal: problem objective, constraints, and required output\n"
+        f"- Planning: solution strategy and sub-step decomposition\n"
+        f"- Retrieval: relevant knowledge, formulas, APIs, or patterns\n"
+        f"- Action: concrete implementation steps\n\n"
+        f"{thinking_content}"
+    )
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
