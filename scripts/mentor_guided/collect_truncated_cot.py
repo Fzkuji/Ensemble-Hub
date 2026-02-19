@@ -87,6 +87,9 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--token-levels", type=str, default="100,500,1000",
                         help="Comma-separated thinking token budgets")
+    parser.add_argument("--subset", type=str, default=None,
+                        help="Run on a single MATH subset only (e.g. algebra). "
+                             "Useful for quick sanity checks.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--temperature", type=float, default=0.7,
                         help="Sampling temperature (default: 0.7, matches paper pipeline)")
@@ -133,6 +136,9 @@ def main():
     elif args.dataset == "gsm8k":
         data = load_gsm8k(args.split)
     logger.info(f"Loaded {len(data)} problems")
+    if args.subset:
+        data = [d for d in data if d.get('subset', '') == args.subset]
+        logger.info(f"Filtered to subset '{args.subset}': {len(data)} problems")
 
     # ========================================
     # Phase 1: Full Reasoning (no truncation)
