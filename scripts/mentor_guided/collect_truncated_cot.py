@@ -97,6 +97,8 @@ def main():
                         help="Top-p sampling (default: 0.95, matches paper pipeline)")
     parser.add_argument("--skip-full", action="store_true",
                         help="Skip full reasoning (only run truncated)")
+    parser.add_argument("--full-only", action="store_true",
+                        help="Only run full reasoning, skip all truncated CoT levels")
     parser.add_argument("--force", action="store_true",
                         help="Force re-generation even if output files exist")
 
@@ -219,6 +221,9 @@ def main():
     # ========================================
     # Phase 2: Truncated CoT
     # ========================================
+    if args.full_only:
+        logger.info("--full-only: skipping truncated CoT phase")
+        truncation_levels = []
     for N in truncation_levels:
         out_path = os.path.join(args.output_dir, f"truncated_cot_{N}_{args.split}.json")
         if not args.force and os.path.exists(out_path):
