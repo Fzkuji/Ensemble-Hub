@@ -150,7 +150,7 @@ def main():
             batch = data[batch_start:batch_start + args.batch_size]
             prompts = [model.build_chat_prompt(item['question'], use_think=True)
                        for item in batch]
-            responses = model.generate(prompts, max_tokens=8192, temperature=args.temperature, top_p=args.top_p)
+            responses = model.generate(prompts, max_tokens=4096, temperature=args.temperature, top_p=args.top_p)
 
             for item, prompt, response in zip(batch, prompts, responses):
                 full_cache[item['question']] = response
@@ -206,7 +206,7 @@ def main():
             batch = data[batch_start:batch_start + args.batch_size]
             prompts = [model.build_chat_prompt(item['question'], use_think=True)
                        for item in batch]
-            responses = model.generate(prompts, max_tokens=8192, temperature=args.temperature, top_p=args.top_p)
+            responses = model.generate(prompts, max_tokens=4096, temperature=args.temperature, top_p=args.top_p)
             for item, response in zip(batch, responses):
                 full_cache[item['question']] = response
 
