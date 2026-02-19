@@ -888,6 +888,49 @@ def load_humaneval() -> List[Dict[str, Any]]:
     return data
 
 
+def load_mbpp(split: str = "test") -> List[Dict[str, Any]]:
+    """Load MBPP dataset from HuggingFace.
+
+    MBPP-sanitized has 427 problems. We use:
+      - split="train" (374 problems) for training the classifier
+      - split="test"  (500 problems) for evaluation
+      - split="validation" (100 problems) for dev
+
+    Returns:
+        List of problem dicts with 'question', 'ground_truth', 'task_id',
+        'test_list', 'entry_point', 'subset' fields
+    """
+    from datasets import load_dataset as hf_load_dataset
+    import re
+
+    logger.info(f"Loading MBPP (split={split}) from HuggingFace...")
+    ds = hf_load_dataset("google-research-datasets/mbpp", "sanitized", split=split)
+
+    data = []
+    for item in ds:
+        code = item['code']
+        # Extract entry point (function name) from the solution code
+        func_match = re.search(r'def\s+(\w+)\s*\(', code)
+        entry_point = func_match.group(1) if func_match else "solution"
+
+        # Build test code in HumanEval check() format
+        test_list = item.get('test_list', [])
+        setup_code = item.get('test_setup_code', '') or ''
+
+        data.append({
+            'question': item['text'],  # Natural language description
+            'ground_truth': code,
+            'task_id': f"MBPP/{item['task_id']}",
+            'test_list': test_list,
+            'entry_point': entry_point,
+            'prompt': item.get('prompt', ''),  # Some entries have function signature
+            'subset': 'mbpp',
+        })
+
+    logger.info(f"Loaded {len(data)} MBPP problems (split={split})")
+    return data
+
+
 def load_dataset_generic(dataset_name: str, split: str = "test", subset: Optional[str] = None) -> List[Dict[str, Any]]:
     """Generic dataset loader using DATASET_CONFIGS.
 
@@ -1705,8 +1748,8 @@ def main():
     parser.add_argument("--intern-model", type=str, default=None,
                         help="Intern model name (small model, e.g., 7B). If not set, uses --model")
     parser.add_argument("--dataset", type=str, default="hendrycks_math",
-                        choices=["hendrycks_math", "math500", "hendrycks_math_all", "gsm8k", "aime24", "aime25", "humaneval"],
-                        help="Dataset: hendrycks_math (by subset), math500 (MATH-500), hendrycks_math_all (all subsets merged), gsm8k (GSM8K), aime24 (AIME 1983-2024), aime25 (AIME 2025), humaneval (HumanEval code)")
+                        choices=["hendrycks_math", "math500", "hendrycks_math_all", "gsm8k", "aime24", "aime25", "humaneval", "mbpp"],
+                        help="Dataset: hendrycks_math (by subset), math500 (MATH-500), hendrycks_math_all (all subsets merged), gsm8k (GSM8K), aime24 (AIME 1983-2024), aime25 (AIME 2025), humaneval (HumanEval code), mbpp (MBPP code)")
     parser.add_argument("--subset", type=str, default=None,
                         help="Specific subset(s) for hendrycks_math (e.g., 'algebra' or 'geometry,algebra' for multiple). If None, process all subsets")
     parser.add_argument("--split", type=str, default="test",
@@ -1775,10 +1818,10 @@ def main():
         SYSTEM_PROMPT = SYSTEM_PROMPT_SIMPLE
         logger.info("Using SIMPLE system prompt")
 
-    # Auto-set code prompt for humaneval dataset
-    if args.dataset == "humaneval" and args.prompt_type == "simple":
+    # Auto-set code prompt for code datasets
+    if args.dataset in ("humaneval", "mbpp") and args.prompt_type == "simple":
         SYSTEM_PROMPT = SYSTEM_PROMPT_CODE
-        logger.info("Auto-switched to CODE system prompt for humaneval dataset")
+        logger.info(f"Auto-switched to CODE system prompt for {args.dataset} dataset")
 
     logger.info(f"Insight mode: {args.insight_mode}")
     if args.insight_mode == "prompt":
@@ -2253,6 +2296,18 @@ def main():
         data = load_humaneval()
         output_subdir = os.path.join(args.output_dir, "humaneval")
         collect_and_save(data, output_subdir, subset_name="humaneval")
+
+    elif args.dataset == "mbpp":
+        # MBPP: split into train/test for classifier training+eval
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Processing MBPP (split={args.split})")
+        logger.info(f"NOTE: is_correct uses math grader during collection.")
+        logger.info(f"Run collect_mbpp_vllm.py --reeval to fix correctness via code execution.")
+        logger.info(f"{'='*60}")
+
+        data = load_mbpp(split=args.split)
+        output_subdir = os.path.join(args.output_dir, "mbpp", args.split)
+        collect_and_save(data, output_subdir, subset_name="mbpp", split=args.split)
 
     else:
         # hendrycks_math by subset (supports comma-separated list)
