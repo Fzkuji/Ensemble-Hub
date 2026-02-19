@@ -350,6 +350,74 @@ def build_cross_model_prompt(
         return intern_prompt + converted_output
 
 
+def clean_mentor_thinking(mentor_output: str) -> str:
+    """Extract clean thinking content from mentor's raw output.
+
+    Strips <think>/<thinking> tags and returns just the thinking text.
+    """
+    import re
+    text = mentor_output.strip()
+    # Remove think tags
+    text = re.sub(r'^<think>\s*', '', text)
+    text = re.sub(r'\s*</think>.*$', '', text, flags=re.DOTALL)
+    text = re.sub(r'^<thinking>\s*', '', text)
+    text = re.sub(r'\s*</thinking>.*$', '', text, flags=re.DOTALL)
+    return text.strip()
+
+
+def build_intern_prompt_with_insights(
+    question: str,
+    mentor_output: str,
+    intern_model: "VLLMInference",
+    use_think: bool = True,
+) -> str:
+    """Build intern prompt with mentor's thinking as context (not continuation).
+
+    Instead of having the intern continue the mentor's thinking stream,
+    this places the mentor's thinking insights into the prompt context
+    so the intern generates its own independent response.
+
+    This matches the paper's design: mentor provides structured insights,
+    intern reasons and answers independently based on those insights.
+
+    Args:
+        question: The original question
+        mentor_output: Mentor's generated thinking output
+        intern_model: The intern VLLMInference instance
+        use_think: Whether thinking mode is enabled
+
+    Returns:
+        Formatted prompt for intern to generate independently
+    """
+    # Clean the mentor's thinking content
+    thinking_content = clean_mentor_thinking(mentor_output)
+
+    # Build the user message with insights as context
+    user_message = f"{question}\n\n[Thinking Insights]\n{thinking_content}"
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    # Use intern's own template
+    intern_family = intern_model.model_family
+
+    if intern_family == "qwen3":
+        prompt = intern_model.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=use_think,
+        )
+    else:
+        prompt = intern_model.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        if not use_think and intern_model.family_config.get("no_think_prefill"):
+            prompt = prompt + intern_model.family_config["no_think_prefill"]
+
+    return prompt
+
+
 def parse_answer(raw_answer: str, parser_type: Optional[str] = None) -> str:
     """Parse answer based on dataset-specific format.
 
@@ -919,13 +987,19 @@ def collect_data_for_token_level(
     batch_size: int = 8,
     use_think: bool = True,
     mentor_cache: Optional[Dict[str, str]] = None,
+    insight_mode: str = "continuation",
 ) -> List[Dict[str, Any]]:
     """Collect data for a specific token level.
 
     ACT-E approach:
     - token_level=-1: Mentor generates full answer (mentor only baseline)
     - token_level=0: Intern generates from scratch
-    - token_level>0: Mentor generates first N tokens, then Intern CONTINUES from there
+    - token_level>0: Mentor generates first N tokens, intern uses them
+
+    Two insight modes for token_level > 0:
+    - "continuation": Intern continues mentor's thinking stream (legacy)
+    - "prompt": Mentor's thinking is placed in prompt context,
+                intern generates independently (paper design)
 
     When mentor_cache is provided and token_level > 0, mentor outputs are truncated
     from the cached full responses instead of re-running mentor inference.
@@ -939,6 +1013,7 @@ def collect_data_for_token_level(
         use_think: Whether to use think mode
         mentor_cache: Optional dict mapping question -> full_mentor_response
                      When provided, token_level > 0 will truncate from cache
+        insight_mode: "continuation" or "prompt"
 
     Returns:
         List of results with responses and correctness
@@ -1018,51 +1093,83 @@ def collect_data_for_token_level(
                 # No cache - run mentor inference
                 mentor_outputs = mentor_model.generate_mentor_tokens(mentor_prompts, max_tokens=token_level)
 
-            # Intern CONTINUES from mentor's output
-            # Check if cross-model scenario (different model families or API mentor)
-            # Note: API models (OpenRouter) return message lists, not strings, so always use cross-model
-            mentor_prompt_is_list = mentor_prompts and isinstance(mentor_prompts[0], list)
-            is_cross_model = mentor_prompt_is_list or mentor_model.model_family != intern_model.model_family
-
-            if is_cross_model:
-                # Cross-model: build intern-native prompts with mentor's output
-                continued_prompts = [
-                    build_cross_model_prompt(item['question'], mentor_output, intern_model, use_think)
+            if insight_mode == "prompt":
+                # Paper design: mentor's thinking goes into prompt context,
+                # intern generates independently with its own template
+                intern_prompts = [
+                    build_intern_prompt_with_insights(
+                        item['question'], mentor_output, intern_model, use_think
+                    )
                     for item, mentor_output in zip(batch, mentor_outputs)
                 ]
+                intern_responses = intern_model.generate(intern_prompts)
+
+                for item, mentor_output, response in zip(batch, mentor_outputs, intern_responses):
+                    is_correct = check_math_correctness(response, item['ground_truth'])
+                    mentor_length = len(mentor_model.tokenizer.encode(mentor_output)) if mentor_output else 0
+                    intern_length = len(intern_model.tokenizer.encode(response)) if response else 0
+
+                    result_entry = {
+                        'question': item['question'],
+                        'ground_truth': item['ground_truth'],
+                        'mentor_tokens': token_level,
+                        'mentor_response': mentor_output,
+                        'response': response,  # intern's independent response
+                        'is_correct': is_correct,
+                        'mentor_length': mentor_length,
+                        'intern_length': intern_length,
+                        'subset': item.get('subset', ''),
+                        'level': item.get('level', ''),
+                    }
+                    if 'task_id' in item:
+                        result_entry['task_id'] = item['task_id']
+                    results.append(result_entry)
             else:
-                # Same model family: directly concatenate prompt + mentor_output
-                continued_prompts = [
-                    prompt + mentor_output
-                    for prompt, mentor_output in zip(mentor_prompts, mentor_outputs)
-                ]
+                # Legacy continuation mode: intern continues mentor's thinking stream
+                # Check if cross-model scenario (different model families or API mentor)
+                # Note: API models (OpenRouter) return message lists, not strings, so always use cross-model
+                mentor_prompt_is_list = mentor_prompts and isinstance(mentor_prompts[0], list)
+                is_cross_model = mentor_prompt_is_list or mentor_model.model_family != intern_model.model_family
 
-            intern_continuations = intern_model.generate(continued_prompts)
+                if is_cross_model:
+                    # Cross-model: build intern-native prompts with mentor's output
+                    continued_prompts = [
+                        build_cross_model_prompt(item['question'], mentor_output, intern_model, use_think)
+                        for item, mentor_output in zip(batch, mentor_outputs)
+                    ]
+                else:
+                    # Same model family: directly concatenate prompt + mentor_output
+                    continued_prompts = [
+                        prompt + mentor_output
+                        for prompt, mentor_output in zip(mentor_prompts, mentor_outputs)
+                    ]
 
-            for item, mentor_output, intern_continuation in zip(batch, mentor_outputs, intern_continuations):
-                # Full response = mentor_output + intern_continuation
-                full_response = mentor_output + intern_continuation
-                is_correct = check_math_correctness(full_response, item['ground_truth'])
+                intern_continuations = intern_model.generate(continued_prompts)
 
-                # Calculate token lengths
-                mentor_length = len(mentor_model.tokenizer.encode(mentor_output)) if mentor_output else 0
-                intern_length = len(intern_model.tokenizer.encode(intern_continuation)) if intern_continuation else 0
+                for item, mentor_output, intern_continuation in zip(batch, mentor_outputs, intern_continuations):
+                    # Full response = mentor_output + intern_continuation
+                    full_response = mentor_output + intern_continuation
+                    is_correct = check_math_correctness(full_response, item['ground_truth'])
 
-                result_entry = {
-                    'question': item['question'],
-                    'ground_truth': item['ground_truth'],
-                    'mentor_tokens': token_level,
-                    'mentor_response': mentor_output,
-                    'response': full_response,
-                    'is_correct': is_correct,
-                    'mentor_length': mentor_length,
-                    'intern_length': intern_length,
-                    'subset': item.get('subset', ''),
-                    'level': item.get('level', ''),
-                }
-                if 'task_id' in item:
-                    result_entry['task_id'] = item['task_id']
-                results.append(result_entry)
+                    # Calculate token lengths
+                    mentor_length = len(mentor_model.tokenizer.encode(mentor_output)) if mentor_output else 0
+                    intern_length = len(intern_model.tokenizer.encode(intern_continuation)) if intern_continuation else 0
+
+                    result_entry = {
+                        'question': item['question'],
+                        'ground_truth': item['ground_truth'],
+                        'mentor_tokens': token_level,
+                        'mentor_response': mentor_output,
+                        'response': full_response,
+                        'is_correct': is_correct,
+                        'mentor_length': mentor_length,
+                        'intern_length': intern_length,
+                        'subset': item.get('subset', ''),
+                        'level': item.get('level', ''),
+                    }
+                    if 'task_id' in item:
+                        result_entry['task_id'] = item['task_id']
+                    results.append(result_entry)
 
     return results
 
@@ -1095,6 +1202,7 @@ def worker_process_all_tasks(
     dataset: str = None,
     mode_suffix: str = None,
     split: str = None,
+    insight_mode: str = "continuation",
 ):
     """Worker process that processes ALL subsets and token levels.
 
@@ -1286,7 +1394,8 @@ def worker_process_all_tasks(
                 cache_to_use = mentor_cache if token_level > 0 else None
                 results = collect_data_for_token_level(
                     mentor_model, intern_model, shard_data, token_level,
-                    batch_size, use_think=use_think, mentor_cache=cache_to_use
+                    batch_size, use_think=use_think, mentor_cache=cache_to_use,
+                    insight_mode=insight_mode,
                 )
             except Exception as e:
                 logger.error(f"[Worker {rank}] Error collecting {subset_name} tokens={token_level}: {e}", exc_info=True)
@@ -1373,6 +1482,7 @@ def collect_parallel(
     mentor_api: str = None,
     openrouter_api_key: str = None,
     api_max_workers: int = 8,
+    insight_mode: str = "continuation",
 ) -> Dict[int, Dict[str, Any]]:
     """Collect data for a single dataset in parallel.
 
@@ -1401,6 +1511,7 @@ def collect_parallel(
         mentor_api=mentor_api,
         openrouter_api_key=openrouter_api_key,
         api_max_workers=api_max_workers,
+        insight_mode=insight_mode,
     )
     return results.get("single", {})
 
@@ -1464,6 +1575,7 @@ def collect_all_parallel(
     dataset: str = None,
     mode_suffix: str = None,
     split: str = None,
+    insight_mode: str = "continuation",
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """Collect data for ALL subsets in parallel.
 
@@ -1542,7 +1654,7 @@ def collect_all_parallel(
         intern_gpu = [intern_gpu_ids[rank]] if intern_gpu_ids else [gpu_id]
         p = mp.Process(
             target=worker_process_all_tasks,
-            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers, cache_base_dir, dataset, mode_suffix, split)
+            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers, cache_base_dir, dataset, mode_suffix, split, insight_mode)
         )
         p.start()
         processes.append(p)
@@ -1614,6 +1726,11 @@ def main():
     parser.add_argument("--prompt-type", type=str, default="simple",
                         choices=["simple", "structured", "code"],
                         help="System prompt type: 'simple' (default), 'structured' (with insights), or 'code' (for code generation)")
+    parser.add_argument("--insight-mode", type=str, default="continuation",
+                        choices=["continuation", "prompt"],
+                        help="How intern uses mentor's output: "
+                             "'continuation' = intern continues mentor's thinking stream (legacy), "
+                             "'prompt' = mentor's thinking is placed in prompt context, intern generates independently (paper design)")
     parser.add_argument("--force", action="store_true",
                         help="Force re-collection even if data files already exist")
     # OpenRouter API support for closed-source mentor models
@@ -1643,6 +1760,12 @@ def main():
     if args.dataset == "humaneval" and args.prompt_type == "simple":
         SYSTEM_PROMPT = SYSTEM_PROMPT_CODE
         logger.info("Auto-switched to CODE system prompt for humaneval dataset")
+
+    logger.info(f"Insight mode: {args.insight_mode}")
+    if args.insight_mode == "prompt":
+        logger.info("  -> Mentor thinking will be placed in prompt context; intern generates independently")
+    else:
+        logger.info("  -> Intern continues mentor's thinking stream (legacy continuation mode)")
 
     # Determine mentor and intern models
     mentor_model = args.mentor_model if args.mentor_model else args.model
@@ -1940,6 +2063,7 @@ def main():
                 mentor_api=args.mentor_api,
                 openrouter_api_key=args.openrouter_api_key,
                 api_max_workers=args.api_max_workers,
+                insight_mode=args.insight_mode,
             )
             all_stats.update(stats)
 
@@ -1978,6 +2102,7 @@ def main():
                 mentor_api=args.mentor_api,
                 openrouter_api_key=args.openrouter_api_key,
                 api_max_workers=args.api_max_workers,
+                insight_mode=args.insight_mode,
             )
             all_stats.update(stats)
 
@@ -2016,6 +2141,7 @@ def main():
                 mentor_api=args.mentor_api,
                 openrouter_api_key=args.openrouter_api_key,
                 api_max_workers=args.api_max_workers,
+                insight_mode=args.insight_mode,
             )
             all_stats.update(stats)
 
@@ -2253,6 +2379,7 @@ def main():
             dataset=args.dataset,
             mode_suffix=mode_suffix,
             split=args.split,
+            insight_mode=args.insight_mode,
         )
 
         # Note: Cache saving for -1 and 0 is now done immediately in workers after merge
