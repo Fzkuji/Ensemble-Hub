@@ -170,34 +170,52 @@ def extract_all_features(model, tokenizer, data, device, max_length=1024):
 
 # ── cascade evaluation ───────────────────────────────────────────────────
 
-def search_thresholds_and_eval(clf, scaler, X_test, y_test):
-    """Search best thresholds on test fold and return cascade accuracy."""
-    n_samples, n_stages, n_feat = X_test.shape
-    X_flat = X_test.reshape(-1, n_feat)
+def _cascade_correct(probs, y, thresholds):
+    """Count correct predictions under given thresholds."""
+    n_samples, n_stages = probs.shape
+    correct = 0
+    for i in range(n_samples):
+        decided = False
+        for s in range(n_stages):
+            if probs[i, s] >= thresholds[s]:
+                correct += y[i, s]
+                decided = True
+                break
+        if not decided:
+            correct += y[i, -1]
+    return correct
+
+
+def search_thresholds_on_train(clf, scaler, X_train, y_train):
+    """Search best cascade thresholds on TRAIN data only."""
+    n_samples, n_stages, n_feat = X_train.shape
+    X_flat = X_train.reshape(-1, n_feat)
     X_scaled = scaler.transform(X_flat)
     probs = clf.predict_proba(X_scaled)[:, 1].reshape(n_samples, n_stages)
 
-    # Grid search thresholds
     candidates = [round(i * 0.05, 2) for i in range(21)]
     best_acc = 0
     best_thresholds = [0.5] * n_stages
 
     for combo in product(candidates, repeat=n_stages):
         th = list(combo)
-        correct = 0
-        for i in range(n_samples):
-            decided = False
-            for s in range(n_stages):
-                if probs[i, s] >= th[s]:
-                    correct += y_test[i, s]
-                    decided = True
-                    break
-            if not decided:
-                correct += y_test[i, -1]
+        correct = _cascade_correct(probs, y_train, th)
         acc = correct / n_samples
         if acc > best_acc:
             best_acc = acc
             best_thresholds = th
+
+    return best_thresholds
+
+
+def eval_cascade_on_test(clf, scaler, X_test, y_test, thresholds):
+    """Apply pre-determined thresholds to test data. Returns (n_correct, n_total, details)."""
+    n_samples, n_stages, n_feat = X_test.shape
+    X_flat = X_test.reshape(-1, n_feat)
+    X_scaled = scaler.transform(X_flat)
+    probs = clf.predict_proba(X_scaled)[:, 1].reshape(n_samples, n_stages)
+
+    n_correct = _cascade_correct(probs, y_test, thresholds)
 
     # Per-stage AUC
     stage_auc = {}
@@ -207,19 +225,19 @@ def search_thresholds_and_eval(clf, scaler, X_test, y_test):
         except ValueError:
             stage_auc[TOKEN_LEVELS[s]] = 0.5
 
-    # Stage distribution with best thresholds
+    # Stage distribution
     stage_counts = [0] * n_stages
     for i in range(n_samples):
         decided = False
         for s in range(n_stages):
-            if probs[i, s] >= best_thresholds[s]:
+            if probs[i, s] >= thresholds[s]:
                 stage_counts[s] += 1
                 decided = True
                 break
         if not decided:
             stage_counts[-1] += 1
 
-    return best_acc, best_thresholds, stage_auc, stage_counts
+    return n_correct, n_samples, stage_auc, stage_counts
 
 
 # ── main ─────────────────────────────────────────────────────────────────
@@ -289,7 +307,8 @@ def main():
     kf = KFold(n_splits=args.n_folds, shuffle=True, random_state=42)
 
     fold_results = []
-    all_fold_accs = []
+    total_correct = 0
+    total_test = 0
 
     for fold_idx, (train_idx, test_idx) in enumerate(kf.split(np.arange(n_samples))):
         X_train, X_test = X[train_idx], X[test_idx]
@@ -311,9 +330,16 @@ def main():
 
         clf.fit(X_train_scaled, y_train_flat)
 
-        # Evaluate cascade on test fold
-        cascade_acc, thresholds, stage_auc, stage_counts = \
-            search_thresholds_and_eval(clf, scaler, X_test, y_test)
+        # Search thresholds on TRAIN data (no data leakage)
+        thresholds = search_thresholds_on_train(clf, scaler, X_train, y_train)
+
+        # Apply thresholds to TEST data
+        n_correct, n_test, stage_auc, stage_counts = \
+            eval_cascade_on_test(clf, scaler, X_test, y_test, thresholds)
+
+        cascade_acc = n_correct / n_test
+        total_correct += n_correct
+        total_test += n_test
 
         # Baselines
         baselines = {TOKEN_LEVELS[s]: float(y_test[:, s].mean()) for s in range(n_stages)}
@@ -321,7 +347,8 @@ def main():
 
         fold_results.append({
             'fold': fold_idx,
-            'n_test': len(test_idx),
+            'n_test': n_test,
+            'n_correct': n_correct,
             'cascade_acc': cascade_acc,
             'oracle': oracle,
             'baselines': baselines,
@@ -329,15 +356,16 @@ def main():
             'stage_auc': stage_auc,
             'stage_counts': stage_counts,
         })
-        all_fold_accs.append(cascade_acc)
 
-        logger.info(f"Fold {fold_idx}: cascade={cascade_acc:.4f}, "
+        logger.info(f"Fold {fold_idx}: cascade={cascade_acc:.4f} ({n_correct}/{n_test}), "
                     f"oracle={oracle:.4f}, best_baseline={max(baselines.values()):.4f}, "
                     f"thresholds={thresholds}")
 
     # ── Summary ──────────────────────────────────────────────────────
-    mean_cascade = np.mean(all_fold_accs)
-    std_cascade = np.std(all_fold_accs)
+    # Weighted accuracy: total correct across all folds / total samples
+    overall_cascade = total_correct / total_test
+    per_fold_accs = [fr['cascade_acc'] for fr in fold_results]
+    std_cascade = np.std(per_fold_accs)
 
     # Overall baselines (from full data)
     full_baselines = {TOKEN_LEVELS[s]: float(y[:, s].mean()) for s in range(n_stages)}
@@ -350,7 +378,7 @@ def main():
     print(f"Classifier: {args.classifier}")
     print(f"Folds: {args.n_folds}")
     print()
-    print(f"Cascade Accuracy: {mean_cascade:.4f} (+/- {std_cascade:.4f})")
+    print(f"Cascade Accuracy: {overall_cascade:.4f} ({total_correct}/{total_test}) (+/- {std_cascade:.4f})")
     print(f"Oracle Accuracy:  {full_oracle:.4f}")
     print()
     print("Full-data Baselines:")
@@ -358,7 +386,7 @@ def main():
         print(f"  T{t}: {full_baselines[t]:.4f}")
     best_baseline = max(full_baselines.values())
     print(f"\nBest single-stage baseline: {best_baseline:.4f}")
-    print(f"Cascade improvement: {mean_cascade - best_baseline:+.4f}")
+    print(f"Cascade improvement: {overall_cascade - best_baseline:+.4f}")
     print()
 
     print("Per-Fold Results:")
@@ -381,7 +409,9 @@ def main():
             'n_samples': n_samples,
             'n_folds': args.n_folds,
             'classifier': args.classifier,
-            'cascade_accuracy_mean': float(mean_cascade),
+            'cascade_accuracy': float(overall_cascade),
+            'total_correct': int(total_correct),
+            'total_test': int(total_test),
             'cascade_accuracy_std': float(std_cascade),
             'oracle_accuracy': float(full_oracle),
             'baselines': {str(k): v for k, v in full_baselines.items()},
