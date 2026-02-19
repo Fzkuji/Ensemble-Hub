@@ -89,6 +89,7 @@ def collect_full_mentor_outputs(
     data: List[Dict[str, Any]],
     batch_size: int = 8,
     use_think: bool = True,
+    temperature: float = 0.7,
 ) -> Dict[str, str]:
     """Collect full mentor outputs for all questions.
 
@@ -110,7 +111,7 @@ def collect_full_mentor_outputs(
     for batch_start in tqdm(range(0, len(data), batch_size), desc="collecting mentor outputs", total=total_batches, unit="batch", ncols=80):
         batch = data[batch_start:batch_start + batch_size]
         prompts = [mentor_model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
-        responses = mentor_model.generate(prompts)
+        responses = mentor_model.generate(prompts, temperature=temperature)
 
         for item, response in zip(batch, responses):
             mentor_cache[item['question']] = response
@@ -988,6 +989,7 @@ def collect_data_for_token_level(
     use_think: bool = True,
     mentor_cache: Optional[Dict[str, str]] = None,
     insight_mode: str = "continuation",
+    temperature: float = 0.7,
 ) -> List[Dict[str, Any]]:
     """Collect data for a specific token level.
 
@@ -1029,7 +1031,7 @@ def collect_data_for_token_level(
         if token_level == MENTOR_ONLY_LEVEL:
             # Mentor only - mentor generates full answer, no intern
             prompts = [mentor_model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
-            responses = mentor_model.generate(prompts)
+            responses = mentor_model.generate(prompts, temperature=temperature)
 
             for item, response in zip(batch, responses):
                 is_correct = check_math_correctness(response, item['ground_truth'])
@@ -1053,7 +1055,7 @@ def collect_data_for_token_level(
         elif token_level == 0:
             # No mentor - intern generates from scratch
             prompts = [intern_model.build_chat_prompt(item['question'], use_think=use_think) for item in batch]
-            responses = intern_model.generate(prompts)
+            responses = intern_model.generate(prompts, temperature=temperature)
 
             for item, response in zip(batch, responses):
                 is_correct = check_math_correctness(response, item['ground_truth'])
@@ -1091,7 +1093,7 @@ def collect_data_for_token_level(
                     mentor_outputs.append(truncated)
             else:
                 # No cache - run mentor inference
-                mentor_outputs = mentor_model.generate_mentor_tokens(mentor_prompts, max_tokens=token_level)
+                mentor_outputs = mentor_model.generate_mentor_tokens(mentor_prompts, max_tokens=token_level, temperature=temperature)
 
             if insight_mode == "prompt":
                 # Paper design: mentor's thinking goes into prompt context,
@@ -1102,7 +1104,7 @@ def collect_data_for_token_level(
                     )
                     for item, mentor_output in zip(batch, mentor_outputs)
                 ]
-                intern_responses = intern_model.generate(intern_prompts)
+                intern_responses = intern_model.generate(intern_prompts, temperature=temperature)
 
                 for item, mentor_output, response in zip(batch, mentor_outputs, intern_responses):
                     is_correct = check_math_correctness(response, item['ground_truth'])
@@ -1144,7 +1146,7 @@ def collect_data_for_token_level(
                         for prompt, mentor_output in zip(mentor_prompts, mentor_outputs)
                     ]
 
-                intern_continuations = intern_model.generate(continued_prompts)
+                intern_continuations = intern_model.generate(continued_prompts, temperature=temperature)
 
                 for item, mentor_output, intern_continuation in zip(batch, mentor_outputs, intern_continuations):
                     # Full response = mentor_output + intern_continuation
@@ -1203,6 +1205,7 @@ def worker_process_all_tasks(
     mode_suffix: str = None,
     split: str = None,
     insight_mode: str = "continuation",
+    temperature: float = 0.7,
 ):
     """Worker process that processes ALL subsets and token levels.
 
@@ -1379,7 +1382,8 @@ def worker_process_all_tasks(
             if mentor_cache is None:
                 logger.info(f"[Worker {rank}] Collecting full mentor outputs for {len(shard_data)} samples (for truncation)...")
                 mentor_cache = collect_full_mentor_outputs(
-                    mentor_model, shard_data, batch_size, use_think=use_think
+                    mentor_model, shard_data, batch_size, use_think=use_think,
+                    temperature=temperature,
                 )
                 logger.info(f"[Worker {rank}] Mentor outputs collected, will truncate for levels: {[t for t in levels_to_compute if t > 0]}")
 
@@ -1395,7 +1399,7 @@ def worker_process_all_tasks(
                 results = collect_data_for_token_level(
                     mentor_model, intern_model, shard_data, token_level,
                     batch_size, use_think=use_think, mentor_cache=cache_to_use,
-                    insight_mode=insight_mode,
+                    insight_mode=insight_mode, temperature=temperature,
                 )
             except Exception as e:
                 logger.error(f"[Worker {rank}] Error collecting {subset_name} tokens={token_level}: {e}", exc_info=True)
@@ -1483,6 +1487,7 @@ def collect_parallel(
     openrouter_api_key: str = None,
     api_max_workers: int = 8,
     insight_mode: str = "continuation",
+    temperature: float = 0.7,
 ) -> Dict[int, Dict[str, Any]]:
     """Collect data for a single dataset in parallel.
 
@@ -1512,6 +1517,7 @@ def collect_parallel(
         openrouter_api_key=openrouter_api_key,
         api_max_workers=api_max_workers,
         insight_mode=insight_mode,
+        temperature=temperature,
     )
     return results.get("single", {})
 
@@ -1576,6 +1582,7 @@ def collect_all_parallel(
     mode_suffix: str = None,
     split: str = None,
     insight_mode: str = "continuation",
+    temperature: float = 0.7,
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """Collect data for ALL subsets in parallel.
 
@@ -1654,7 +1661,7 @@ def collect_all_parallel(
         intern_gpu = [intern_gpu_ids[rank]] if intern_gpu_ids else [gpu_id]
         p = mp.Process(
             target=worker_process_all_tasks,
-            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers, cache_base_dir, dataset, mode_suffix, split, insight_mode)
+            args=(rank, world_size, gpu_id, mentor_model_name, intern_model_name, max_model_len, batch_size, all_tasks, token_levels, use_think, mentor_gpu, intern_gpu, mentor_memory_util, intern_memory_util, mentor_max_model_len, intern_max_model_len, force, need_mentor, need_intern, mentor_api, openrouter_api_key, api_max_workers, cache_base_dir, dataset, mode_suffix, split, insight_mode, temperature)
         )
         p.start()
         processes.append(p)
@@ -1731,6 +1738,8 @@ def main():
                         help="How intern uses mentor's output: "
                              "'continuation' = intern continues mentor's thinking stream (legacy), "
                              "'prompt' = mentor's thinking is placed in prompt context, intern generates independently (paper design)")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="Sampling temperature for generation (default: 0.7). Use 0 for greedy decoding.")
     parser.add_argument("--force", action="store_true",
                         help="Force re-collection even if data files already exist")
     # OpenRouter API support for closed-source mentor models
@@ -1766,6 +1775,9 @@ def main():
         logger.info("  -> Mentor thinking will be placed in prompt context; intern generates independently")
     else:
         logger.info("  -> Intern continues mentor's thinking stream (legacy continuation mode)")
+
+    logger.info(f"Temperature: {args.temperature}")
+    logger.info(f"Max model length: {args.max_model_len}")
 
     # Determine mentor and intern models
     mentor_model = args.mentor_model if args.mentor_model else args.model
@@ -2064,6 +2076,7 @@ def main():
                 openrouter_api_key=args.openrouter_api_key,
                 api_max_workers=args.api_max_workers,
                 insight_mode=args.insight_mode,
+                temperature=args.temperature,
             )
             all_stats.update(stats)
 
@@ -2103,6 +2116,7 @@ def main():
                 openrouter_api_key=args.openrouter_api_key,
                 api_max_workers=args.api_max_workers,
                 insight_mode=args.insight_mode,
+                temperature=args.temperature,
             )
             all_stats.update(stats)
 
@@ -2142,6 +2156,7 @@ def main():
                 openrouter_api_key=args.openrouter_api_key,
                 api_max_workers=args.api_max_workers,
                 insight_mode=args.insight_mode,
+                temperature=args.temperature,
             )
             all_stats.update(stats)
 
@@ -2380,6 +2395,7 @@ def main():
             mode_suffix=mode_suffix,
             split=args.split,
             insight_mode=args.insight_mode,
+            temperature=args.temperature,
         )
 
         # Note: Cache saving for -1 and 0 is now done immediately in workers after merge
