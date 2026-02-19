@@ -34,7 +34,7 @@ from typing import List, Dict, Any
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-TOKEN_LEVELS = [0, 100, 500, 1000]
+TOKEN_LEVELS = [-1, 0, 100, 500, 1000]
 
 
 def extract_code_from_response(response: str, entry_point: str, prompt: str) -> str:
