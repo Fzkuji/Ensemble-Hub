@@ -88,10 +88,10 @@ def main():
     parser.add_argument("--token-levels", type=str, default="100,500,1000",
                         help="Comma-separated thinking token budgets")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--temperature", type=float, default=0.0,
-                        help="Sampling temperature (default: 0.0 for greedy)")
-    parser.add_argument("--top-p", type=float, default=1.0,
-                        help="Top-p sampling (default: 1.0 for greedy)")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="Sampling temperature (default: 0.7, matches paper pipeline)")
+    parser.add_argument("--top-p", type=float, default=0.95,
+                        help="Top-p sampling (default: 0.95, matches paper pipeline)")
     parser.add_argument("--skip-full", action="store_true",
                         help="Skip full reasoning (only run truncated)")
     parser.add_argument("--force", action="store_true",
