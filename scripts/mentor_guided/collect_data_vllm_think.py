@@ -891,7 +891,7 @@ def load_humaneval() -> List[Dict[str, Any]]:
 def load_mbpp(split: str = "test") -> List[Dict[str, Any]]:
     """Load MBPP dataset from HuggingFace.
 
-    MBPP-sanitized has 427 problems. We use:
+    MBPP-full has 974 problems:
       - split="train" (374 problems) for training the classifier
       - split="test"  (500 problems) for evaluation
       - split="validation" (100 problems) for dev
@@ -904,7 +904,7 @@ def load_mbpp(split: str = "test") -> List[Dict[str, Any]]:
     import re
 
     logger.info(f"Loading MBPP (split={split}) from HuggingFace...")
-    ds = hf_load_dataset("google-research-datasets/mbpp", "sanitized", split=split)
+    ds = hf_load_dataset("google-research-datasets/mbpp", "full", split=split)
 
     data = []
     for item in ds:
