@@ -240,7 +240,7 @@ def reeval_correctness(data_dir: str, exec_timeout: int = 10, num_workers: int =
 
         logger.info(
             f"tokens={token_level}: {old_correct} -> {new_correct} correct "
-            f"({accuracy:.4f}, {updated} re-evaluated)"
+            f"({accuracy:.4f}, {len(tasks)} re-evaluated)"
         )
 
     # Summary
