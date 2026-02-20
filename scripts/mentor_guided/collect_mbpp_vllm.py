@@ -127,7 +127,7 @@ def load_mbpp_metadata() -> Dict[str, Dict]:
     metadata = {}
     for split in ["train", "test", "validation"]:
         try:
-            ds = load_dataset("google-research-datasets/mbpp", "sanitized", split=split)
+            ds = load_dataset("google-research-datasets/mbpp", "full", split=split)
             for item in ds:
                 task_id = f"MBPP/{item['task_id']}"
                 code = item['code']
