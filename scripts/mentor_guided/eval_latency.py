@@ -42,9 +42,14 @@ SUBSETS = [
     "intermediate_algebra", "number_theory", "prealgebra", "precalculus",
 ]
 
-# Pre-measured generation times (s/sample) from previous vLLM runs
+# Pre-measured generation times (s/sample) from previous vLLM runs (4-GPU TP)
 PREMEASURED_INTERN = {0: 6.59, 100: 4.48, 500: 3.93, 1000: 3.69}
 PREMEASURED_MENTOR = 19.30
+
+# Pre-measured feature extraction + classifier overhead (s/sample)
+# Feature extraction = transformers forward pass for PPL/entropy (1 GPU)
+# Classifier inference is <0.001s, included in the totals below
+PREMEASURED_OVERHEAD = {0: 0.022, 100: 0.029, 500: 0.075, 1000: 0.124}
 
 BASE_DIR = "/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected"
 DEFAULT_DATA_DIR = os.path.join(
@@ -168,15 +173,20 @@ def benchmark_vllm(model_name: str, gpu_ids: List[int],
 # ============================================================================
 
 def compute_tandem(intern_times: Dict[int, float],
-                   oracle_dist: Dict[int, float]) -> float:
+                   oracle_dist: Dict[int, float],
+                   overhead: Dict[int, float] = None) -> float:
     """Tandem cascade latency = weighted sum of cumulative per-stage times.
 
     Cascade is sequential: sample stopped at T_k has visited T0, ..., T_k.
+    Each stage costs: intern_generation + feature_extraction + classifier.
     """
+    if overhead is None:
+        overhead = PREMEASURED_OVERHEAD
     avg_time = 0.0
     for i, stop_tl in enumerate(TOKEN_LEVELS):
         p = oracle_dist.get(stop_tl, 0.0)
-        cum_time = sum(intern_times[TOKEN_LEVELS[j]] for j in range(i + 1))
+        cum_time = sum(intern_times[TOKEN_LEVELS[j]] + overhead.get(TOKEN_LEVELS[j], 0)
+                       for j in range(i + 1))
         avg_time += p * cum_time
     return avg_time
 
@@ -186,7 +196,10 @@ def compute_tandem(intern_times: Dict[int, float],
 # ============================================================================
 
 def print_table(mentor_time, intern_time_t0, tandem_time,
-                avg_intern, oracle_dist, intern_times):
+                avg_intern, oracle_dist, intern_times,
+                overhead=None):
+    if overhead is None:
+        overhead = PREMEASURED_OVERHEAD
     print()
     print("=" * 70)
     print("  Wall-clock Latency (Reviewer yUBt W5)")
@@ -201,9 +214,12 @@ def print_table(mentor_time, intern_time_t0, tandem_time,
     print("  " + "-" * 52)
 
     print()
-    print("  Per-stage 7B generation time:")
+    print("  Per-stage breakdown (generation + classifier overhead):")
     for tl in TOKEN_LEVELS:
-        print(f"    {STAGE_NAMES[tl]}: {intern_times[tl]:.2f}s "
+        oh = overhead.get(tl, 0)
+        total = intern_times[tl] + oh
+        print(f"    {STAGE_NAMES[tl]}: {intern_times[tl]:.2f}s gen "
+              f"+ {oh:.3f}s clf = {total:.2f}s "
               f"(avg {avg_intern[tl]} tokens)")
 
     print()
@@ -213,12 +229,12 @@ def print_table(mentor_time, intern_time_t0, tandem_time,
 
     # Tandem breakdown by stopped stage
     print()
-    print("  Tandem per-stop-stage latency:")
+    print("  Tandem per-stop-stage latency (cumulative):")
     for i, tl in enumerate(TOKEN_LEVELS):
-        cum = sum(intern_times[TOKEN_LEVELS[j]] for j in range(i + 1))
+        cum = sum(intern_times[TOKEN_LEVELS[j]] + overhead.get(TOKEN_LEVELS[j], 0)
+                  for j in range(i + 1))
         pct = oracle_dist[tl] * 100
-        print(f"    Stop@{STAGE_NAMES[tl]}: {cum:.2f}s "
-              f"(cum. gen) × {pct:.1f}% samples")
+        print(f"    Stop@{STAGE_NAMES[tl]}: {cum:.2f}s × {pct:.1f}% samples")
 
     print("=" * 70)
 
