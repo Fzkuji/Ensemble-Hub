@@ -254,13 +254,17 @@ def phase2_feature_timing(
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    device = f"cuda:{gpu_id}"
-    logger.info(f"[Phase 2] Loading intern ({intern_model_name}) via transformers on {device} ...")
+    # After vLLM cleanup, CUDA_VISIBLE_DEVICES is already set to the intern
+    # GPUs, so the first visible device is always cuda:0 regardless of the
+    # physical GPU index that was passed in.
+    device = "cuda:0"
+    logger.info(f"[Phase 2] Loading intern ({intern_model_name}) via transformers on {device} "
+                f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}) ...")
     tokenizer = AutoTokenizer.from_pretrained(intern_model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
-        intern_model_name, torch_dtype=torch.float16, device_map=device)
+        intern_model_name, dtype=torch.float16, device_map=device)
     model.eval()
 
     # warm-up
