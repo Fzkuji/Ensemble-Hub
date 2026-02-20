@@ -59,20 +59,38 @@ def extract_code_from_response(response: str, entry_point: str = None) -> str:
         after_think = text[text.index('<think>') + len('<think>'):]
         text = after_think.strip()
 
-    # Strategy 3: Look for function definition by entry_point
-    if entry_point:
-        func_pattern = rf'((?:(?:import|from)\s+\S+.*\n)*def\s+{re.escape(entry_point)}\s*\(.*?\):.*?)(?:\n(?=\S)|\Z)'
-        func_match = re.search(func_pattern, text, re.DOTALL)
-        if func_match:
-            return func_match.group(1)
-
-    # Strategy 4: Find any function definitions
-    func_match = re.search(r'((?:(?:import|from)\s+\S+.*\n)*def\s+\w+\s*\(.*?\):.*?)(?:\n(?=\S)|\Z)', text, re.DOTALL)
-    if func_match:
-        return func_match.group(1)
-
-    # Strategy 5: Indented code lines
+    # Strategy 3+4+5: Line-based extraction (avoids regex backtracking on long text)
     lines = text.split('\n')
+    # Find the last function definition matching entry_point (or any def)
+    best_start = -1
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if entry_point and stripped.startswith(f'def {entry_point}('):
+            best_start = idx
+        elif stripped.startswith('def ') and best_start == -1:
+            best_start = idx
+
+    if best_start >= 0:
+        # Collect the function: def line + all following indented/empty lines
+        code_lines = [lines[best_start]]
+        for line in lines[best_start + 1:]:
+            if line == '' or line[0] in (' ', '\t'):
+                code_lines.append(line)
+            else:
+                break
+        # Also grab preceding import lines
+        imports = []
+        for idx in range(best_start - 1, -1, -1):
+            stripped = lines[idx].strip()
+            if stripped.startswith(('import ', 'from ')):
+                imports.insert(0, lines[idx])
+            elif stripped == '':
+                continue
+            else:
+                break
+        return '\n'.join(imports + code_lines)
+
+    # Strategy 5: Any code-like lines
     code_lines = []
     in_code = False
     for line in lines:
@@ -193,6 +211,8 @@ def reeval_correctness(data_dir: str, exec_timeout: int = 10, num_workers: int =
                 logger.warning(f"No test metadata for {task_id}, skipping")
                 continue
 
+            if (i + 1) % 50 == 0:
+                logger.info(f"  extracting {i+1}/{len(results)}...")
             code = extract_code_from_response(response, entry_point)
             tasks.append((i, code, test_list, entry_point, exec_timeout))
 
