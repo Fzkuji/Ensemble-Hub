@@ -22,7 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -197,7 +197,7 @@ def reeval_correctness(data_dir: str, exec_timeout: int = 10, num_workers: int =
         logger.info(f"tokens={token_level}: evaluating {len(tasks)} samples with {num_workers} workers...")
         done = 0
         correct_count = 0
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = {executor.submit(_eval_single, t): t[0] for t in tasks}
             for future in as_completed(futures):
                 idx, is_correct = future.result()
