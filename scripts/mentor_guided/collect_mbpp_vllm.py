@@ -166,7 +166,8 @@ def reeval_correctness(data_dir: str, exec_timeout: int = 10):
         old_correct = sum(1 for r in results if r.get('is_correct', False))
         updated = 0
 
-        for r in results:
+        correct_so_far = 0
+        for i, r in enumerate(results):
             task_id = r.get('task_id', '')
             response = r.get('response', '')
 
@@ -185,13 +186,13 @@ def reeval_correctness(data_dir: str, exec_timeout: int = 10):
             is_correct = check_code_correctness(code, test_list, entry_point, timeout=exec_timeout)
             r['is_correct'] = is_correct
             updated += 1
+            if is_correct:
+                correct_so_far += 1
 
-            # Debug: log first few samples per token level
-            if updated <= 3:
-                logger.debug(
-                    f"  [{task_id}] extracted {len(code)} chars, correct={is_correct}\n"
-                    f"    code[:200]: {code[:200]!r}"
-                )
+            if (i + 1) % 50 == 0 or i == len(results) - 1:
+                print(f"\r  tokens={token_level}: {i+1}/{len(results)} "
+                      f"({correct_so_far}/{updated} correct so far)", end="", flush=True)
+        print()  # newline after progress
 
         new_correct = sum(1 for r in results if r.get('is_correct', False))
         accuracy = new_correct / len(results) if results else 0
