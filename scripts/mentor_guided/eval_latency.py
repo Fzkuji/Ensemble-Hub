@@ -121,11 +121,16 @@ def compute_stats(token_logprobs, token_entropies):
         return [0.0] * 23
 
     n = len(token_logprobs)
-    ent = np.array(token_entropies)
-    lp = np.array(token_logprobs)
+    ent = np.array(token_entropies, dtype=np.float64)
+    lp = np.array(token_logprobs, dtype=np.float64)
 
     def slope(a):
-        return float(np.polyfit(np.arange(len(a)), a, 1)[0]) if len(a) >= 2 else 0.0
+        if len(a) < 2 or np.all(a == a[0]):
+            return 0.0
+        try:
+            return float(np.polyfit(np.arange(len(a)), a, 1)[0])
+        except (np.linalg.LinAlgError, ValueError):
+            return 0.0
     def inc_ratio(a):
         return float(np.sum(np.diff(a) > 0) / max(len(a) - 1, 1))
     def dec_ratio(a):
@@ -135,7 +140,7 @@ def compute_stats(token_logprobs, token_entropies):
     q1 = max(1, n // 4)
     avg_lp = float(np.mean(lp))
 
-    return [
+    result = [
         float(np.exp(-avg_lp)), -avg_lp,
         float(np.mean(ent)), float(np.std(ent)),
         float(np.max(ent)), float(np.min(ent)),
@@ -147,6 +152,8 @@ def compute_stats(token_logprobs, token_entropies):
         float(np.mean(lp[:q1])), float(np.mean(lp[-q1:])), trend_ch(lp),
         float(n),
     ]
+    # Sanitize: replace NaN/Inf with 0.0
+    return [0.0 if (x != x or abs(x) == float('inf')) else x for x in result]
 
 
 def extract_features_timed(model, tokenizer, text, device, max_length=1024):
@@ -345,6 +352,9 @@ def phase3_combine(
             # classifier inference
             t_c0 = time.time()
             feat_vec = feat + [stage_idx, tl]
+            # Replace NaN/Inf with 0.0 to avoid sklearn errors
+            feat_vec = [0.0 if (x != x or abs(x) == float('inf')) else x
+                        for x in feat_vec]
             prob = clf.predict_proba(scaler.transform([feat_vec]))[0, 1]
             t_c1 = time.time()
             clf_t = t_c1 - t_c0
