@@ -46,31 +46,31 @@ def extract_code_from_response(response: str, entry_point: str, prompt: str) -> 
     3. Look for the function definition
     4. Fall back to using the raw response
     """
-    # Remove <think>...</think> blocks (complete ones)
-    text = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
-
-    # Also handle unclosed <think> (truncated mentor thinking)
-    # Remove everything from <think> to the end if no </think> found
-    if '<think>' in text and '</think>' not in text:
-        text = text[:text.index('<think>')].strip()
-
-    # Strategy 1: Find ```python code blocks
-    python_blocks = re.findall(r'```python\s*\n(.*?)```', text, re.DOTALL)
+    # Strategy 1: Search for ```python blocks in FULL response first.
+    # This handles unclosed <think> tags where code appears inside the think block.
+    python_blocks = re.findall(r'```python\s*\n(.*?)```', response, re.DOTALL)
     if python_blocks:
         code = python_blocks[-1].strip()
         if f"def {entry_point}" in code:
             return code
         return prompt + code
 
-    # Strategy 2: Find generic code blocks
-    code_blocks = re.findall(r'```\s*\n(.*?)```', text, re.DOTALL)
+    # Strategy 2: Generic code blocks in full response
+    code_blocks = re.findall(r'```\s*\n(.*?)```', response, re.DOTALL)
     if code_blocks:
         code = code_blocks[-1].strip()
         if f"def {entry_point}" in code:
             return code
         return prompt + code
 
-    # Strategy 3: Look for function definition in raw text
+    # Clean up think tags for remaining strategies
+    text = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+    # For unclosed <think>, take everything AFTER the tag
+    if '<think>' in text and '</think>' not in text:
+        after_think = text[text.index('<think>') + len('<think>'):]
+        text = after_think.strip()
+
+    # Strategy 3: Look for function definition in cleaned text
     func_pattern = rf'(def\s+{re.escape(entry_point)}\s*\(.*?\):.*?)(?:\n(?=\S)|\Z)'
     func_match = re.search(func_pattern, text, re.DOTALL)
     if func_match:

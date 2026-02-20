@@ -33,36 +33,40 @@ TOKEN_LEVELS = [-1, 0, 100, 500, 1000]
 def extract_code_from_response(response: str, entry_point: str = None) -> str:
     """Extract Python code from model response.
 
-    Tries multiple strategies:
+    Tries multiple strategies on the full response first (to handle unclosed
+    <think> tags), then on cleaned text:
     1. Extract from ```python ... ``` code blocks
     2. Extract from ``` ... ``` code blocks
     3. Look for function definition
     4. Fall back to using the raw response
     """
-    # Remove <think>...</think> blocks
-    text = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
-    if '<think>' in text and '</think>' not in text:
-        text = text[:text.index('<think>')].strip()
-
-    # Strategy 1: Python code blocks
-    python_blocks = re.findall(r'```python\s*\n(.*?)```', text, re.DOTALL)
+    # Strategy 1: Search for ```python blocks in the FULL response first.
+    # This handles unclosed <think> tags where code appears inside the think block.
+    python_blocks = re.findall(r'```python\s*\n(.*?)```', response, re.DOTALL)
     if python_blocks:
         return python_blocks[-1].strip()
 
-    # Strategy 2: Generic code blocks
-    code_blocks = re.findall(r'```\s*\n(.*?)```', text, re.DOTALL)
+    # Strategy 2: Generic code blocks in full response
+    code_blocks = re.findall(r'```\s*\n(.*?)```', response, re.DOTALL)
     if code_blocks:
         return code_blocks[-1].strip()
 
-    # Strategy 3: Look for function definition
+    # Now clean up think tags for remaining strategies
+    text = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+    # For unclosed <think>, take everything AFTER the tag (code often follows reasoning)
+    if '<think>' in text and '</think>' not in text:
+        after_think = text[text.index('<think>') + len('<think>'):]
+        text = after_think.strip()
+
+    # Strategy 3: Look for function definition by entry_point
     if entry_point:
-        func_pattern = rf'(def\s+{re.escape(entry_point)}\s*\(.*?\):.*?)(?:\n(?=\S)|\Z)'
+        func_pattern = rf'((?:(?:import|from)\s+\S+.*\n)*def\s+{re.escape(entry_point)}\s*\(.*?\):.*?)(?:\n(?=\S)|\Z)'
         func_match = re.search(func_pattern, text, re.DOTALL)
         if func_match:
             return func_match.group(1)
 
     # Strategy 4: Find any function definitions
-    func_match = re.search(r'(def\s+\w+\s*\(.*?\):.*?)(?:\n(?=\S)|\Z)', text, re.DOTALL)
+    func_match = re.search(r'((?:(?:import|from)\s+\S+.*\n)*def\s+\w+\s*\(.*?\):.*?)(?:\n(?=\S)|\Z)', text, re.DOTALL)
     if func_match:
         return func_match.group(1)
 
@@ -182,6 +186,13 @@ def reeval_correctness(data_dir: str, exec_timeout: int = 10):
             r['is_correct'] = is_correct
             updated += 1
 
+            # Debug: log first few samples per token level
+            if updated <= 3:
+                logger.debug(
+                    f"  [{task_id}] extracted {len(code)} chars, correct={is_correct}\n"
+                    f"    code[:200]: {code[:200]!r}"
+                )
+
         new_correct = sum(1 for r in results if r.get('is_correct', False))
         accuracy = new_correct / len(results) if results else 0
 
@@ -221,7 +232,12 @@ def main():
                         help="Directory containing tokens{0,100,500,1000}.json")
     parser.add_argument("--exec-timeout", type=int, default=10,
                         help="Code execution timeout in seconds")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logging")
     args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger(__name__).setLevel(logging.DEBUG)
 
     reeval_correctness(data_dir=args.data_dir, exec_timeout=args.exec_timeout)
 
