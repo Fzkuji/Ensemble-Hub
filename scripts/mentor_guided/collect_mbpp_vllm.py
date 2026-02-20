@@ -194,6 +194,7 @@ def reeval_correctness(data_dir: str, exec_timeout: int = 10, num_workers: int =
             tasks.append((i, code, test_list, entry_point, exec_timeout))
 
         # Run in parallel
+        logger.info(f"tokens={token_level}: evaluating {len(tasks)} samples with {num_workers} workers...")
         done = 0
         correct_count = 0
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -205,9 +206,8 @@ def reeval_correctness(data_dir: str, exec_timeout: int = 10, num_workers: int =
                 if is_correct:
                     correct_count += 1
                 if done % 50 == 0 or done == len(tasks):
-                    print(f"\r  tokens={token_level}: {done}/{len(tasks)} "
-                          f"({correct_count}/{done} correct so far)", end="", flush=True)
-        print()
+                    logger.info(f"  tokens={token_level}: {done}/{len(tasks)} done, "
+                                f"{correct_count}/{done} correct so far")
 
         new_correct = sum(1 for r in results if r.get('is_correct', False))
         accuracy = new_correct / len(results) if results else 0
