@@ -168,12 +168,15 @@ def reeval_correctness(data_dir: str, exec_timeout: int = 10, num_workers: int =
             logger.warning(f"Not found: {filepath}")
             continue
 
+        logger.info(f"Loading {filepath}...")
         with open(filepath, 'r') as f:
             results = json.load(f)
+        logger.info(f"Loaded {len(results)} results from tokens{token_level}.json")
 
         old_correct = sum(1 for r in results if r.get('is_correct', False))
 
         # Prepare tasks for parallel execution
+        logger.info(f"Preparing tasks (extracting code)...")
         tasks = []
         for i, r in enumerate(results):
             task_id = r.get('task_id', '')
