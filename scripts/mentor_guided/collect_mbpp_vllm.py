@@ -22,7 +22,8 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import Dict, List
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Dict, List, Tuple
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -150,7 +151,14 @@ def load_mbpp_metadata() -> Dict[str, Dict]:
     return metadata
 
 
-def reeval_correctness(data_dir: str, exec_timeout: int = 10):
+def _eval_single(args: Tuple) -> Tuple[int, bool]:
+    """Evaluate a single sample (top-level function for pickling)."""
+    idx, code, test_list, entry_point, timeout = args
+    is_correct = check_code_correctness(code, test_list, entry_point, timeout=timeout)
+    return idx, is_correct
+
+
+def reeval_correctness(data_dir: str, exec_timeout: int = 10, num_workers: int = 16):
     """Re-evaluate is_correct for collected MBPP data using code execution."""
     metadata = load_mbpp_metadata()
 
@@ -164,9 +172,9 @@ def reeval_correctness(data_dir: str, exec_timeout: int = 10):
             results = json.load(f)
 
         old_correct = sum(1 for r in results if r.get('is_correct', False))
-        updated = 0
 
-        correct_so_far = 0
+        # Prepare tasks for parallel execution
+        tasks = []
         for i, r in enumerate(results):
             task_id = r.get('task_id', '')
             response = r.get('response', '')
@@ -183,16 +191,23 @@ def reeval_correctness(data_dir: str, exec_timeout: int = 10):
                 continue
 
             code = extract_code_from_response(response, entry_point)
-            is_correct = check_code_correctness(code, test_list, entry_point, timeout=exec_timeout)
-            r['is_correct'] = is_correct
-            updated += 1
-            if is_correct:
-                correct_so_far += 1
+            tasks.append((i, code, test_list, entry_point, exec_timeout))
 
-            if (i + 1) % 50 == 0 or i == len(results) - 1:
-                print(f"\r  tokens={token_level}: {i+1}/{len(results)} "
-                      f"({correct_so_far}/{updated} correct so far)", end="", flush=True)
-        print()  # newline after progress
+        # Run in parallel
+        done = 0
+        correct_count = 0
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(_eval_single, t): t[0] for t in tasks}
+            for future in as_completed(futures):
+                idx, is_correct = future.result()
+                results[idx]['is_correct'] = is_correct
+                done += 1
+                if is_correct:
+                    correct_count += 1
+                if done % 50 == 0 or done == len(tasks):
+                    print(f"\r  tokens={token_level}: {done}/{len(tasks)} "
+                          f"({correct_count}/{done} correct so far)", end="", flush=True)
+        print()
 
         new_correct = sum(1 for r in results if r.get('is_correct', False))
         accuracy = new_correct / len(results) if results else 0
@@ -233,6 +248,8 @@ def main():
                         help="Directory containing tokens{0,100,500,1000}.json")
     parser.add_argument("--exec-timeout", type=int, default=10,
                         help="Code execution timeout in seconds")
+    parser.add_argument("--workers", type=int, default=16,
+                        help="Number of parallel workers for code execution")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging")
     args = parser.parse_args()
@@ -240,7 +257,8 @@ def main():
     if args.debug:
         logging.getLogger(__name__).setLevel(logging.DEBUG)
 
-    reeval_correctness(data_dir=args.data_dir, exec_timeout=args.exec_timeout)
+    reeval_correctness(data_dir=args.data_dir, exec_timeout=args.exec_timeout,
+                       num_workers=args.workers)
 
 
 if __name__ == "__main__":
