@@ -494,14 +494,30 @@ def main():
     intern_gpus = [int(g) for g in args.intern_gpus.split(",")]
     subsets = [s.strip() for s in args.subsets.split(",")] if args.subsets else SUBSETS
 
+    # Checkpoint file for intermediate results (resume-friendly)
+    ckpt_path = args.output.replace(".json", "_checkpoint.json")
+
+    def save_checkpoint(data):
+        with open(ckpt_path, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        logger.info(f"Checkpoint saved to {ckpt_path}")
+
+    def load_checkpoint():
+        if os.path.exists(ckpt_path):
+            with open(ckpt_path) as f:
+                return json.load(f)
+        return {}
+
     # ---- Load samples ----
     samples = load_test_samples(args.data_dir, args.n_samples, subsets, args.seed)
     if not samples:
         logger.error("No samples found — check --data-dir"); return
 
+    ckpt = load_checkpoint()
+
     # ---- Phase 1a: Mentor-only (32B) full generation ----
-    mentor_only_r = None
-    if not args.skip_mentor:
+    mentor_only_r = ckpt.get("mentor_only")
+    if not args.skip_mentor and mentor_only_r is None:
         logger.info("=" * 60)
         logger.info("Phase 1a: Mentor-only (32B) full generation")
         logger.info("=" * 60)
@@ -517,45 +533,73 @@ def main():
             "tokens_per_sec": float(sum(t["n_output_tokens"] for t in tl)
                                     / sum(t["time_s"] for t in tl)),
         }
+        ckpt["mentor_only"] = mentor_only_r
+        save_checkpoint(ckpt)
+    elif mentor_only_r is not None:
+        logger.info("Phase 1a: Mentor-only — loaded from checkpoint, skipping")
 
     # ---- Phase 1b: Intern (7B) generation at 4 stages ----
-    logger.info("=" * 60)
-    logger.info("Phase 1b: Intern (7B) generation at T0/T100/T500/T1000")
-    logger.info("=" * 60)
-    intern_gen = phase1_vllm_timing(samples, args.intern_model, intern_gpus,
-                                    role="intern", token_levels=TOKEN_LEVELS,
-                                    max_model_len=args.max_model_len,
-                                    gpu_mem_util=args.gpu_mem_util)
-    t0l = intern_gen[0]
-    intern_only_r = {
-        "avg_latency_s": float(np.mean([t["time_s"] for t in t0l])),
-        "total_tokens": int(sum(t["n_output_tokens"] for t in t0l)),
-        "avg_tokens_per_sample": float(np.mean([t["n_output_tokens"] for t in t0l])),
-        "tokens_per_sec": float(sum(t["n_output_tokens"] for t in t0l)
-                                / sum(t["time_s"] for t in t0l)),
-    }
+    intern_gen = ckpt.get("intern_gen")
+    intern_only_r = ckpt.get("intern_only")
+    if intern_gen is None:
+        logger.info("=" * 60)
+        logger.info("Phase 1b: Intern (7B) generation at T0/T100/T500/T1000")
+        logger.info("=" * 60)
+        intern_gen = phase1_vllm_timing(samples, args.intern_model, intern_gpus,
+                                        role="intern", token_levels=TOKEN_LEVELS,
+                                        max_model_len=args.max_model_len,
+                                        gpu_mem_util=args.gpu_mem_util)
+        t0l = intern_gen[0]
+        intern_only_r = {
+            "avg_latency_s": float(np.mean([t["time_s"] for t in t0l])),
+            "total_tokens": int(sum(t["n_output_tokens"] for t in t0l)),
+            "avg_tokens_per_sample": float(np.mean([t["n_output_tokens"] for t in t0l])),
+            "tokens_per_sec": float(sum(t["n_output_tokens"] for t in t0l)
+                                    / sum(t["time_s"] for t in t0l)),
+        }
+        # Save intern_gen with string keys for JSON serialization
+        ckpt["intern_gen"] = {str(k): v for k, v in intern_gen.items()}
+        ckpt["intern_only"] = intern_only_r
+        save_checkpoint(ckpt)
+    else:
+        logger.info("Phase 1b: Intern generation — loaded from checkpoint, skipping")
+        # Restore int keys
+        intern_gen = {int(k): v for k, v in intern_gen.items()}
 
     # ---- Phase 2: Feature extraction (transformers) ----
-    logger.info("=" * 60)
-    logger.info("Phase 2: Feature extraction (transformers forward pass)")
-    logger.info("=" * 60)
-    feat_data = phase2_feature_timing(samples, args.intern_model,
-                                      intern_gpus[0], args.max_feat_len)
+    feat_data = ckpt.get("feat_data")
+    if feat_data is None:
+        logger.info("=" * 60)
+        logger.info("Phase 2: Feature extraction (transformers forward pass)")
+        logger.info("=" * 60)
+        feat_data = phase2_feature_timing(samples, args.intern_model,
+                                          intern_gpus[0], args.max_feat_len)
+        ckpt["feat_data"] = {str(k): v for k, v in feat_data.items()}
+        save_checkpoint(ckpt)
+    else:
+        logger.info("Phase 2: Feature extraction — loaded from checkpoint, skipping")
+        feat_data = {int(k): v for k, v in feat_data.items()}
 
     # ---- Phase 3: Cascade combine ----
     logger.info("=" * 60)
     logger.info("Phase 3: Cascade routing + combine")
     logger.info("=" * 60)
-    # mentor hint generation timing at T100/T500/T1000
     mentor_gen_stages = None
     if not args.skip_mentor:
-        logger.info("Timing mentor hint generation at T100/T500/T1000 ...")
-        mentor_gen_stages = phase1_vllm_timing(
-            samples, args.mentor_model, mentor_gpus,
-            role="mentor", token_levels=[100, 500, 1000],
-            max_model_len=args.max_model_len,
-            gpu_mem_util=args.gpu_mem_util)
-        mentor_gen_stages[0] = [{"time_s": 0.0, "n_output_tokens": 0}] * len(samples)
+        mentor_gen_stages = ckpt.get("mentor_gen_stages")
+        if mentor_gen_stages is None:
+            logger.info("Timing mentor hint generation at T100/T500/T1000 ...")
+            mentor_gen_stages = phase1_vllm_timing(
+                samples, args.mentor_model, mentor_gpus,
+                role="mentor", token_levels=[100, 500, 1000],
+                max_model_len=args.max_model_len,
+                gpu_mem_util=args.gpu_mem_util)
+            mentor_gen_stages[0] = [{"time_s": 0.0, "n_output_tokens": 0}] * len(samples)
+            ckpt["mentor_gen_stages"] = {str(k): v for k, v in mentor_gen_stages.items()}
+            save_checkpoint(ckpt)
+        else:
+            logger.info("Mentor hint timing — loaded from checkpoint, skipping")
+            mentor_gen_stages = {int(k): v for k, v in mentor_gen_stages.items()}
 
     tandem_r = phase3_combine(samples, intern_gen, feat_data,
                               args.classifier_dir, mentor_gen_stages)
@@ -564,7 +608,7 @@ def main():
     # ---- Print ----
     print_results(mentor_only_r, intern_only_r, tandem_r, bkd)
 
-    # ---- Save ----
+    # ---- Save final results ----
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     save = {
         "n_samples": len(samples),
@@ -579,6 +623,11 @@ def main():
     with open(args.output, "w") as f:
         json.dump(save, f, indent=2, default=str)
     logger.info(f"Results saved to {args.output}")
+
+    # Clean up checkpoint after successful completion
+    if os.path.exists(ckpt_path):
+        os.remove(ckpt_path)
+        logger.info("Checkpoint removed (run completed successfully)")
 
 
 if __name__ == "__main__":
