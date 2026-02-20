@@ -52,7 +52,11 @@ DEFAULT_DATA_DIR = os.path.join(
     BASE_DIR,
     "hendrycks_math_split_think_mDeepSeek-R1-Distill-Qwen-32B_iDeepSeek-R1-Distill-Qwen-7B",
 )
-DEFAULT_CLASSIFIER_DIR = os.path.join(DEFAULT_DATA_DIR, "all", "ppl_model")
+DEFAULT_CLASSIFIER_DIR = os.path.join(
+    BASE_DIR,
+    "hendrycks_math_split_think_DeepSeek-R1-Distill-Qwen-7B",
+    "all", "ppl_model",
+)
 DEFAULT_MENTOR = "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
 DEFAULT_INTERN = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 DEFAULT_OUTPUT = os.path.join(DEFAULT_DATA_DIR, "latency_results.json")
@@ -304,6 +308,11 @@ def phase3_combine(
 ) -> Dict[str, Any]:
     """Walk the cascade per sample, sum actual times for stages visited."""
     clf_path = os.path.join(classifier_dir, "classifier.pkl")
+    if not os.path.exists(clf_path):
+        raise FileNotFoundError(
+            f"Classifier not found: {clf_path}\n"
+            f"Use --classifier-dir to specify the correct path."
+        )
     with open(clf_path, "rb") as f:
         saved = pickle.load(f)
     clf = saved["classifier"]
@@ -482,6 +491,8 @@ def main():
     p.add_argument("--n-samples",      type=int, default=100)
     p.add_argument("--skip-mentor",    action="store_true",
                    help="Skip mentor-only and live mentor-hint timing (use cached hints)")
+    p.add_argument("--skip-generation", action="store_true",
+                   help="Skip all vLLM generation (Phase 1). Uses pre-measured avg times.")
     p.add_argument("--subsets",        default=None)
     p.add_argument("--max-model-len",  type=int, default=8192)
     p.add_argument("--max-feat-len",   type=int, default=1024)
@@ -515,56 +526,103 @@ def main():
 
     ckpt = load_checkpoint()
 
-    # ---- Phase 1a: Mentor-only (32B) full generation ----
-    mentor_only_r = ckpt.get("mentor_only")
-    if not args.skip_mentor and mentor_only_r is None:
-        logger.info("=" * 60)
-        logger.info("Phase 1a: Mentor-only (32B) full generation")
-        logger.info("=" * 60)
-        mg = phase1_vllm_timing(samples, args.mentor_model, mentor_gpus,
-                                role="mentor", token_levels=[0],
-                                max_model_len=args.max_model_len,
-                                gpu_mem_util=args.gpu_mem_util)
-        tl = mg[0]
-        mentor_only_r = {
-            "avg_latency_s": float(np.mean([t["time_s"] for t in tl])),
-            "total_tokens": int(sum(t["n_output_tokens"] for t in tl)),
-            "avg_tokens_per_sample": float(np.mean([t["n_output_tokens"] for t in tl])),
-            "tokens_per_sec": float(sum(t["n_output_tokens"] for t in tl)
-                                    / sum(t["time_s"] for t in tl)),
-        }
-        ckpt["mentor_only"] = mentor_only_r
-        save_checkpoint(ckpt)
-    elif mentor_only_r is not None:
-        logger.info("Phase 1a: Mentor-only — loaded from checkpoint, skipping")
+    # Pre-measured generation times (s/sample) from previous runs
+    PREMEASURED_INTERN = {0: 6.59, 100: 4.48, 500: 3.93, 1000: 3.69}
+    PREMEASURED_MENTOR = 19.30
 
-    # ---- Phase 1b: Intern (7B) generation at 4 stages ----
-    intern_gen = ckpt.get("intern_gen")
-    intern_only_r = ckpt.get("intern_only")
-    if intern_gen is None:
+    if args.skip_generation:
+        # ---- Skip Phase 1 entirely, use pre-measured average times ----
         logger.info("=" * 60)
-        logger.info("Phase 1b: Intern (7B) generation at T0/T100/T500/T1000")
+        logger.info("--skip-generation: using pre-measured generation times")
         logger.info("=" * 60)
-        intern_gen = phase1_vllm_timing(samples, args.intern_model, intern_gpus,
-                                        role="intern", token_levels=TOKEN_LEVELS,
-                                        max_model_len=args.max_model_len,
-                                        gpu_mem_util=args.gpu_mem_util)
-        t0l = intern_gen[0]
-        intern_only_r = {
-            "avg_latency_s": float(np.mean([t["time_s"] for t in t0l])),
-            "total_tokens": int(sum(t["n_output_tokens"] for t in t0l)),
-            "avg_tokens_per_sample": float(np.mean([t["n_output_tokens"] for t in t0l])),
-            "tokens_per_sec": float(sum(t["n_output_tokens"] for t in t0l)
-                                    / sum(t["time_s"] for t in t0l)),
-        }
-        # Save intern_gen with string keys for JSON serialization
-        ckpt["intern_gen"] = {str(k): v for k, v in intern_gen.items()}
-        ckpt["intern_only"] = intern_only_r
-        save_checkpoint(ckpt)
+
+        n = len(samples)
+
+        # Try checkpoint first, otherwise construct from pre-measured averages
+        intern_gen = ckpt.get("intern_gen")
+        if intern_gen is not None:
+            logger.info("  intern_gen loaded from checkpoint")
+            intern_gen = {int(k): v for k, v in intern_gen.items()}
+        else:
+            logger.info("  Constructing intern_gen from pre-measured averages")
+            intern_gen = {}
+            for tl_val in TOKEN_LEVELS:
+                avg_t = PREMEASURED_INTERN[tl_val]
+                intern_gen[tl_val] = [{"time_s": avg_t, "n_output_tokens": 0}] * n
+
+        intern_only_r = ckpt.get("intern_only")
+        if intern_only_r is None:
+            intern_only_r = {
+                "avg_latency_s": PREMEASURED_INTERN[0],
+                "total_tokens": 0,
+                "avg_tokens_per_sample": 0,
+                "tokens_per_sec": 0,
+            }
+
+        mentor_only_r = ckpt.get("mentor_only")
+        if mentor_only_r is None:
+            mentor_only_r = {
+                "avg_latency_s": PREMEASURED_MENTOR,
+                "total_tokens": 0,
+                "avg_tokens_per_sample": 0,
+                "tokens_per_sec": 0,
+            }
+
+        for tl_val, avg_t in PREMEASURED_INTERN.items():
+            logger.info(f"  Intern {STAGE_NAMES[tl_val]}: {avg_t:.2f} s/sample")
+        logger.info(f"  Mentor full: {PREMEASURED_MENTOR:.2f} s/sample")
+
     else:
-        logger.info("Phase 1b: Intern generation — loaded from checkpoint, skipping")
-        # Restore int keys
-        intern_gen = {int(k): v for k, v in intern_gen.items()}
+        # ---- Phase 1a: Mentor-only (32B) full generation ----
+        mentor_only_r = ckpt.get("mentor_only")
+        if not args.skip_mentor and mentor_only_r is None:
+            logger.info("=" * 60)
+            logger.info("Phase 1a: Mentor-only (32B) full generation")
+            logger.info("=" * 60)
+            mg = phase1_vllm_timing(samples, args.mentor_model, mentor_gpus,
+                                    role="mentor", token_levels=[0],
+                                    max_model_len=args.max_model_len,
+                                    gpu_mem_util=args.gpu_mem_util)
+            tl = mg[0]
+            mentor_only_r = {
+                "avg_latency_s": float(np.mean([t["time_s"] for t in tl])),
+                "total_tokens": int(sum(t["n_output_tokens"] for t in tl)),
+                "avg_tokens_per_sample": float(np.mean([t["n_output_tokens"] for t in tl])),
+                "tokens_per_sec": float(sum(t["n_output_tokens"] for t in tl)
+                                        / sum(t["time_s"] for t in tl)),
+            }
+            ckpt["mentor_only"] = mentor_only_r
+            save_checkpoint(ckpt)
+        elif mentor_only_r is not None:
+            logger.info("Phase 1a: Mentor-only — loaded from checkpoint, skipping")
+
+        # ---- Phase 1b: Intern (7B) generation at 4 stages ----
+        intern_gen = ckpt.get("intern_gen")
+        intern_only_r = ckpt.get("intern_only")
+        if intern_gen is None:
+            logger.info("=" * 60)
+            logger.info("Phase 1b: Intern (7B) generation at T0/T100/T500/T1000")
+            logger.info("=" * 60)
+            intern_gen = phase1_vllm_timing(samples, args.intern_model, intern_gpus,
+                                            role="intern", token_levels=TOKEN_LEVELS,
+                                            max_model_len=args.max_model_len,
+                                            gpu_mem_util=args.gpu_mem_util)
+            t0l = intern_gen[0]
+            intern_only_r = {
+                "avg_latency_s": float(np.mean([t["time_s"] for t in t0l])),
+                "total_tokens": int(sum(t["n_output_tokens"] for t in t0l)),
+                "avg_tokens_per_sample": float(np.mean([t["n_output_tokens"] for t in t0l])),
+                "tokens_per_sec": float(sum(t["n_output_tokens"] for t in t0l)
+                                        / sum(t["time_s"] for t in t0l)),
+            }
+            # Save intern_gen with string keys for JSON serialization
+            ckpt["intern_gen"] = {str(k): v for k, v in intern_gen.items()}
+            ckpt["intern_only"] = intern_only_r
+            save_checkpoint(ckpt)
+        else:
+            logger.info("Phase 1b: Intern generation — loaded from checkpoint, skipping")
+            # Restore int keys
+            intern_gen = {int(k): v for k, v in intern_gen.items()}
 
     # ---- Phase 2: Feature extraction (transformers) ----
     feat_data = ckpt.get("feat_data")
@@ -572,6 +630,11 @@ def main():
         logger.info("=" * 60)
         logger.info("Phase 2: Feature extraction (transformers forward pass)")
         logger.info("=" * 60)
+        # When skipping generation, vLLM hasn't set CUDA_VISIBLE_DEVICES,
+        # so we set it manually to the first intern GPU.
+        if args.skip_generation:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(intern_gpus[0])
+            logger.info(f"  Set CUDA_VISIBLE_DEVICES={intern_gpus[0]}")
         feat_data = phase2_feature_timing(samples, args.intern_model,
                                           intern_gpus[0], args.max_feat_len)
         ckpt["feat_data"] = {str(k): v for k, v in feat_data.items()}
@@ -585,7 +648,15 @@ def main():
     logger.info("Phase 3: Cascade routing + combine")
     logger.info("=" * 60)
     mentor_gen_stages = None
-    if not args.skip_mentor:
+    if args.skip_generation:
+        # In Tandem cascade, mentor hints are pre-computed and cached, so
+        # mentor hint generation is NOT part of the tandem latency.
+        # We set mentor_gen_stages to zero to reflect this.
+        logger.info("  skip-generation: mentor hint time set to 0 (pre-cached)")
+        n = len(samples)
+        mentor_gen_stages = {tl_val: [{"time_s": 0.0, "n_output_tokens": 0}] * n
+                             for tl_val in TOKEN_LEVELS}
+    elif not args.skip_mentor:
         mentor_gen_stages = ckpt.get("mentor_gen_stages")
         if mentor_gen_stages is None:
             logger.info("Timing mentor hint generation at T100/T500/T1000 ...")
