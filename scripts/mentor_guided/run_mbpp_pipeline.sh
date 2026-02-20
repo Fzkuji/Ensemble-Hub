@@ -17,8 +17,8 @@ INTERN_MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 HF_MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"  # For feature extraction
 TOKEN_LEVELS="0,100,500,1000"
 TEMPERATURE=0.7
-MAX_MODEL_LEN=4096
-BATCH_SIZE=16
+MAX_MODEL_LEN=8192
+BATCH_SIZE=8
 EXEC_TIMEOUT=15
 
 # Paths (auto-detected from output dir naming convention)
