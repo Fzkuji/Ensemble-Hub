@@ -27,21 +27,37 @@ TOKEN_LEVELS = [0, 100, 500, 1000]
 
 def load_math_with_levels():
     """Load original MATH dataset from HuggingFace to get difficulty levels."""
+    import re
     from datasets import load_dataset
 
+    # Try multiple dataset names (different versions cached under different names)
+    HF_NAMES = [
+        "EleutherAI/hendrycks_math",       # used by collect_data_vllm_think.py
+        "hendrycks/competition_math",       # alternative name
+    ]
+
     level_map = {}  # question_text -> difficulty_level (int)
-    for subset in SUBSETS:
-        dataset = load_dataset("hendrycks/competition_math", subset, split="test")
-        for item in dataset:
-            q = item["problem"].strip()
-            level_str = item.get("level", "")
-            # Parse "Level 3" -> 3
-            import re
-            m = re.search(r"(\d)", str(level_str))
-            level = int(m.group(1)) if m else None
-            level_map[q] = level
-    print(f"Loaded {len(level_map)} problems with difficulty levels from HuggingFace")
-    return level_map
+    for hf_name in HF_NAMES:
+        try:
+            print(f"Trying to load from '{hf_name}'...")
+            for subset in SUBSETS:
+                dataset = load_dataset(hf_name, subset, split="test")
+                for item in dataset:
+                    q = item["problem"].strip()
+                    level_str = item.get("level", "")
+                    m = re.search(r"(\d)", str(level_str))
+                    level = int(m.group(1)) if m else None
+                    level_map[q] = level
+                print(f"  {subset}: {len(dataset)} problems")
+            print(f"Loaded {len(level_map)} problems with difficulty levels from '{hf_name}'")
+            return level_map
+        except Exception as e:
+            print(f"  Failed: {e}")
+            level_map = {}
+            continue
+
+    raise RuntimeError("Could not load MATH dataset from any known source. "
+                       "Please check your HuggingFace cache or internet connection.")
 
 
 def load_collected_data(data_dir):
