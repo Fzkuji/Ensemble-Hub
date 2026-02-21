@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-Simple Latency Measurement for Tandem (Reviewer yUBt W5).
+Wall-clock Latency Measurement for Tandem (Reviewer yUBt W5).
 
-Approach: generate fixed # tokens (based on paper data averages), measure time.
-No classifier, no feature extraction — just pure generation speed.
+Benchmarks actual vLLM generation times for both LLM (32B) and SLM (7B),
+using token counts from the paper's Table 1 and the trained classifier's
+cascade distribution.
 
-Two modes:
-  1. --benchmark: load vLLM, generate fixed tokens, measure wall-clock time
-  2. Default:     use pre-measured generation times from previous runs
+Tandem cascade flow for a sample stopping at stage S:
+  T0_check → (LLM gen 100 → T100_check →) ... → S_check → SLM generates at S
 
-Both modes compute Tandem latency from oracle cascade distribution.
+  - Each check: PPL/entropy forward pass + classifier inference (CLF_OVERHEAD)
+  - Each stage transition: LLM generates incremental thinking tokens
+  - Final step: SLM generates the answer using accumulated thinking tokens
 
 Usage:
-  python eval_latency.py                              # use pre-measured times
-  python eval_latency.py --benchmark --intern-gpus 4  # re-measure 7B
+  python eval_latency.py --benchmark                                  # full benchmark
+  python eval_latency.py --benchmark-mentor --mentor-gpus 0,1,2,3     # mentor only
+  python eval_latency.py --benchmark-intern --intern-gpus 4,5,6,7     # intern only
+  python eval_latency.py                                               # pre-measured
 """
 
 import argparse
@@ -35,98 +39,43 @@ if scripts_dir not in sys.path:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
-TOKEN_LEVELS = [0, 100, 500, 1000]
-STAGE_NAMES = {0: "T0", 100: "T100", 500: "T500", 1000: "T1000"}
-SUBSETS = [
-    "algebra", "counting_and_probability", "geometry",
-    "intermediate_algebra", "number_theory", "prealgebra", "precalculus",
-]
+# ============================================================================
+# Paper data (Table 1: DeepSeek-R1-Distill-Qwen-32B/7B on MATH, average)
+# ============================================================================
 
-# Pre-measured generation times (s/sample) from previous vLLM runs (4-GPU TP)
-PREMEASURED_INTERN = {0: 6.59, 100: 4.48, 500: 3.93, 1000: 3.69}
-PREMEASURED_MENTOR = 19.30
+STAGE_ORDER = ["T0", "T100", "T500", "T1000"]
 
-# Pre-measured feature extraction + classifier overhead (s/sample)
-# Feature extraction = transformers forward pass for PPL/entropy (1 GPU)
-# Classifier inference is <0.001s, included in the totals below
-PREMEASURED_OVERHEAD = {0: 0.022, 100: 0.029, 500: 0.075, 1000: 0.124}
+# Total inference length per stage = LLM thinking tokens + SLM output tokens
+STAGE_CONFIG = {
+    "T0":    {"llm_tok": 0,    "total_tok": 2732},   # 7B standalone
+    "T100":  {"llm_tok": 100,  "total_tok": 2735},   # 7B+32B (low)
+    "T500":  {"llm_tok": 500,  "total_tok": 2853},   # 7B+32B (medium)
+    "T1000": {"llm_tok": 1000, "total_tok": 2930},   # 7B+32B (high)
+}
+for s in STAGE_CONFIG.values():
+    s["slm_tok"] = s["total_tok"] - s["llm_tok"]
 
-BASE_DIR = "/mnt/data/zichuanfu/Ensemble-Hub/data/acte_experiments/collected"
-DEFAULT_DATA_DIR = os.path.join(
-    BASE_DIR,
-    "hendrycks_math_split_think_mDeepSeek-R1-Distill-Qwen-32B_iDeepSeek-R1-Distill-Qwen-7B",
-)
+# 32B standalone: avg 2630 output tokens (for Mentor Only baseline)
+MENTOR_FULL_TOKENS = 2630
+
+# Tandem cascade stage distribution (from trained classifier, Table in Q2)
+CASCADE_DIST = {"T0": 0.0938, "T100": 0.1152, "T500": 0.3154, "T1000": 0.4756}
+
+# Continual judgment overhead per stage (pre-measured: PPL/entropy forward + clf)
+CLF_OVERHEAD = {"T0": 0.022, "T100": 0.029, "T500": 0.075, "T1000": 0.124}
+
 DEFAULT_MENTOR = "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
 DEFAULT_INTERN = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 
 
 # ============================================================================
-# Step 1: Load data → avg token counts + oracle cascade distribution
+# Benchmarking
 # ============================================================================
 
-def load_data_stats(data_dir: str, n_samples: int = 100, seed: int = 42):
-    """Load test data and compute:
-      - avg intern/mentor output token counts per stage
-      - oracle cascade stop distribution (stop at first correct stage)
-    """
-    all_q = {}
-    for subset in SUBSETS:
-        for tl in TOKEN_LEVELS:
-            path = os.path.join(data_dir, subset, "test", f"tokens{tl}.json")
-            if not os.path.exists(path):
-                log.warning(f"Missing: {path}")
-                continue
-            with open(path) as f:
-                items = json.load(f)
-            for item in items:
-                q = item["question"].strip()
-                if q not in all_q:
-                    all_q[q] = {}
-                all_q[q][tl] = {
-                    "intern_length": item.get("intern_length", 0),
-                    "mentor_length": item.get("mentor_length", 0),
-                    "is_correct": item.get("is_correct", False),
-                }
-
-    complete = [s for s in all_q.values() if len(s) == len(TOKEN_LEVELS)]
-    log.info(f"Complete samples (all 4 stages): {len(complete)}")
-
-    rng = np.random.RandomState(seed)
-    if n_samples < len(complete):
-        idx = rng.choice(len(complete), size=n_samples, replace=False)
-        complete = [complete[i] for i in sorted(idx)]
-
-    # Average token counts per stage
-    avg_intern = {}
-    avg_mentor = {}
-    for tl in TOKEN_LEVELS:
-        avg_intern[tl] = int(np.mean([s[tl]["intern_length"] for s in complete]))
-        avg_mentor[tl] = int(np.mean([s[tl]["mentor_length"] for s in complete]))
-
-    # Oracle cascade: stop at FIRST stage where answer is correct
-    oracle_stop = {tl: 0 for tl in TOKEN_LEVELS}
-    for s in complete:
-        for tl in TOKEN_LEVELS:
-            if s[tl]["is_correct"]:
-                oracle_stop[tl] += 1
-                break
-        else:
-            oracle_stop[TOKEN_LEVELS[-1]] += 1  # never correct → stop at last
-
-    n = len(complete)
-    oracle_dist = {tl: oracle_stop[tl] / n for tl in TOKEN_LEVELS}
-
-    return avg_intern, avg_mentor, oracle_dist, n
-
-
-# ============================================================================
-# Step 2: Benchmark generation (optional, with --benchmark)
-# ============================================================================
-
-def benchmark_vllm(model_name: str, gpu_ids: List[int],
-                   token_targets: Dict[str, int], n_repeat: int = 20,
-                   max_model_len: int = 8192, gpu_mem_util: float = 0.9):
-    """Generate fixed # tokens with vLLM, measure avg wall-clock time.
+def benchmark_model(model_name: str, gpu_ids: List[int],
+                    token_targets: Dict[str, int], n_repeat: int = 20,
+                    max_model_len: int = 8192, gpu_mem_util: float = 0.9):
+    """Benchmark vLLM generation for fixed token counts.
 
     Args:
         token_targets: {label: n_tokens}
@@ -157,8 +106,7 @@ def benchmark_vllm(model_name: str, gpu_ids: List[int],
         for _ in tqdm(range(n_repeat), desc=f"{label}({n_tok}tok)", ncols=80):
             t0 = time.time()
             _ = vllm_m.generate([prompt], max_tokens=n_tok, temperature=0.6)
-            t1 = time.time()
-            times.append(t1 - t0)
+            times.append(time.time() - t0)
         avg = float(np.mean(times))
         results[label] = avg
         log.info(f"  {label}: {avg:.3f}s ({n_tok} tokens)")
@@ -169,74 +117,114 @@ def benchmark_vllm(model_name: str, gpu_ids: List[int],
 
 
 # ============================================================================
-# Step 3: Compute Tandem latency from cascade distribution
+# Latency computation
 # ============================================================================
 
-def compute_tandem(intern_times: Dict[int, float],
-                   oracle_dist: Dict[int, float],
-                   overhead: Dict[int, float] = None) -> float:
-    """Tandem cascade latency = weighted sum of cumulative per-stage times.
+def compute_cascade_latency(llm_times: Dict[int, float],
+                            slm_times: Dict[str, float],
+                            cascade_dist: Dict[str, float] = None):
+    """Compute Tandem cascade latency with proper LLM + SLM accounting.
 
-    Cascade is sequential: sample stopped at T_k has visited T0, ..., T_k.
-    Each stage costs: intern_generation + feature_extraction + classifier.
+    Cascade flow for a sample stopping at stage S:
+      - Visits all stages T0..S sequentially
+      - At each stage: LLM generates incremental tokens + clf check
+      - At stop stage: SLM generates the final answer
+
+    Args:
+        llm_times: {100: time_s, 500: time_s, 1000: time_s}
+                   Cumulative LLM gen time for first N tokens.
+        slm_times: {"T0": time_s, ...}
+                   SLM gen time for the SLM output tokens at each stage.
+        cascade_dist: {"T0": fraction, ...}
+
+    Returns:
+        cumulative: {stage: total_latency_if_stop_here}
+        llm_incremental: {stage: incremental_llm_time}
+        tandem_avg: weighted average latency
     """
-    if overhead is None:
-        overhead = PREMEASURED_OVERHEAD
-    avg_time = 0.0
-    for i, stop_tl in enumerate(TOKEN_LEVELS):
-        p = oracle_dist.get(stop_tl, 0.0)
-        cum_time = sum(intern_times[TOKEN_LEVELS[j]] + overhead.get(TOKEN_LEVELS[j], 0)
-                       for j in range(i + 1))
-        avg_time += p * cum_time
-    return avg_time
+    if cascade_dist is None:
+        cascade_dist = CASCADE_DIST
+
+    # LLM incremental times (from cumulative measurements)
+    # T0: no LLM generation
+    # T100: LLM generates first 100 tokens
+    # T500: LLM generates tokens 100→500 (incremental)
+    # T1000: LLM generates tokens 500→1000 (incremental)
+    llm_incremental = {
+        "T0":    0.0,
+        "T100":  llm_times[100],
+        "T500":  llm_times[500] - llm_times[100],
+        "T1000": llm_times[1000] - llm_times[500],
+    }
+
+    # Cumulative time for samples stopping at each stage
+    cumulative = {}
+    running_time = 0.0
+    for stage in STAGE_ORDER:
+        # Add: LLM incremental generation + classifier check at this stage
+        running_time += llm_incremental[stage] + CLF_OVERHEAD[stage]
+        # If stopping here: also add SLM generation for the answer
+        cumulative[stage] = running_time + slm_times[stage]
+
+    # Weighted average
+    tandem_avg = sum(cascade_dist[s] * cumulative[s] for s in STAGE_ORDER)
+
+    return cumulative, llm_incremental, tandem_avg
 
 
 # ============================================================================
-# Step 4: Print rebuttal table
+# Output
 # ============================================================================
 
-def print_table(mentor_time, intern_time_t0, tandem_time,
-                avg_intern, oracle_dist, intern_times,
-                overhead=None):
-    if overhead is None:
-        overhead = PREMEASURED_OVERHEAD
+def print_results(llm_times, slm_times, mentor_full_time):
+    cumulative, llm_incr, tandem_avg = compute_cascade_latency(llm_times, slm_times)
+    intern_only = slm_times["T0"]
+
     print()
-    print("=" * 70)
+    print("=" * 75)
     print("  Wall-clock Latency (Reviewer yUBt W5)")
-    print("=" * 70)
-    fmt = "  {:<22} {:>14} {:>14}"
-    print(fmt.format("Method", "Avg Latency (s)", "Avg Tokens"))
-    print("  " + "-" * 52)
-    print(fmt.format("Mentor Only (32B)", f"{mentor_time:.2f}", "—"))
-    print(fmt.format("Intern Only (7B)", f"{intern_time_t0:.2f}",
-                      str(avg_intern[0])))
-    print(fmt.format("Tandem (Oracle)", f"{tandem_time:.2f}", "—"))
-    print("  " + "-" * 52)
+    print("=" * 75)
+
+    # Main comparison
+    fmt = "  {:<22} {:>14} {:>10}"
+    print(fmt.format("Method", "Latency (s)", "Speedup"))
+    print("  " + "-" * 48)
+    print(fmt.format("Mentor Only (32B)", f"{mentor_full_time:.2f}", "1.0x"))
+    print(fmt.format("Tandem (Cascade)",  f"{tandem_avg:.2f}",
+                      f"{mentor_full_time/tandem_avg:.1f}x"))
+    print(fmt.format("Intern Only (7B)",  f"{intern_only:.2f}",
+                      f"{mentor_full_time/intern_only:.1f}x"))
+
+    # Per-stage breakdown
+    print()
+    print("  Per-stage breakdown (incremental cost per stage):")
+    hdr = "  {:<8} {:>10} {:>10} {:>8} {:>10} {:>8}"
+    print(hdr.format("Stage", "LLM Gen", "SLM Gen", "Clf", "Cumul", "Dist"))
+    print("  " + "-" * 60)
+    for stage in STAGE_ORDER:
+        cfg = STAGE_CONFIG[stage]
+        print(hdr.format(
+            stage,
+            f"{llm_incr[stage]:.2f}s",
+            f"{slm_times[stage]:.2f}s",
+            f"{CLF_OVERHEAD[stage]:.3f}s",
+            f"{cumulative[stage]:.2f}s",
+            f"{CASCADE_DIST[stage]*100:.1f}%",
+        ))
 
     print()
-    print("  Per-stage breakdown (generation + classifier overhead):")
-    for tl in TOKEN_LEVELS:
-        oh = overhead.get(tl, 0)
-        total = intern_times[tl] + oh
-        print(f"    {STAGE_NAMES[tl]}: {intern_times[tl]:.2f}s gen "
-              f"+ {oh:.3f}s clf = {total:.2f}s "
-              f"(avg {avg_intern[tl]} tokens)")
+    print(f"  Tandem weighted avg: {tandem_avg:.2f}s "
+          f"({mentor_full_time/tandem_avg:.1f}x faster than Mentor Only)")
 
+    # Token counts for reference
     print()
-    print("  Oracle cascade distribution:")
-    for tl in TOKEN_LEVELS:
-        print(f"    {STAGE_NAMES[tl]}: {oracle_dist[tl]*100:.1f}%")
+    print("  Token counts (from paper Table 1):")
+    for stage in STAGE_ORDER:
+        cfg = STAGE_CONFIG[stage]
+        print(f"    {stage}: LLM={cfg['llm_tok']}, SLM={cfg['slm_tok']}, "
+              f"Total={cfg['total_tok']}")
 
-    # Tandem breakdown by stopped stage
-    print()
-    print("  Tandem per-stop-stage latency (cumulative):")
-    for i, tl in enumerate(TOKEN_LEVELS):
-        cum = sum(intern_times[TOKEN_LEVELS[j]] + overhead.get(TOKEN_LEVELS[j], 0)
-                  for j in range(i + 1))
-        pct = oracle_dist[tl] * 100
-        print(f"    Stop@{STAGE_NAMES[tl]}: {cum:.2f}s × {pct:.1f}% samples")
-
-    print("=" * 70)
+    print("=" * 75)
 
 
 # ============================================================================
@@ -244,86 +232,118 @@ def print_table(mentor_time, intern_time_t0, tandem_time,
 # ============================================================================
 
 def main():
-    p = argparse.ArgumentParser(description="Latency measurement (Reviewer yUBt W5)")
-    p.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    p = argparse.ArgumentParser(
+        description="Wall-clock latency measurement for Tandem (Reviewer yUBt W5)")
     p.add_argument("--mentor-model", default=DEFAULT_MENTOR)
     p.add_argument("--intern-model", default=DEFAULT_INTERN)
     p.add_argument("--mentor-gpus", default="0,1,2,3")
     p.add_argument("--intern-gpus", default="4,5,6,7")
-    p.add_argument("--n-samples", type=int, default=100)
     p.add_argument("--n-repeat", type=int, default=20,
-                   help="Repetitions per generation target (for --benchmark)")
+                   help="Repetitions per generation target")
     p.add_argument("--benchmark", action="store_true",
-                   help="Re-measure generation times with vLLM (requires GPUs)")
-    p.add_argument("--skip-mentor", action="store_true",
-                   help="Skip mentor (32B) benchmark, use pre-measured time")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--output", default=None)
+                   help="Benchmark both LLM and SLM (requires GPUs)")
+    p.add_argument("--benchmark-mentor", action="store_true",
+                   help="Benchmark LLM (32B) only")
+    p.add_argument("--benchmark-intern", action="store_true",
+                   help="Benchmark SLM (7B) only")
+    p.add_argument("--output", default="latency_results.json")
     args = p.parse_args()
-
-    if args.output is None:
-        args.output = os.path.join(args.data_dir, "latency_results.json")
 
     mentor_gpus = [int(g) for g in args.mentor_gpus.split(",")]
     intern_gpus = [int(g) for g in args.intern_gpus.split(",")]
 
-    # ---- Step 1: Load data stats ----
-    log.info("Loading data stats ...")
-    avg_intern, avg_mentor, oracle_dist, n = load_data_stats(
-        args.data_dir, args.n_samples, args.seed)
+    do_mentor = args.benchmark or args.benchmark_mentor
+    do_intern = args.benchmark or args.benchmark_intern
 
-    log.info(f"Avg intern tokens per stage: {avg_intern}")
-    log.info(f"Oracle cascade distribution: "
-             + ", ".join(f"{STAGE_NAMES[tl]}={oracle_dist[tl]*100:.1f}%"
-                         for tl in TOKEN_LEVELS))
-
-    # ---- Step 2: Get generation times ----
-    if args.benchmark:
-        # Re-measure with vLLM
+    # ---- Benchmark LLM (32B) ----
+    if do_mentor:
         log.info("=" * 60)
-        log.info("Benchmarking generation times ...")
+        log.info("Benchmarking LLM (32B) generation")
         log.info("=" * 60)
 
-        # Mentor (32B)
-        if not args.skip_mentor:
-            mentor_targets = {"mentor_full": 4096}  # generate up to 4096 tokens
-            mentor_results = benchmark_vllm(
-                args.mentor_model, mentor_gpus, mentor_targets,
-                n_repeat=args.n_repeat)
-            mentor_time = mentor_results["mentor_full"]
-        else:
-            mentor_time = PREMEASURED_MENTOR
+        targets = {
+            "LLM_100":  100,
+            "LLM_500":  500,
+            "LLM_1000": 1000,
+            "LLM_full": MENTOR_FULL_TOKENS,
+        }
+        raw = benchmark_model(args.mentor_model, mentor_gpus, targets,
+                              n_repeat=args.n_repeat)
+        llm_times = {100: raw["LLM_100"], 500: raw["LLM_500"],
+                     1000: raw["LLM_1000"]}
+        mentor_full = raw["LLM_full"]
 
-        # Intern (7B) at each stage
-        intern_targets = {STAGE_NAMES[tl]: avg_intern[tl] for tl in TOKEN_LEVELS}
-        intern_results = benchmark_vllm(
-            args.intern_model, intern_gpus, intern_targets,
-            n_repeat=args.n_repeat)
-        intern_times = {tl: intern_results[STAGE_NAMES[tl]] for tl in TOKEN_LEVELS}
+        # Save for future runs
+        log.info(f"LLM times: 100={llm_times[100]:.3f}s, "
+                 f"500={llm_times[500]:.3f}s, 1000={llm_times[1000]:.3f}s, "
+                 f"full={mentor_full:.3f}s")
     else:
-        # Use pre-measured times
-        log.info("Using pre-measured generation times (no --benchmark flag)")
-        mentor_time = PREMEASURED_MENTOR
-        intern_times = dict(PREMEASURED_INTERN)
+        log.info("Using pre-measured LLM times")
+        log.info("(Run with --benchmark or --benchmark-mentor to re-measure)")
+        # Will be filled after first benchmark run
+        llm_times = None
+        mentor_full = None
 
-    # ---- Step 3: Compute Tandem latency ----
-    tandem_time = compute_tandem(intern_times, oracle_dist)
+    # ---- Benchmark SLM (7B) ----
+    if do_intern:
+        log.info("=" * 60)
+        log.info("Benchmarking SLM (7B) generation")
+        log.info("=" * 60)
 
-    # ---- Step 4: Print & save ----
-    print_table(mentor_time, intern_times[0], tandem_time,
-                avg_intern, oracle_dist, intern_times)
+        targets = {}
+        for stage in STAGE_ORDER:
+            targets[f"SLM_{stage}"] = STAGE_CONFIG[stage]["slm_tok"]
+
+        raw = benchmark_model(args.intern_model, intern_gpus, targets,
+                              n_repeat=args.n_repeat)
+        slm_times = {stage: raw[f"SLM_{stage}"] for stage in STAGE_ORDER}
+
+        log.info(f"SLM times: " + ", ".join(
+            f"{s}={slm_times[s]:.3f}s" for s in STAGE_ORDER))
+    else:
+        log.info("Using pre-measured SLM times")
+        slm_times = None
+
+    # ---- Load from previous results if needed ----
+    if (llm_times is None or slm_times is None) and os.path.exists(args.output):
+        log.info(f"Loading previous results from {args.output}")
+        with open(args.output) as f:
+            prev = json.load(f)
+        if llm_times is None and "llm_gen_times_s" in prev:
+            llm_times = {int(k): v for k, v in prev["llm_gen_times_s"].items()}
+            mentor_full = prev["mentor_full_time_s"]
+            log.info(f"Loaded LLM times from {args.output}")
+        if slm_times is None and "slm_gen_times_s" in prev:
+            slm_times = prev["slm_gen_times_s"]
+            log.info(f"Loaded SLM times from {args.output}")
+
+    if llm_times is None or slm_times is None:
+        log.error("No generation times available. "
+                  "Run with --benchmark to measure, or ensure previous "
+                  f"results exist at {args.output}")
+        return
+
+    # ---- Compute and print results ----
+    print_results(llm_times, slm_times, mentor_full)
+
+    # ---- Save ----
+    cumulative, llm_incr, tandem_avg = compute_cascade_latency(
+        llm_times, slm_times)
 
     save = {
-        "n_samples": n,
-        "avg_intern_tokens": {str(k): v for k, v in avg_intern.items()},
-        "avg_mentor_tokens": {str(k): v for k, v in avg_mentor.items()},
-        "oracle_distribution": {str(k): v for k, v in oracle_dist.items()},
-        "mentor_time_s": mentor_time,
-        "intern_times_s": {str(k): v for k, v in intern_times.items()},
-        "intern_only_latency_s": intern_times[0],
-        "tandem_oracle_latency_s": tandem_time,
+        "llm_gen_times_s": {str(k): v for k, v in llm_times.items()},
+        "slm_gen_times_s": slm_times,
+        "mentor_full_time_s": mentor_full,
+        "llm_incremental_s": llm_incr,
+        "clf_overhead_s": CLF_OVERHEAD,
+        "cascade_dist": CASCADE_DIST,
+        "stage_config": STAGE_CONFIG,
+        "cumulative_latency_s": cumulative,
+        "tandem_avg_latency_s": tandem_avg,
+        "mentor_only_latency_s": mentor_full,
+        "intern_only_latency_s": slm_times["T0"],
+        "speedup_vs_mentor": mentor_full / tandem_avg,
     }
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as f:
         json.dump(save, f, indent=2)
     log.info(f"Saved to {args.output}")
