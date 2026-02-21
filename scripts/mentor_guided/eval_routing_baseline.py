@@ -290,6 +290,7 @@ def eval_binary_routing(
     features: np.ndarray,
     labels: np.ndarray,
     train_idx: np.ndarray,
+    val_idx: np.ndarray,
     test_idx: np.ndarray,
     low_stage: int = 0,
     high_stage: int = 3,
@@ -299,16 +300,17 @@ def eval_binary_routing(
 
     Label = 1 if problem is correct at low_stage (can stay at cheap stage).
     If classifier says 0, route to high_stage.
+    Threshold is selected on val_idx, final accuracy reported on test_idx.
     """
-    # Labels: can the problem be solved at the low stage?
     y_train = labels[train_idx, low_stage]
-    y_test = labels[test_idx, low_stage]
 
     X_train = features[train_idx]
+    X_val = features[val_idx]
     X_test = features[test_idx]
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
+    X_val_s = scaler.transform(X_val)
     X_test_s = scaler.transform(X_test)
 
     clf = GradientBoostingClassifier(
@@ -316,45 +318,52 @@ def eval_binary_routing(
     )
     clf.fit(X_train_s, y_train)
 
-    probs = clf.predict_proba(X_test_s)[:, 1]
-
-    # Search for best threshold
-    best_acc = 0
+    # Select threshold on validation set
+    val_probs = clf.predict_proba(X_val_s)[:, 1]
+    best_val_acc = 0
     best_thresh = 0.5
-    best_details = {}
 
     for thresh in np.arange(0.1, 0.95, 0.05):
-        route_low = probs >= thresh
-        route_high = ~route_low
-
+        route_low = val_probs >= thresh
         correct = 0
-        for i, idx in enumerate(test_idx):
+        for i, idx in enumerate(val_idx):
             if route_low[i]:
                 correct += labels[idx, low_stage]
             else:
                 correct += labels[idx, high_stage]
-
-        acc = correct / len(test_idx)
-        pct_low = route_low.sum() / len(test_idx) * 100
-        pct_high = route_high.sum() / len(test_idx) * 100
-
-        # Compute cost
-        cost_low = COST_TABLE[TOKEN_LEVELS[low_stage]]
-        cost_high = COST_TABLE[TOKEN_LEVELS[high_stage]]
-        avg_cost = (route_low.sum() * cost_low + route_high.sum() * cost_high) / len(test_idx)
-
-        if acc > best_acc:
-            best_acc = acc
+        acc = correct / len(val_idx)
+        if acc > best_val_acc:
+            best_val_acc = acc
             best_thresh = thresh
-            best_details = {
-                'accuracy': acc * 100,
-                'threshold': thresh,
-                'pct_low_stage': pct_low,
-                'pct_high_stage': pct_high,
-                'avg_cost_tflops': avg_cost,
-            }
 
-    return best_details
+    # Evaluate on test set with the selected threshold
+    test_probs = clf.predict_proba(X_test_s)[:, 1]
+    route_low = test_probs >= best_thresh
+    route_high = ~route_low
+
+    correct = 0
+    for i, idx in enumerate(test_idx):
+        if route_low[i]:
+            correct += labels[idx, low_stage]
+        else:
+            correct += labels[idx, high_stage]
+
+    acc = correct / len(test_idx)
+    pct_low = route_low.sum() / len(test_idx) * 100
+    pct_high = route_high.sum() / len(test_idx) * 100
+
+    cost_low = COST_TABLE[TOKEN_LEVELS[low_stage]]
+    cost_high = COST_TABLE[TOKEN_LEVELS[high_stage]]
+    avg_cost = (route_low.sum() * cost_low + route_high.sum() * cost_high) / len(test_idx)
+
+    return {
+        'accuracy': acc * 100,
+        'threshold': best_thresh,
+        'val_accuracy': best_val_acc * 100,
+        'pct_low_stage': pct_low,
+        'pct_high_stage': pct_high,
+        'avg_cost_tflops': avg_cost,
+    }
 
 
 def eval_llm_routing(
@@ -362,6 +371,7 @@ def eval_llm_routing(
     labels_t0: np.ndarray,
     llm_correct: np.ndarray,
     train_idx: np.ndarray,
+    val_idx: np.ndarray,
     test_idx: np.ndarray,
 ) -> Dict:
     """
@@ -369,15 +379,17 @@ def eval_llm_routing(
 
     Label = 1 if SLM can solve it (route to SLM).
     If classifier says 0, route to LLM (32B standalone).
+    Threshold is selected on val_idx, final accuracy reported on test_idx.
     """
     y_train = labels_t0[train_idx]
-    y_test = labels_t0[test_idx]
 
     X_train = features[train_idx]
+    X_val = features[val_idx]
     X_test = features[test_idx]
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
+    X_val_s = scaler.transform(X_val)
     X_test_s = scaler.transform(X_test)
 
     clf = GradientBoostingClassifier(
@@ -385,59 +397,71 @@ def eval_llm_routing(
     )
     clf.fit(X_train_s, y_train)
 
-    probs = clf.predict_proba(X_test_s)[:, 1]
-
-    best_acc = 0
-    best_details = {}
+    # Select threshold on validation set
+    val_probs = clf.predict_proba(X_val_s)[:, 1]
+    best_val_acc = 0
+    best_thresh = 0.5
 
     for thresh in np.arange(0.1, 0.95, 0.05):
-        route_slm = probs >= thresh
-        route_llm = ~route_slm
-
+        route_slm = val_probs >= thresh
         correct = 0
-        for i, idx in enumerate(test_idx):
+        for i, idx in enumerate(val_idx):
             if route_slm[i]:
                 correct += labels_t0[idx]
             else:
                 correct += llm_correct[idx]
+        acc = correct / len(val_idx)
+        if acc > best_val_acc:
+            best_val_acc = acc
+            best_thresh = thresh
 
-        acc = correct / len(test_idx)
-        pct_slm = route_slm.sum() / len(test_idx) * 100
-        pct_llm = route_llm.sum() / len(test_idx) * 100
-        avg_cost = (route_slm.sum() * COST_TABLE[0] + route_llm.sum() * COST_TABLE["32B"]) / len(test_idx)
+    # Evaluate on test set with the selected threshold
+    test_probs = clf.predict_proba(X_test_s)[:, 1]
+    route_slm = test_probs >= best_thresh
+    route_llm = ~route_slm
 
-        if acc > best_acc:
-            best_acc = acc
-            best_details = {
-                'accuracy': acc * 100,
-                'threshold': thresh,
-                'pct_slm': pct_slm,
-                'pct_llm': pct_llm,
-                'avg_cost_tflops': avg_cost,
-            }
+    correct = 0
+    for i, idx in enumerate(test_idx):
+        if route_slm[i]:
+            correct += labels_t0[idx]
+        else:
+            correct += llm_correct[idx]
 
-    return best_details
+    acc = correct / len(test_idx)
+    pct_slm = route_slm.sum() / len(test_idx) * 100
+    pct_llm = route_llm.sum() / len(test_idx) * 100
+    avg_cost = (route_slm.sum() * COST_TABLE[0] + route_llm.sum() * COST_TABLE["32B"]) / len(test_idx)
+
+    return {
+        'accuracy': acc * 100,
+        'threshold': best_thresh,
+        'val_accuracy': best_val_acc * 100,
+        'pct_slm': pct_slm,
+        'pct_llm': pct_llm,
+        'avg_cost_tflops': avg_cost,
+    }
 
 
 def eval_tandem_cascade(
     features: np.ndarray,
     labels: np.ndarray,
     train_idx: np.ndarray,
+    val_idx: np.ndarray,
     test_idx: np.ndarray,
 ) -> Dict:
     """
-    Tandem cascade: multi-stage with threshold search (same as train_ppl_classifier.py).
+    Tandem cascade: multi-stage with threshold search.
+    Threshold is selected on val_idx, final accuracy reported on test_idx.
     """
     from itertools import product
 
     n_stages = len(TOKEN_LEVELS)
 
-    # Train per-stage classifiers
     X_train = features[train_idx]
+    X_val = features[val_idx]
     X_test = features[test_idx]
 
-    # For cascade, we need features at each stage. Since we only have T0 features,
-    # we add stage_idx as an extra feature.
+    # For cascade, we add stage_idx as an extra feature.
     all_X_train = []
     all_y_train = []
     for stage_idx in range(n_stages):
@@ -456,52 +480,69 @@ def eval_tandem_cascade(
     )
     clf.fit(all_X_train_s, all_y_train)
 
-    # Predict for test set at each stage
-    probs = np.zeros((len(test_idx), n_stages))
+    # Predict for validation set at each stage (for threshold selection)
+    val_probs = np.zeros((len(val_idx), n_stages))
     for stage_idx in range(n_stages):
-        stage_features = np.column_stack([X_test, np.full(len(test_idx), stage_idx)])
+        stage_features = np.column_stack([X_val, np.full(len(val_idx), stage_idx)])
         stage_features_s = scaler.transform(stage_features)
-        probs[:, stage_idx] = clf.predict_proba(stage_features_s)[:, 1]
+        val_probs[:, stage_idx] = clf.predict_proba(stage_features_s)[:, 1]
 
-    gt = labels[test_idx]
+    val_gt = labels[val_idx]
 
-    # Grid search for thresholds
+    # Grid search for thresholds on validation set
     threshold_candidates = [round(i * 0.1, 1) for i in range(11)]
-    best_acc = 0
+    best_val_acc = 0
     best_thresholds = None
 
     for combo in product(threshold_candidates, repeat=n_stages):
         thresholds = list(combo)
         correct = 0
-        stage_counts = [0] * n_stages
-        for i in range(len(test_idx)):
+        for i in range(len(val_idx)):
             decided = False
             for stage_idx in range(n_stages):
-                if probs[i, stage_idx] >= thresholds[stage_idx]:
-                    correct += gt[i, stage_idx]
-                    stage_counts[stage_idx] += 1
+                if val_probs[i, stage_idx] >= thresholds[stage_idx]:
+                    correct += val_gt[i, stage_idx]
                     decided = True
                     break
             if not decided:
-                correct += gt[i, -1]
-                stage_counts[-1] += 1
-
-        acc = correct / len(test_idx)
-        if acc > best_acc:
-            best_acc = acc
+                correct += val_gt[i, -1]
+        acc = correct / len(val_idx)
+        if acc > best_val_acc:
+            best_val_acc = acc
             best_thresholds = thresholds
-            best_stage_counts = stage_counts[:]
 
-    # Compute cost for best cascade
+    # Evaluate on test set with the selected thresholds
+    test_probs = np.zeros((len(test_idx), n_stages))
+    for stage_idx in range(n_stages):
+        stage_features = np.column_stack([X_test, np.full(len(test_idx), stage_idx)])
+        stage_features_s = scaler.transform(stage_features)
+        test_probs[:, stage_idx] = clf.predict_proba(stage_features_s)[:, 1]
+
+    test_gt = labels[test_idx]
     n_test = len(test_idx)
-    avg_cost = sum(
-        count * COST_TABLE[TOKEN_LEVELS[s]] for s, count in enumerate(best_stage_counts)
-    ) / n_test
+    correct = 0
+    stage_counts = [0] * n_stages
+    for i in range(n_test):
+        decided = False
+        for stage_idx in range(n_stages):
+            if test_probs[i, stage_idx] >= best_thresholds[stage_idx]:
+                correct += test_gt[i, stage_idx]
+                stage_counts[stage_idx] += 1
+                decided = True
+                break
+        if not decided:
+            correct += test_gt[i, -1]
+            stage_counts[-1] += 1
 
-    stage_pcts = [count / n_test * 100 for count in best_stage_counts]
+    acc = correct / n_test
+    avg_cost = sum(
+        count * COST_TABLE[TOKEN_LEVELS[s]] for s, count in enumerate(stage_counts)
+    ) / n_test
+    stage_pcts = [count / n_test * 100 for count in stage_counts]
 
     return {
-        'accuracy': best_acc * 100,
+        'accuracy': acc * 100,
+        'val_accuracy': best_val_acc * 100,
         'thresholds': best_thresholds,
         'stage_distribution': {
             f"T{TOKEN_LEVELS[s]}": f"{pct:.1f}%" for s, pct in enumerate(stage_pcts)
@@ -586,18 +627,30 @@ def main():
             logger.info(f"Saved features to {args.save_features}")
 
     n_train = len(all_train_features)
-    n_test = len(all_test_features)
-    logger.info(f"\nTotal: {n_train} train, {n_test} test samples")
+    n_test_full = len(all_test_features)
+    logger.info(f"\nTotal: {n_train} train, {n_test_full} test samples")
 
-    # Merge train and test for index-based splitting
+    # Split test into val (for threshold selection) and test (for final evaluation)
+    # Use 50/50 split with fixed seed for reproducibility
+    rng = np.random.RandomState(42)
+    perm = rng.permutation(n_test_full)
+    n_val = n_test_full // 2
+    n_test = n_test_full - n_val
+    val_local_idx = perm[:n_val]
+    test_local_idx = perm[n_val:]
+    logger.info(f"Split test into {n_val} val + {n_test} test for threshold selection")
+
+    # Merge train and test_full for index-based splitting
     all_features = np.vstack([all_train_features, all_test_features])
     all_labels = np.vstack([all_train_labels, all_test_labels])
     train_idx = np.arange(n_train)
-    test_idx = np.arange(n_train, n_train + n_test)
+    val_idx = n_train + val_local_idx    # offset into merged array
+    test_idx = n_train + test_local_idx  # offset into merged array
 
     # ── Baseline results ──────────────────────────────────────────────
     print("\n" + "=" * 70)
     print("  BASELINE COMPARISON: Routing vs. Tandem Cascade")
+    print(f"  (val={n_val}, test={n_test}, thresholds selected on val)")
     print("=" * 70)
 
     # 1. Individual stage baselines
@@ -611,10 +664,10 @@ def main():
     # 2. Binary Routing (T0 vs T1000)
     print("\n── Binary Routing: SLM (7B) vs 7B+32B (high) ──")
     binary_results = eval_binary_routing(
-        all_features, all_labels, train_idx, test_idx,
+        all_features, all_labels, train_idx, val_idx, test_idx,
         low_stage=0, high_stage=3,
     )
-    print(f"  Accuracy: {binary_results['accuracy']:.2f}%")
+    print(f"  Accuracy: {binary_results['accuracy']:.2f}% (val: {binary_results['val_accuracy']:.2f}%)")
     print(f"  Route to SLM (7B): {binary_results['pct_low_stage']:.1f}%")
     print(f"  Route to 7B+32B (high): {binary_results['pct_high_stage']:.1f}%")
     print(f"  Avg Cost: {binary_results['avg_cost_tflops']:.2f} TFLOPs")
@@ -622,9 +675,9 @@ def main():
     # 3. Tandem Cascade (re-trained from T0 features only for fair comparison)
     print("\n── Tandem Cascade (4-stage) ──")
     cascade_results = eval_tandem_cascade(
-        all_features, all_labels, train_idx, test_idx,
+        all_features, all_labels, train_idx, val_idx, test_idx,
     )
-    print(f"  Accuracy: {cascade_results['accuracy']:.2f}%")
+    print(f"  Accuracy: {cascade_results['accuracy']:.2f}% (val: {cascade_results['val_accuracy']:.2f}%)")
     print(f"  Stage distribution: {cascade_results['stage_distribution']}")
     print(f"  Avg Cost: {cascade_results['avg_cost_tflops']:.2f} TFLOPs")
 
@@ -634,25 +687,26 @@ def main():
         llm_results = load_llm_results(args.llm_results_dir, subsets)
 
         if llm_results:
-            # Build per-problem 32B correctness array aligned with test data
+            # Build per-problem 32B correctness array aligned with test_full data
             llm_correct_all = []
-            offset = 0
             for subset in subsets:
                 if subset in llm_results:
                     llm_correct_all.extend(llm_results[subset])
                 else:
-                    # Assume 32B average accuracy for missing subsets
-                    n_sub = all_test_labels[offset:].shape[0]  # rough estimate
+                    n_sub = all_test_labels.shape[0]
                     llm_correct_all.extend([False] * n_sub)
-            llm_correct_arr = np.array(llm_correct_all[:n_test], dtype=int)
+            llm_correct_arr = np.array(llm_correct_all[:n_test_full], dtype=int)
+
+            # Use merged array indices; build llm_correct aligned with merged array
+            llm_correct_merged = np.zeros(len(all_labels), dtype=int)
+            llm_correct_merged[n_train:n_train + n_test_full] = llm_correct_arr
 
             llm_routing_results = eval_llm_routing(
-                all_features[test_idx], all_labels[test_idx, 0],
-                llm_correct_arr,
-                np.arange(int(n_test * 0.7)),
-                np.arange(int(n_test * 0.7), n_test),
+                all_features, all_labels[:, 0],
+                llm_correct_merged,
+                train_idx, val_idx, test_idx,
             )
-            print(f"  Accuracy: {llm_routing_results['accuracy']:.2f}%")
+            print(f"  Accuracy: {llm_routing_results['accuracy']:.2f}% (val: {llm_routing_results['val_accuracy']:.2f}%)")
             print(f"  Route to SLM (7B): {llm_routing_results['pct_slm']:.1f}%")
             print(f"  Route to LLM (32B): {llm_routing_results['pct_llm']:.1f}%")
             print(f"  Avg Cost: {llm_routing_results['avg_cost_tflops']:.2f} TFLOPs")
@@ -660,6 +714,7 @@ def main():
     # ── Summary Table ─────────────────────────────────────────────────
     print("\n" + "=" * 70)
     print("  Summary (Markdown Table)")
+    print(f"  Thresholds selected on val ({n_val}), evaluated on test ({n_test})")
     print("=" * 70)
     print()
     print("| Method | MATH Acc | Cost (TFLOPs) |")
