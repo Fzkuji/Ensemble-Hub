@@ -1,15 +1,15 @@
-# Tandem: Riding Together with Large and Small Language Models for Efficient Reasoning
+# Ensemble-Hub
 
 <p align="center">
   <img src="assets/Ensemble-Hub.gif" alt="Ensemble-Hub" width="600">
 </p>
 
 <p align="center">
-  <a href="https://arxiv.org/abs/xxxx.xxxxx"><img src="https://img.shields.io/badge/Paper-ACL%202025-blue" alt="Paper"></a>
+  <a href="https://arxiv.org/abs/xxxx.xxxxx"><img src="https://img.shields.io/badge/Paper-ACL%202025%20Findings-blue" alt="Paper"></a>
   <a href="https://github.com/Fzkuji/Ensemble-Hub/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green" alt="License"></a>
 </p>
 
-This is the official implementation of **Tandem**, accepted at **ACL 2025 Main Conference**.
+This is the official implementation of **Tandem**, accepted at **ACL 2025 Findings**.
 
 > **Tandem: Riding Together with Large and Small Language Models for Efficient Reasoning**
 >
