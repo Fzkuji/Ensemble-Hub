@@ -1,272 +1,80 @@
-![# LLaMA Factory](assets/Ensemble-Hub.gif)
+# Tandem: Riding Together with Large and Small Language Models for Efficient Reasoning
 
-# Ensemble-Hub
+<p align="center">
+  <img src="assets/Ensemble-Hub.gif" alt="Ensemble-Hub" width="600">
+</p>
 
-**Ensemble-Hub** is an open-source toolkit for large language model (LLM) ensemble inference. 
-It is designed to support and unify multiple ensemble strategies for LLMs, including existing methods such as [LLM-Blender](https://github.com/yuchenlin/LLM-Blender), [GaC](https://github.com/yaoching0/GaC), and [UniTE](https://github.com/starrYYxuan/UniTE). 
-The project is under active development.
+<p align="center">
+  <a href="https://arxiv.org/abs/xxxx.xxxxx"><img src="https://img.shields.io/badge/Paper-ACL%202025-blue" alt="Paper"></a>
+  <a href="https://github.com/Fzkuji/Ensemble-Hub/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green" alt="License"></a>
+</p>
 
-## 🌟 Project goals
+This is the official implementation of **Tandem**, accepted at **ACL 2025 Main Conference**.
 
-| **Why?**                                                  | **How?**                                                                                                                       |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| **Boost answer quality** by letting several LLMs compete. | Each round, every generator writes a short segment → a reward model (Qwen 2.5-Math-PRM-7B) scores them → best segment is kept. |
-| **Stay fast & memory-friendly** with model caching.       | ModelPool loads each generator/reward model once, then re-uses it for every call (CLI, notebook or API).                       |
-| **Provide plug-and-play usage** for research & services.  | Python `EnsembleFramework` class **or** a production-grade FastAPI server (`ensemblehub/api.py`).                            |
+> **Tandem: Riding Together with Large and Small Language Models for Efficient Reasoning**
+>
+> Zichuan Fu, Xian Wu, Guojing Li, Yejing Wang, Yijun Chen, Zihao Zhao, Yixuan Luo, Hanyu Yan, Yefeng Zheng, Xiangyu Zhao
+>
+> *Recent advancements in large language models (LLMs) have catalyzed the rise of reasoning-intensive inference paradigms, where models perform explicit step-by-step reasoning before generating final answers. While such approaches improve answer quality and interpretability, they incur substantial computational overhead due to the prolonged generation sequences. We propose Tandem, a novel collaborative framework that synergizes large and small language models (LLMs and SLMs) to achieve high-quality reasoning with significantly reduced computational cost. The LLM serves as a strategic coordinator, efficiently generating a compact set of critical reasoning insights. These insights then guide a smaller, more efficient SLM in executing the full reasoning process and delivering the final response. To balance efficiency and reliability, Tandem introduces a cost-aware termination mechanism that adaptively determines when sufficient reasoning guidance has been accumulated, enabling early stopping of the LLM's generation. Experiments on mathematical reasoning and code generation benchmarks demonstrate that Tandem reduces computational costs by approximately 40% compared to standalone LLM reasoning, while achieving superior or competitive performance.*
 
+## Key Results
 
-## 💡 Core features
+| Method | MATH Acc. (%) | Cost (TFLOPs) | Cost Reduction |
+|--------|:---:|:---:|:---:|
+| SLM (DeepSeek-7B) | 77.14 | 38.25 | — |
+| LLM (DeepSeek-32B) | 80.90 | 168.35 | — |
+| **Tandem (7B+32B)** | **83.46** | **99.72** | **40.7%** |
 
-* **Unlimited generators** – mix and match multiple models (HF *and* vLLM backends supported).
-* **Reward-guided selection** – uses a reward model (e.g. Qwen2.5-Math-PRM-7B) to score candidates and pick the best output each round.
-* **EOS-based early stop** – if a model outputs its end-of-sequence token, the loop exits early.
-* **Context accumulation** – optionally carry forward previously chosen segments into the next round (builds a running conversation context).
-* **Clean prompt template** – minimal prompt format with no extraneous instructions (no stray “600 words” artifacts).
-* **Singleton caches** – models load once and are reused on repeated calls (even across API requests).
+- **+2.56%** accuracy over the standalone 32B LLM while using only **59%** of its computational cost
+- Sufficiency classifier trained on MATH transfers to HumanEval (code generation) **without retraining**
+- Compatible with both open-source and API-accessible LLMs (GPT-4o-mini, etc.)
 
+## Method Overview
 
-## 🎯 Ensemble Methods
+Tandem establishes a **mentor-intern** collaboration between a large and a small language model:
 
-Ensemble-Hub supports multiple ensemble strategies that can be easily configured:
+1. **Thinking Insight Generation**: The LLM generates structured reasoning insights following the GPRA schema (Goal, Planning, Retrieval, Action), inspired by the ACT-R cognitive architecture.
+2. **Cost-Aware Continual Judgment**: A lightweight classifier evaluates whether the current guidance is sufficient for the SLM, using perplexity and entropy as confidence indicators.
+3. **Response Completion**: Once sufficient guidance is detected, the SLM takes over to complete the reasoning and produce the final answer.
 
-### Model Selection Methods
-- **`zscore`**: Statistical selection based on perplexity and confidence scores
-- **`all`**: Use all available models (no selection)
-- **`random`**: Randomly select a subset of models
+The framework progressively generates insights across three effort levels (low, medium, high), enabling adaptive allocation of computational resources — simple problems terminate early with minimal guidance, while complex ones receive deeper support.
 
-### Output Aggregation Methods
-- **`reward_based`**: Reward-based selection using scoring models (default)
-- **`progressive`**: Length or token-based model switching during generation
-  - Length-based: switch models based on output length thresholds
-  - Token-based: switch models when encountering special tokens
-- **`random`**: Random selection from model outputs
-- **`loop`**: Round-robin cycling through models
-- **`gac`**: GAC token-level aggregation
-- **`distribution`**: Distribution-based token aggregation
+## Getting Started
 
-## 🗂 Repository layout
-
-```
-Ensemble-Hub/
-├── ensemblehub/                         # Main package
-│   ├── api/                             # FastAPI server module
-│   │   ├── __main__.py                  # Command line entry point
-│   │   └── app.py                       # FastAPI application
-│   ├── ensemble_methods/                # Ensemble method implementations
-│   │   ├── ensemble.py                  # Unified ensemble framework
-│   │   ├── model_selection/             # Model selection strategies
-│   │   │   ├── base.py                  # Base selector interface
-│   │   │   ├── statistical.py           # Z-score, random selection
-│   │   │   └── learned.py               # LLM-Blender, meta-learning
-│   │   └── output_aggregation/          # Output aggregation methods
-│   │       ├── token_level/             # Token-level aggregation (GAC, distribution)
-│   │       ├── sentence_level/          # Sentence-level aggregation
-│   │       │   ├── loop_selector.py     # Round-robin selection
-│   │       │   ├── random_selector.py   # Random selection
-│   │       │   ├── reward_based.py      # Reward-based selection
-│   │       │   └── progressive_selector.py # Progressive selection
-│   │       └── response_level/          # Response-level aggregation
-│   ├── generators/                      # Model generators (HF, vLLM backends)
-│   │   ├── base.py                      # Base generator interface
-│   │   ├── hf.py                        # Hugging Face transformers
-│   │   ├── vllm.py                      # vLLM backend
-│   │   └── pool.py                      # Generator pool management
-│   ├── scorers/                         # Reward models and scoring
-│   │   └── base.py                      # Base scorer interface
-│   ├── inference.py                     # High-level inference pipeline
-│   └── utils.py                         # Utility functions
-├── data/                                # Datasets (AIME, GSM8K, MATH, etc.)
-├── docs/                                # Documentation
-│   ├── api_usage.md                     # Complete API usage guide
-│   ├── benchmark_single_model.md        # Single model benchmarking
-│   └── progressive_selector_usage.md    # Progressive selector guide
-├── examples/                            # Usage examples
-│   └── test_single_model.py             # Single model testing
-├── scripts/                             # Utility scripts
-│   ├── vllm_infer.py                    # vLLM inference script
-│   └── grader.py                        # Answer grading
-├── requirements.txt                     # Dependencies
-└── README.md                            # You're here!
-```
-
-##  Getting Started
-
-### 🔧 Installation
+### Installation
 
 ```bash
-conda create -n ensemble python=3.12
-conda activate ensemble
-
-git clone --depth 1 https://github.com/hiyouga/LLaMA-Factory.git
-cd LLaMA-Factory
-pip install -e ".[torch,metrics]" --no-build-isolation
-cd ..
-
-git clone --depth 1 https://github.com/EleutherAI/lm-evaluation-harness
-cd lm-evaluation-harness
-pip install -e .
-cd ..
+conda create -n tandem python=3.12
+conda activate tandem
 
 git clone https://github.com/Fzkuji/Ensemble-Hub.git
 cd Ensemble-Hub
-
 pip install -r requirements.txt
 ```
 
+### Reproducing Tandem Experiments
 
-### 💻 Quickstart
+Experiment scripts are located in `scripts/mentor_guided/`:
 
-> [!NOTE]
-> The inference script now supports both YAML configuration files and command-line arguments.
-
-**Using YAML configuration (recommended):**
-```shell
-python -m ensemblehub.inference \
-   --config examples/all_progressive.yaml \
-   --input_path data/AIME2024/aime/aime24.json \
-   --output_path saves/aime24.jsonl \
-   --max_examples 10 \
-   --batch_size 1
-```
-
-**Using command-line arguments only:**
-```shell
-python -m ensemblehub.inference \
-   --input_path data/AIME2024/aime/aime24.json \
-   --output_path saves/aime24.jsonl \
-   --max_examples 500 \
-   --batch_size 4 \
-   --output_aggregation_method progressive \
-   --max_tokens 2048 \
-   --model_specs "Qwen/Qwen2.5-0.5B-Instruct:hf:auto" \
-   --model_specs "Qwen/Qwen2.5-1.5B-Instruct:hf:auto"
-```
-
-*Under the hood: models are loaded once → the reward model scores each round → loop stops when the selected segment ends with an EOS token.*
-
-### 🚀 Start the FastAPI
-
-#### Using YAML Configuration (Recommended)
-
-```bash
-# Start with example configuration
-python ensemblehub/api.py examples/all_loop.yaml
-
-# Or use progressive ensemble
-python ensemblehub/api.py examples/all_progressive.yaml
-```
-
-#### Using Default Configuration
-
-```bash
-# Start with default settings
-python ensemblehub/api.py
-```
-
-#### Evaluate with lm-evaluation-harness
-
-```bash
-lm_eval --model hf \
-   --tasks arc_challenge_chat \
-   --model_args pretrained=deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
-   --batch_size 2 \
-   --num_fewshot 5
-```
-
-or through the Ensemble-Hub API proxy:
-
-```bash
-# Start API server
-python ensemblehub/api.py examples/all_loop.yaml
-
-# Run evaluation in another terminal
-export OPENAI_API_KEY=dummy_key
-lm_eval --model openai-completions \
-   --tasks arc_challenge_chat \
-   --model_args model=ensemble,base_url=http://localhost:8000/v1/completions,tokenizer_backend=None \
-   --batch_size 2 \
-   --num_fewshot 5
-
-# For longer completions (e.g. MBPP) extend the generation budget
-lm_eval --model openai-completions \
-   --tasks mbpp \
-   --model_args model=ensemble,base_url=http://localhost:8000/v1/completions,tokenizer_backend=None,max_gen_toks=1024 \
-   --batch_size 2 \
-   --limit 1 \
-   --confirm_run_unsafe_code
-```
-
-> **Note**: Server configuration is controlled via environment variables API_HOST and API_PORT.
-
-#### Testing the API
-
-```bash
-# Health check
-curl http://localhost:8000/status
-
-# Chat completion
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "ensemble", "messages": [{"role": "user", "content": "Hello"}]}'
-
-# Text completion  
-curl -X POST http://localhost:8000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "ensemble", "prompt": "Hello", "max_tokens": 50}'
-```
-
-## 🧪 ACT-E Experiments
-
-ACT-E (Adaptive Control of LLM Thinking Ensemble) is a framework for dynamically deciding how much mentor guidance an intern model needs. The experiment scripts evaluate different model combinations and datasets.
-
-### Experiment Scripts
-
-Located in `scripts/mentor_guided/`:
-
-| Script | Mentor Model | Intern Model | Dataset |
-|--------|--------------|--------------|---------|
+| Script | Mentor | Intern | Dataset |
+|--------|--------|--------|---------|
 | `exp_homo_math.sh` | DeepSeek-R1-Distill-Qwen-32B | DeepSeek-R1-Distill-Qwen-7B | MATH-500 |
 | `exp_homo_humaneval.sh` | DeepSeek-R1-Distill-Qwen-32B | DeepSeek-R1-Distill-Qwen-7B | HumanEval |
 | `exp_hetero_math.sh` | GPT-4o (API) | DeepSeek-R1-Distill-Qwen-7B | MATH-500 |
 | `exp_hetero_humaneval.sh` | GPT-4o (API) | DeepSeek-R1-Distill-Qwen-7B | HumanEval |
 
-### Baseline Strategies
-
-Each experiment evaluates the following strategies:
-
-| Strategy | Description |
-|----------|-------------|
-| Mentor Only | Mentor generates complete response (no intern) |
-| Intern Only | Intern generates complete response (no mentor) |
-| Progressive-100 | Mentor generates 100 tokens, intern continues |
-| Progressive-500 | Mentor generates 500 tokens, intern continues |
-| Progressive-1000 | Mentor generates 1000 tokens, intern continues |
-| ACT-E (LSTM/GRU/MLP/Attention) | Adaptive selection based on PPL/Entropy |
-
-### Running Experiments
-
 ```bash
-# Homogeneous models + MATH-500
+# Homogeneous models on MATH-500
 bash scripts/mentor_guided/exp_homo_math.sh
 
-# Homogeneous models + HumanEval
-bash scripts/mentor_guided/exp_homo_humaneval.sh
-
-# Heterogeneous models + MATH-500 (requires OPENROUTER_API_KEY)
+# Heterogeneous models (requires API key)
 export OPENROUTER_API_KEY="your-api-key"
 bash scripts/mentor_guided/exp_hetero_math.sh
-
-# Heterogeneous models + HumanEval
-bash scripts/mentor_guided/exp_hetero_humaneval.sh
 ```
 
-### Parallel Data Collection
-
-For faster data collection with multiple GPUs, use parallel mode:
+**Parallel data collection** for faster processing with multiple GPUs:
 
 ```bash
-# Homogeneous models (local mentor + local intern)
-# 4 workers: GPU 0-3 for Mentor (32B), GPU 4-7 for Intern (7B)
 python scripts/mentor_guided/collect_progressive_data.py \
     --dataset math500 \
     --split train \
@@ -275,53 +83,80 @@ python scripts/mentor_guided/collect_progressive_data.py \
     --num-workers 4 \
     --mentor-gpus "0,1,2,3" \
     --intern-gpus "4,5,6,7"
-
-# Heterogeneous models (API mentor + local intern)
-# All 8 GPUs for Intern since Mentor uses API
-python scripts/mentor_guided/collect_progressive_data.py \
-    --dataset math500 \
-    --split train \
-    --mentor-type api \
-    --api-model "gpt-4o" \
-    --parallel \
-    --num-workers 8 \
-    --intern-gpus "0,1,2,3,4,5,6,7"
 ```
 
-**Memory Requirements:**
-- 32B Mentor model: ~64GB VRAM per instance (fp16)
-- 7B Intern model: ~14GB VRAM per instance (fp16)
+Results are saved to `data/acte_experiments/results/`.
 
-### Output
+## Ensemble-Hub Toolkit
 
-Results are saved to `data/acte_experiments/results/` with accuracy, average token lengths, and TFLOPs comparison.
+Beyond Tandem, this repository also provides a general-purpose **LLM ensemble inference toolkit** supporting multiple ensemble strategies:
 
-## 📌 To-Do
+### Ensemble Methods
 
-- [x] Multi-model inference
-- [x] HuggingFace backend
-- [x] FastAPI server with OpenAI-compatible endpoints
-- [x] Ray Serve integration
-- [x] Command line configuration for ensemble methods
-- [x] LM-evaluation-harness compatibility
-- [ ] Reward model selection
-- [ ] vLLM backends
-- [ ] API support for closed-source models
-- [ ] Streaming API interface (SSE)
-- [ ] Advanced scorer aggregation methods
+**Model Selection**: `zscore` | `all` | `random`
 
-## 📝 Changelog
+**Output Aggregation**: `reward_based` | `progressive` | `loop` | `gac` | `distribution` | `random`
 
-### Recent Updates
+### Batch Inference
 
-- **Enable Thinking Mode**: Refactored `enable_thinking` parameter to be configured at model initialization level instead of generation time. This allows better integration with LLaMA-Factory's template system and supports reasoning models like DeepSeek-R1.
-- **Consistent Length Handling**: Updated tokenizer calls to use `cutoff_len` from DataArguments for consistent max_length handling across all generation methods.
-- **API Improvements**: Added `--enable_thinking` command line flag for easy configuration of reasoning models.
+```bash
+python -m ensemblehub.inference \
+   --config examples/all_progressive.yaml \
+   --input_path data/AIME2024/aime/aime24.json \
+   --output_path saves/aime24.jsonl
+```
 
-## 📜 License
+### FastAPI Server (OpenAI-compatible)
 
-Apache-2.0. See the [LICENSE](./LICENSE) file for details.
+```bash
+python ensemblehub/api.py examples/all_loop.yaml
+```
 
-## 🙏 Acknowledgements
+```bash
+# Chat completion
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "ensemble", "messages": [{"role": "user", "content": "Hello"}]}'
+```
 
-Relies on **DeepSeek**, **Qwen** model weights, Hugging Face Transformers, [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory), and the incredible open-source community.
+Compatible with [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) for standardized benchmarking.
+
+### Repository Structure
+
+```
+Ensemble-Hub/
+├── ensemblehub/                    # Main package
+│   ├── api/                        # FastAPI server (OpenAI-compatible)
+│   ├── ensemble_methods/           # Ensemble strategies
+│   │   ├── ensemble.py             # Core framework
+│   │   ├── model_selection/        # Pre-inference model selection
+│   │   └── output_aggregation/     # Token/sentence/response-level aggregation
+│   ├── generators/                 # Model backends (HF, vLLM, API)
+│   ├── scorers/                    # Reward models
+│   └── inference.py                # Batch inference pipeline
+├── scripts/mentor_guided/          # Tandem experiment scripts
+├── data/                           # Datasets (MATH, GSM8K, HumanEval, AIME)
+├── examples/                       # YAML configuration examples
+└── docs/                           # Documentation
+```
+
+## Citation
+
+If you find this work useful, please cite our paper:
+
+```bibtex
+@inproceedings{fu2025tandem,
+  title={Tandem: Riding Together with Large and Small Language Models for Efficient Reasoning},
+  author={Fu, Zichuan and Wu, Xian and Li, Guojing and Wang, Yejing and Chen, Yijun and Zhao, Zihao and Luo, Yixuan and Yan, Hanyu and Zheng, Yefeng and Zhao, Xiangyu},
+  booktitle={Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (ACL)},
+  year={2025}
+}
+```
+
+## License
+
+Apache-2.0. See [LICENSE](./LICENSE) for details.
+
+## Acknowledgements
+
+This work was supported by City University of Hong Kong, Tencent, Renmin University of China, and Westlake University. We thank the open-source community for [DeepSeek](https://github.com/deepseek-ai), [Qwen](https://github.com/QwenLM), and [Hugging Face Transformers](https://github.com/huggingface/transformers).
